@@ -51,6 +51,14 @@ func GenerateDirectoryMappings(client platformLister) (mappings map[string]confi
 			skipped++
 			continue
 		}
+		if !platform.HasEmuPak(tag) {
+			// Known tag, but NO emulator pak installed on this device (e.g. DS/3DS/PSP on a
+			// Mini Flip). Mapping it would stub a library of games that can't launch — and a
+			// search would happily download them. Skip it; a device that later adds the pak
+			// picks the platform up on the next mapping generation.
+			skipped++
+			continue
+		}
 		display := sanitizeFolderName(platformDisplayName(p))
 		mappings[p.FsSlug] = config.DirMapping{
 			Slug:         p.FsSlug,

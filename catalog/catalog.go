@@ -166,6 +166,18 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 		// platform is in flight rather than a frozen previous label.
 		rep.phase(fmt.Sprintf("Mirroring %s (%d/%d)…", platformDisplay(p), pi2+1, nPlat))
 
+		// Don't stub platforms this device can't launch. A mapping can carry a known tag
+		// (DS/3DS/PSP) for which NO emulator pak is installed on a Mini Flip — stubbing it
+		// fills the library + search with un-launchable games (you could download what you
+		// can't play). Skip it BEFORE the network fetch, and self-heal a stale mapping by
+		// pruning any 0-byte stubs already on the card. A real download is left untouched.
+		if tag, ok := platform.PrimaryTag(p.FsSlug); !ok || !platform.HasEmuPak(tag) {
+			pruneUnplayableStubs(cfg, p)
+			doneWork += p.RomCount
+			rep.percent(mirrorPct(pi2+1, nPlat, doneWork, totalWork))
+			continue
+		}
+
 		page, gerr := client.GetRoms(romm.GetRomsQuery{PlatformIDs: []int{p.ID}})
 		if gerr != nil {
 			// Skip this platform's stubs but keep going (parity with grout's WARN). Still
@@ -473,6 +485,49 @@ func sdcardRoot() string {
 		sd = "/mnt/SDCARD"
 	}
 	return sd
+}
+
+// pruneUnplayableStubs removes 0-byte stub files from a mapped platform's Roms folder
+// when that platform has no installed emulator pak — self-healing a config that still
+// maps a system the device can't launch (DS/3DS/PSP on a Mini Flip). Real (non-zero)
+// downloads are LEFT ALONE (never delete a game the user pulled); if nothing but cover
+// art remains afterward, the now-pointless folder is removed.
+func pruneUnplayableStubs(cfg *config.Config, p romm.Platform) {
+	m, ok := cfg.DirectoryMappings[p.FsSlug]
+	if !ok || m.RelativePath == "" {
+		return
+	}
+	dir := filepath.Join(sdcardRoot(), "Roms", m.RelativePath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue // leave .media and any subfolders
+		}
+		if info, ierr := e.Info(); ierr == nil && info.Size() == 0 {
+			if os.Remove(filepath.Join(dir, e.Name())) == nil {
+				removed++
+			}
+		}
+	}
+	// If only cover art (or nothing) is left — i.e. no real downloads — drop the folder.
+	rest, _ := os.ReadDir(dir)
+	onlyMedia := true
+	for _, e := range rest {
+		if e.Name() != ".media" {
+			onlyMedia = false
+			break
+		}
+	}
+	if onlyMedia {
+		_ = os.RemoveAll(dir)
+	}
+	if removed > 0 {
+		fmt.Fprintf(os.Stderr, "MIRROR prune %s: removed %d un-launchable stub(s) (no Emus pak)\n", p.FsSlug, removed)
+	}
 }
 
 // getMappedPlatforms returns the RomM platforms the user has a directory mapping

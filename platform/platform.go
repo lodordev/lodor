@@ -260,3 +260,33 @@ func PrimaryTag(fsSlug string) (tag string, ok bool) {
 	}
 	return folders[0], true
 }
+
+// HasEmuPak reports whether an emulator pak for the given MinUI tag is actually
+// INSTALLED on this device (checked at the builtin then the user pak location). This is
+// the difference between a platform the engine knows a TAG for and one the device can
+// actually LAUNCH: a Mini Flip has an "NDS"/"3DS"/"PSP" tag but no matching .pak, so
+// those games must not be mapped or stubbed (you'd download what you can't play). It
+// adapts per device — a beefier MinUI handheld that ships an NDS.pak gets DS mapped.
+// Honors SDCARD_PATH/PLATFORM (defaults /mnt/SDCARD, miyoomini), like the rest of the engine.
+func HasEmuPak(tag string) bool {
+	if tag == "" {
+		return false
+	}
+	sd := os.Getenv("SDCARD_PATH")
+	if sd == "" {
+		sd = "/mnt/SDCARD"
+	}
+	plat := os.Getenv("PLATFORM")
+	if plat == "" {
+		plat = "miyoomini"
+	}
+	for _, p := range []string{
+		filepath.Join(sd, ".system", plat, "paks", "Emus", tag+".pak"),
+		filepath.Join(sd, "Emus", plat, tag+".pak"),
+	} {
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			return true
+		}
+	}
+	return false
+}
