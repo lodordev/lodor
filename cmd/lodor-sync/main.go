@@ -36,6 +36,7 @@ func main() {
 		pushPending       bool
 		downloadBios      bool
 		syncFeed          bool
+		recent            bool
 		syncSave          string
 		listSaves         string
 		restoreSave       string
@@ -53,6 +54,7 @@ func main() {
 	flag.BoolVar(&pushPending, "push-pending", false, "upload every save in pending-saves.txt; prints RESULT pushed=<N> total=<M> stuck=<K>")
 	flag.BoolVar(&downloadBios, "download-bios", false, "download BIOS/firmware for every mapped platform; prints RESULT bios=<count>")
 	flag.BoolVar(&syncFeed, "sync-feed", false, "list recent server saves across mapped platforms, newest first, tab-separated")
+	flag.BoolVar(&recent, "recent", false, "print the single most-recently-played game across devices as <localRomPath>\\t<game>\\t<when>\\t<device> (drives the Continue tile); empty if unreachable/none")
 	flag.StringVar(&syncSave, "sync-save", "", "pull-then-push the save for one ROM; prints RESULT pulled=<0|1> pushed=<0|1>")
 	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated")
 	flag.StringVar(&restoreSave, "restore-save", "", "restore a specific server save by id for one ROM (save id is the positional arg); prints RESULT restored=<0|1>")
@@ -116,6 +118,8 @@ func main() {
 		runDownloadBios(dlClient, cfg)
 	case syncFeed:
 		runSyncFeed(client, cfg)
+	case recent:
+		runRecent(client, cfg)
 	case syncSave != "":
 		requireDevice(host)
 		runSyncSave(client, cfg, syncSave)

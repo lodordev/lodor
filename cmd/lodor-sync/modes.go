@@ -696,6 +696,54 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 	os.Exit(0)
 }
 
+// runRecent prints the single most-recently-played game across mapped platforms — the
+// data source for the launcher's "Continue" tile. Output is ONE TAB-separated line:
+//   <localRomPath>\t<game>\t<when>\t<device>
+// localRomPath is the on-card stub/file path (the .m3u for multi-disc). Unreachable, no
+// platforms, or no saves => prints nothing and exits 0 (the launcher falls back to its own
+// local recents). One extra GetRom resolves the newest save's rom to a launchable path.
+func runRecent(client *romm.Client, cfg *config.Config) {
+	platforms, err := mappedPlatforms(client, cfg)
+	if err != nil {
+		os.Exit(0)
+	}
+	var newest romm.Save
+	found := false
+	for _, p := range platforms {
+		ps, gerr := client.GetSaves(romm.SaveQuery{PlatformID: p.ID})
+		if gerr != nil {
+			continue
+		}
+		for _, s := range ps {
+			if !found || s.UpdatedAt.After(newest.UpdatedAt) {
+				newest = s
+				found = true
+			}
+		}
+	}
+	if !found {
+		os.Exit(0)
+	}
+	rom, rerr := client.GetRom(newest.RomID)
+	if rerr != nil || rom.ID == 0 {
+		os.Exit(0)
+	}
+	path := platform.LocalRomPath(cfg, rom)
+	if path == "" {
+		os.Exit(0)
+	}
+	game := rom.Name
+	if game == "" {
+		game = rom.FsNameNoExt
+	}
+	device := ""
+	if len(newest.DeviceSyncs) > 0 {
+		device = newest.DeviceSyncs[0].DeviceName
+	}
+	fmt.Printf("%s\t%s\t%s\t%s\n", path, game, newest.UpdatedAt.Format("2006-01-02 15:04"), device)
+	os.Exit(0)
+}
+
 // mappedPlatforms returns the RomM platforms the user has a directory mapping for,
 // fetching the platform list once. Only mapped platforms have a Roms/BIOS folder on
 // the card, so BIOS download and the sync feed both scope to them.
