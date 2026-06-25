@@ -1,0 +1,3 @@
+module lodor
+
+go 1.25

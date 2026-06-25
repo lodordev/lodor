@@ -1,0 +1,24 @@
+{
+  "hosts": [
+    {
+      "root_uri": "https://romm.example.com",
+      "port": 0,
+      "username": "",
+      "password": "",
+      "token": "paired-client-token-goes-here",
+      "insecure_skip_verify": false,
+      "device_id": "",
+      "device_name": "My Handheld"
+    }
+  ],
+  "directory_mappings": {
+    "gba": { "slug": "gba", "relative_path": "Roms/Game Boy Advance (GBA)" },
+    "gbc": { "slug": "gbc", "relative_path": "Roms/Game Boy Color (GBC)" },
+    "gb":  { "slug": "gb",  "relative_path": "Roms/Game Boy (GB)" },
+    "nes": { "slug": "nes", "relative_path": "Roms/Nintendo Entertainment System (FC)" },
+    "snes":{ "slug": "snes","relative_path": "Roms/Super Nintendo (SUPA)" },
+    "psx": { "slug": "psx", "relative_path": "Roms/Sony PlayStation (PS)" }
+  },
+  "api_timeout": 30,
+  "download_timeout": 3600
+}

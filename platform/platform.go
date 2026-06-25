@@ -1,0 +1,262 @@
+// Package platform re-expresses the miyoomini/MinUI save-directory data (BLUEPRINT
+// §6) as our own and provides the path helpers the engine needs: where ROMs, BIOS,
+// and saves live on the card, and how a RomM ROM maps to a concrete on-disk path.
+//
+// CFW = MINUI. CGO-free, stdlib only. No embedded JSON: the slug->emulator-folder
+// map is a plain Go literal, owing nothing to grout's code.
+package platform
+
+import (
+	"os"
+	"path/filepath"
+
+	"lodor/config"
+	"lodor/romm"
+)
+
+// emulatorFolders maps a RomM filesystem slug to its MinUI emulator/save folder
+// name(s). The first entry is the canonical save directory; discovery scans all of
+// them. A slug mapped to an empty slice has no save directory (BLUEPRINT §6).
+var emulatorFolders = map[string][]string{
+	"3do":                        {},
+	"3ds":                        {"3DS"},
+	"acpc":                       {"CPC"},
+	"amiga":                      {"PUAE"},
+	"arcade":                     {"FBN"},
+	"arduboy":                    {},
+	"atari-st":                   {},
+	"atari2600":                  {"A2600"},
+	"atari5200":                  {"A5200"},
+	"atari7800":                  {"A7800"},
+	"c128":                       {"C128"},
+	"c64":                        {"C64"},
+	"cave-story":                 {},
+	"cbm-ii":                     {},
+	"chailove":                   {},
+	"chip-8":                     {},
+	"colecovision":               {"COLECO"},
+	"cpet":                       {"PET"},
+	"dc":                         {"DC"},
+	"doom":                       {"PRBOOM"},
+	"dos":                        {},
+	"fairchild-channel-f":        {},
+	"famicom":                    {"FC"},
+	"fds":                        {"FDS"},
+	"g-and-w":                    {},
+	"galaksija":                  {},
+	"gamegear":                   {"GG"},
+	"gb":                         {"GB"},
+	"gba":                        {"GBA", "MGBA"},
+	"gbc":                        {"GBC"},
+	"genesis":                    {"MD"},
+	"intellivision":              {},
+	"j2me":                       {},
+	"jaguar":                     {},
+	"karaoke":                    {},
+	"lowres":                     {},
+	"lua":                        {},
+	"lynx":                       {"LYNX"},
+	"media-player":               {},
+	"mega-duck-slash-cougar-boy": {},
+	"msx":                        {"MSX"},
+	"n64":                        {"N64"},
+	"naomi":                      {},
+	"nds":                        {"NDS"},
+	"neo-geo-cd":                 {},
+	"neo-geo-pocket":             {"NGP"},
+	"neo-geo-pocket-color":       {"NGPC"},
+	"neogeoaes":                  {},
+	"neogeomvs":                  {},
+	"nes":                        {"FC"},
+	"odyssey":                    {},
+	"onscripter":                 {},
+	"openbor":                    {},
+	"pc-8000":                    {},
+	"pc-9800-series":             {},
+	"pc-fx":                      {},
+	"philips-cd-i":               {},
+	"pico":                       {},
+	"pico-8":                     {"P8"},
+	"pokemon-mini":               {"PKM"},
+	"ports":                      {},
+	"ps2":                        {"PS2"},
+	"psp":                        {"PSP"},
+	"psx":                        {"PS"},
+	"quake":                      {},
+	"rpg-maker":                  {},
+	"saturn":                     {},
+	"scummvm":                    {},
+	"sega32":                     {"32X"},
+	"segacd":                     {"SEGACD"},
+	"sfam":                       {"SFC"},
+	"sg1000":                     {"SG1000"},
+	"sharp-x68000":               {},
+	"sms":                        {"SMS"},
+	"snes":                       {"SFC"},
+	"supergrafx":                 {},
+	"supervision":                {},
+	"tg16":                       {"PCE"},
+	"ti-83":                      {},
+	"tic-80":                     {},
+	"turbografx-cd":              {},
+	"uzebox":                     {},
+	"vectrex":                    {},
+	"vemulator":                  {},
+	"vic-20":                     {"VIC"},
+	"vircon-32":                  {},
+	"virtualboy":                 {"VB"},
+	"wasm-4":                     {},
+	"wolfenstein-3d":             {},
+	"wonderswan":                 {"WS"},
+	"wonderswan-color":           {"WSC"},
+	"x1":                         {},
+	"zx81":                       {},
+	"zxs":                        {},
+	// --- live-slug additions (2026-06-25): RomM fs_slugs that --mirror-catalog
+	// SKIPPED for lack of a tag but the Mini Flip (SSD202D) can run. Tags match the
+	// existing in-repo twin so saves + the eventual Emus/<TAG>.pak stay consistent.
+	"atarilynx":       {"LYNX"},
+	"fbneo":           {"FBN"},
+	"mastersystem":    {"SMS"},
+	"megaduck":        {"MEGADUCK"},
+	"pcengine":        {"PCE"},
+	"pokemini":        {"PKM"},
+	"sega32x":         {"32X"},
+	"wonderswancolor": {"WSC"},
+}
+
+// BasePath returns the SD-card root: BASE_PATH if set, otherwise the first of
+// /mnt/SDCARD, /mnt/sdcard, /mnt/mmc that exists, defaulting to /mnt/SDCARD.
+func BasePath() string {
+	if bp := os.Getenv("BASE_PATH"); bp != "" {
+		return bp
+	}
+	for _, candidate := range []string{"/mnt/SDCARD", "/mnt/sdcard", "/mnt/mmc"} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return "/mnt/SDCARD"
+}
+
+// RomsDir returns <BasePath>/Roms.
+func RomsDir() string { return filepath.Join(BasePath(), "Roms") }
+
+// BiosDir returns <BasePath>/Bios.
+func BiosDir() string { return filepath.Join(BasePath(), "Bios") }
+
+// SavesDir returns <BasePath>/Saves.
+func SavesDir() string { return filepath.Join(BasePath(), "Saves") }
+
+// EmulatorFoldersForFSSlug returns the MinUI emulator/save folder names for a RomM
+// filesystem slug. An unknown slug or one with no save directory returns nil/empty.
+func EmulatorFoldersForFSSlug(slug string) []string {
+	return emulatorFolders[slug]
+}
+
+// SaveFileName returns the MinUI/minarch on-disk save filename for a ROM: the full
+// ROM filename (extension included) suffixed with ".sav" — e.g. SaveFileName(
+// "Game (USA).gba", "srm") == "Game (USA).gba.sav". The saveExt argument is part of
+// the cross-CFW signature and is ignored on MinUI, which always uses ".sav".
+func SaveFileName(romFullFilename, saveExt string) string {
+	return romFullFilename + ".sav"
+}
+
+// SaveDirectory returns the canonical save directory for a slug:
+// <SavesDir>/<firstEmulatorFolder>. Slugs with no save directory return "".
+func SaveDirectory(slug string) string {
+	folders := EmulatorFoldersForFSSlug(slug)
+	if len(folders) == 0 {
+		return ""
+	}
+	return filepath.Join(SavesDir(), folders[0])
+}
+
+// BIOSFilePaths returns every candidate BIOS path for fileName on a platform: one
+// per emulator tag (<BiosDir>/<TAG>/<fileName>) when the slug has tags, otherwise a
+// single <BiosDir>/<fileName>.
+func BIOSFilePaths(fileName, slug string) []string {
+	tags := EmulatorFoldersForFSSlug(slug)
+	if len(tags) > 0 {
+		paths := make([]string, 0, len(tags))
+		base := filepath.Base(fileName)
+		for _, tag := range tags {
+			paths = append(paths, filepath.Join(BiosDir(), tag, base))
+		}
+		return paths
+	}
+	return []string{filepath.Join(BiosDir(), fileName)}
+}
+
+// platformRomDirectory returns the directory under RomsDir where a ROM with the
+// given fs_slug lives. It mirrors grout's resolver: the configured
+// directory_mappings[fs_slug].relative_path when set, otherwise the fs_slug folder
+// name itself (grout's GetPlatformRomDirectory keeps relativePath non-empty, so the
+// RomMFSSlugToCFW fallback is the literal slug). When no mapping exists at all we
+// fall back to the ROM's platform display name if available, else the fs_slug.
+func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string {
+	folder := fsSlug
+	if cfg != nil {
+		if m, ok := cfg.DirectoryMappings[fsSlug]; ok {
+			if m.RelativePath != "" {
+				folder = m.RelativePath
+			} else {
+				folder = fsSlug
+			}
+			return filepath.Join(RomsDir(), folder)
+		}
+	}
+	// No mapping: prefer the platform display name (the MinUI "Name (TAG)" folder)
+	// when present, otherwise the fs_slug.
+	if displayName != "" {
+		folder = displayName
+	}
+	return filepath.Join(RomsDir(), folder)
+}
+
+// LocalRomPath returns the absolute on-disk path a ROM occupies under RomsDir:
+// <RomsDir>/<mapped folder>/<rom.Files[0].FileName> for single-file ROMs, or
+// <RomsDir>/<mapped folder>/<FsNameNoExt>.m3u for multi-file ROMs. Mirrors grout's
+// Rom.GetLocalPath (BLUEPRINT §4). Returns "" when the ROM has no platform slug or
+// no resolvable file.
+func LocalRomPath(cfg *config.Config, rom romm.Rom) string {
+	if rom.PlatformFsSlug == "" {
+		return ""
+	}
+	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
+	if rom.HasMultipleFiles {
+		return filepath.Join(romDir, rom.FsNameNoExt+".m3u")
+	}
+	if len(rom.Files) > 0 {
+		return filepath.Join(romDir, rom.Files[0].FileName)
+	}
+	return ""
+}
+
+// MultiDiscDir returns the per-game subfolder a multi-file ROM's discs are written
+// into: <RomsDir>/<mapped folder>/<FsNameNoExt>/. The .m3u (from LocalRomPath) sits
+// one level up, beside this folder, and references each disc as "<FsNameNoExt>/<disc
+// filename>" — relative to the .m3u's own directory, which is exactly how the MinUI
+// launcher's getFirstDisc and the emulator's m3u loader resolve disc paths. This
+// mirrors RomM's own folder-per-game layout and keeps the system folder to one .m3u +
+// one subfolder per multi-disc game. Returns "" when the ROM has no platform slug.
+func MultiDiscDir(cfg *config.Config, rom romm.Rom) string {
+	if rom.PlatformFsSlug == "" {
+		return ""
+	}
+	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
+	return filepath.Join(romDir, rom.FsNameNoExt)
+}
+
+// PrimaryTag returns the canonical MinUI emulator tag for a RomM filesystem slug —
+// the first (canonical) entry of its emulatorFolders list, used to build the
+// "<Display Name> (<TAG>)" ROM-folder name when auto-generating directory_mappings.
+// Returns "" and ok=false for a slug with no known save/emulator folder (the caller
+// must then SKIP it rather than invent a folder).
+func PrimaryTag(fsSlug string) (tag string, ok bool) {
+	folders := emulatorFolders[fsSlug]
+	if len(folders) == 0 {
+		return "", false
+	}
+	return folders[0], true
+}

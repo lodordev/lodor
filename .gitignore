@@ -1,0 +1,15 @@
+# Secrets / device state — never commit
+config.json
+wifi.txt
+*.token
+
+# Build output
+/lodor-sync
+/grout-sync-arm32
+*.elf
+*.exe
+
+# Scratch
+*.bak
+*.tmp
+*.log
