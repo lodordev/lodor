@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,10 +120,48 @@ func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save r
 		return PullResult{Outcome: PullResolveFail, Reason: "no save directory"}
 	}
 
+	// Rewind Pillar A — lose-proof. Before this restore overwrites the live save,
+	// preserve the device's CURRENT save by pushing it to the server timeline first.
+	// A rewind to an older point can then never silently destroy unsynced progress:
+	// that progress becomes its own permanent point you can rewind back to. Content-
+	// hash dedup makes it a no-op when the current save is already backed up. If a real
+	// local save exists and CANNOT be preserved, the restore is aborted (mirroring
+	// "if the backup fails, abort") rather than trading known progress for old bytes.
+	if ok, pushed, reason := snapshotLocalSaves(client, cfg, rom); !ok {
+		fmt.Fprintf(os.Stderr, "rewind: restore ABORTED — %s (rom %d)\n", reason, rom.ID)
+		return PullResult{Outcome: PullError, Reason: reason}
+	} else if pushed > 0 {
+		fmt.Fprintf(os.Stderr, "rewind: preserved %d current save(s) to the timeline before restore (rom %d)\n", pushed, rom.ID)
+	}
+
 	if res := writeSave(client, cfg, save.ID, localPath); res.Outcome != PullWritten {
 		return res
 	}
 	return PullResult{Outcome: PullWritten, LocalPath: localPath}
+}
+
+// snapshotLocalSaves preserves the device's current local save(s) for a ROM by pushing
+// them to the server timeline BEFORE a restore overwrites them (Rewind Pillar A). It
+// reuses the already-resolved rom (no extra GetRom). ok is true when it is SAFE to
+// proceed with the overwrite — either nothing local exists to lose, or every local
+// save is now on the server (freshly pushed, or already there by content hash). ok is
+// false ONLY when a real local save could not be preserved (a genuine upload error),
+// so the caller can abort instead of destroying unsynced progress. pushed counts saves
+// newly secured this call (for an honest log line); reason is host-free.
+func snapshotLocalSaves(client *romm.Client, cfg *config.Config, rom romm.Rom) (ok bool, pushed int, reason string) {
+	saves := findLocalSavesForRom(rom.PlatformFsSlug, rom)
+	if len(saves) == 0 {
+		return true, 0, "" // nothing on the device to lose
+	}
+	for _, sf := range saves {
+		switch pushOne(client, cfg, rom, sf).Outcome {
+		case OutcomePushed, OutcomeAlreadyOnServer:
+			pushed++
+		case OutcomeUploadError, OutcomeHashMismatch:
+			return false, pushed, "couldn't preserve current save before rewind"
+		}
+	}
+	return true, pushed, ""
 }
 
 // resolveRomAndLocalSavePath reverses romPath to a rom_id (catalog index), fetches
