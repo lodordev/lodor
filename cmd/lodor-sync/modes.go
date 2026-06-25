@@ -86,8 +86,22 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 
 	writePhase(fmt.Sprintf("Downloading %s…", romName))
 
-	data, derr := client.DownloadRomContent(rom.ID, rom.FsName)
-	if derr != nil || len(data) == 0 {
+	// Stream the content straight to the .tmp file (io.Copy via DownloadRomContentTo),
+	// NEVER buffering the whole ROM in RAM — a multi-hundred-MB CHD OOM-crashes the
+	// 128 MB device otherwise (the bug behind the single-file download failures).
+	_ = os.MkdirAll(filepath.Dir(dest), 0o755)
+	tmp := dest + ".tmp"
+	out, oErr := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if oErr != nil {
+		fmt.Fprintf(os.Stderr, "DLFAIL create rom=%d\n", rom.ID)
+		writeProgress(0)
+		fmt.Println("RESULT downloaded=0")
+		os.Exit(0)
+	}
+	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out)
+	cErr := out.Close()
+	if derr != nil || cErr != nil || n == 0 {
+		_ = os.Remove(tmp)
 		fmt.Fprintf(os.Stderr, "DLFAIL download rom=%d\n", rom.ID)
 		writeProgress(0)
 		fmt.Println("RESULT downloaded=0")
@@ -95,14 +109,6 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 	}
 	writeProgress(90)
 
-	// Clear any 0-byte stub, then write the real file atomically (.tmp → rename).
-	_ = os.MkdirAll(filepath.Dir(dest), 0o755)
-	tmp := dest + ".tmp"
-	if wErr := os.WriteFile(tmp, data, 0o644); wErr != nil {
-		fmt.Fprintf(os.Stderr, "DLFAIL write rom=%d\n", rom.ID)
-		fmt.Println("RESULT downloaded=0")
-		os.Exit(0)
-	}
 	_ = os.Remove(dest) // remove the stub before rename (rename over a dir would fail)
 	if rErr := os.Rename(tmp, dest); rErr != nil {
 		fmt.Fprintf(os.Stderr, "DLFAIL rename rom=%d\n", rom.ID)

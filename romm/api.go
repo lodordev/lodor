@@ -226,6 +226,15 @@ func (c *Client) DownloadRomContent(romID int, fsName string) ([]byte, error) {
 	return c.doRaw("GET", path)
 }
 
+// DownloadRomContentTo streams a single-file ROM's content straight to dst (io.Copy,
+// never buffered), returning the bytes written. A multi-hundred-MB CHD costs near-zero
+// RAM this way — the buffered DownloadRomContent OOMs the 128 MB device. Same endpoint,
+// streamed; used by the single-file download path.
+func (c *Client) DownloadRomContentTo(romID int, fsName string, dst io.Writer) (int64, error) {
+	path := fmt.Sprintf("/api/roms/%d/content/%s", romID, fsName)
+	return c.doRawStreamTo(path, dst)
+}
+
 // DownloadRomFileTo streams ONE constituent file of a ROM (selected by its file id)
 // to dst, returning the bytes written. It targets the same content endpoint but adds
 // the single-valued file_ids query param — verified live (2026-06-25): exactly ONE
