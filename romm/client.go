@@ -134,7 +134,10 @@ func (c *Client) doRaw(method, path string) ([]byte, error) {
 // device, where io.ReadAll of a 482 MB disc would OOM. On a non-2xx status it reads
 // (only) a bounded error snippet so the failure is still host-free-diagnosable
 // without buffering a large body. The caller owns dst (file create/sync/close).
-func (c *Client) doRawStreamTo(path string, dst io.Writer) (int64, error) {
+// onProgress (nil-safe) is invoked as bytes arrive with (bytesWritten, totalBytes),
+// where totalBytes is the response Content-Length (or -1 if the server omits it) —
+// this drives the launcher's real download progress bar.
+func (c *Client) doRawStreamTo(path string, dst io.Writer, onProgress func(done, total int64)) (int64, error) {
 	full, err := buildURL(c.baseURL, path)
 	if err != nil {
 		return 0, fmt.Errorf("build url: %w", err)
@@ -155,11 +158,34 @@ func (c *Client) doRawStreamTo(path string, dst io.Writer) (int64, error) {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return 0, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(snippet))
 	}
-	n, err := io.Copy(dst, resp.Body)
+	w := dst
+	if onProgress != nil {
+		w = &progressCountWriter{dst: dst, total: resp.ContentLength, cb: onProgress}
+	}
+	n, err := io.Copy(w, resp.Body)
 	if err != nil {
 		return n, fmt.Errorf("stream response body: %w", err)
 	}
 	return n, nil
+}
+
+// progressCountWriter wraps a writer and reports cumulative bytes written to a
+// callback after each Write, so a streamed download can drive a real progress bar
+// without buffering. total is the known content length (or -1 if unknown).
+type progressCountWriter struct {
+	dst   io.Writer
+	done  int64
+	total int64
+	cb    func(done, total int64)
+}
+
+func (p *progressCountWriter) Write(b []byte) (int, error) {
+	n, err := p.dst.Write(b)
+	p.done += int64(n)
+	if p.cb != nil {
+		p.cb(p.done, p.total)
+	}
+	return n, err
 }
 
 // doMultipart POSTs a multipart/form-data body with exactly one file field named

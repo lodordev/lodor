@@ -98,7 +98,19 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 		fmt.Println("RESULT downloaded=0")
 		os.Exit(0)
 	}
-	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out)
+	// Real progress bar: report 0→90% as bytes stream (reserve 90→100 for verify).
+	lastPct := -1
+	onProg := func(done, total int64) {
+		if total <= 0 {
+			return
+		}
+		pct := int(done * 90 / total)
+		if pct > lastPct {
+			lastPct = pct
+			writeProgress(pct)
+		}
+	}
+	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out, onProg)
 	cErr := out.Close()
 	if derr != nil || cErr != nil || n == 0 {
 		_ = os.Remove(tmp)
@@ -236,7 +248,22 @@ func runDownloadMultiDisc(client *romm.Client, cfg *config.Config, rom romm.Rom,
 			fmt.Println("RESULT downloaded=0")
 			os.Exit(0)
 		}
-		n, dErr := client.DownloadRomFileTo(rom.ID, rom.FsName, f.ID, out)
+		// Real progress: this disc spans [i/total, (i+1)/total] of the overall bar;
+		// move smoothly within that band as its bytes stream.
+		discBase := i * 100 / total
+		discSpan := (i+1)*100/total - discBase
+		lastPct := -1
+		onProg := func(done, tot int64) {
+			if tot <= 0 || discSpan <= 0 {
+				return
+			}
+			pct := discBase + int(done*int64(discSpan)/tot)
+			if pct > lastPct {
+				lastPct = pct
+				writeProgress(pct)
+			}
+		}
+		n, dErr := client.DownloadRomFileTo(rom.ID, rom.FsName, f.ID, out, onProg)
 		cerr2 := out.Close()
 		if dErr != nil || cerr2 != nil || n == 0 {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc download rom=%d disc=%d: %s\n", rom.ID, i+1, safeErr(dErr))

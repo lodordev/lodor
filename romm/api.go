@@ -230,9 +230,9 @@ func (c *Client) DownloadRomContent(romID int, fsName string) ([]byte, error) {
 // never buffered), returning the bytes written. A multi-hundred-MB CHD costs near-zero
 // RAM this way — the buffered DownloadRomContent OOMs the 128 MB device. Same endpoint,
 // streamed; used by the single-file download path.
-func (c *Client) DownloadRomContentTo(romID int, fsName string, dst io.Writer) (int64, error) {
+func (c *Client) DownloadRomContentTo(romID int, fsName string, dst io.Writer, onProgress func(done, total int64)) (int64, error) {
 	path := fmt.Sprintf("/api/roms/%d/content/%s", romID, fsName)
-	return c.doRawStreamTo(path, dst)
+	return c.doRawStreamTo(path, dst, onProgress)
 }
 
 // DownloadRomFileTo streams ONE constituent file of a ROM (selected by its file id)
@@ -243,9 +243,9 @@ func (c *Client) DownloadRomContentTo(romID int, fsName string, dst io.Writer) (
 // streamed (io.Copy), never buffered, so a 482 MB disc costs near-zero RAM. fsName is
 // the ROM's fs_name (the URL still requires the {fs_name} path segment); spaces are
 // %20-escaped by buildURL. The caller owns dst.
-func (c *Client) DownloadRomFileTo(romID int, fsName string, fileID int, dst io.Writer) (int64, error) {
+func (c *Client) DownloadRomFileTo(romID int, fsName string, fileID int, dst io.Writer, onProgress func(done, total int64)) (int64, error) {
 	path := fmt.Sprintf("/api/roms/%d/content/%s?file_ids=%d", romID, fsName, fileID)
-	return c.doRawStreamTo(path, dst)
+	return c.doRawStreamTo(path, dst, onProgress)
 }
 
 // DownloadFirmwareContent fetches a BIOS/firmware file's bytes
