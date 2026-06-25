@@ -518,7 +518,8 @@ func runPushPending(client *romm.Client, cfg *config.Config) {
 	writeProgress(0)
 
 	var allResults []sync.PushResult
-	var remaining []string // entries to keep in the queue (not landed)
+	var remaining []string   // entries to keep in the queue (not landed)
+	var stuckLines []string  // human "STUCK\t<game>\t<why>" lines for the launcher (stdout)
 
 	for i, romPath := range pending {
 		writePhase(fmt.Sprintf("Uploading %s (%d/%d)…", filepath.Base(romPath), i+1, total))
@@ -533,6 +534,13 @@ func runPushPending(client *romm.Client, cfg *config.Config) {
 		// only stdout's RESULT line). This is the stuck-save self-diagnosis channel.
 		for _, r := range results {
 			fmt.Fprintln(os.Stderr, r.Line())
+		}
+		// A human reason per STUCK save, named by game, to STDOUT — the launcher reads
+		// this and tells the user WHY a save didn't upload (instead of "Uploaded 0").
+		for _, r := range results {
+			if why := stuckReason(r); why != "" {
+				stuckLines = append(stuckLines, fmt.Sprintf("STUCK\t%s\t%s", filepath.Base(romPath), why))
+			}
 		}
 
 		// A ROM is dequeued only when EVERY one of its save results is safely on the
@@ -554,7 +562,26 @@ func runPushPending(client *romm.Client, cfg *config.Config) {
 	}
 
 	fmt.Printf("RESULT pushed=%d total=%d stuck=%d\n", pushed, len(allResults), stuck)
+	for _, s := range stuckLines {
+		fmt.Println(s)
+	}
 	os.Exit(0)
+}
+
+// stuckReason maps a non-landed push outcome to a short, human, host-free reason the
+// launcher can show the user. Returns "" for outcomes that aren't stuck (Pushed /
+// AlreadyOnServer), so only genuinely-stuck saves produce a line.
+func stuckReason(r sync.PushResult) string {
+	switch r.Outcome {
+	case sync.OutcomeResolveFail:
+		return "this game is no longer on your server"
+	case sync.OutcomeNoLocalSave:
+		return "no save file found on the card"
+	case sync.OutcomeUploadError:
+		return "upload failed — check Wi-Fi and retry"
+	default:
+		return ""
+	}
 }
 
 // entryLanded reports whether every result for one ROM is safely on the server. An
