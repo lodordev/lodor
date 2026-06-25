@@ -166,6 +166,13 @@ func (c *Client) doRawStreamTo(path string, dst io.Writer, onProgress func(done,
 	if err != nil {
 		return n, fmt.Errorf("stream response body: %w", err)
 	}
+	// Truncation guard: if the server declared a Content-Length, the streamed byte count MUST
+	// match it. A connection that drops but still closes cleanly yields a short file — for a CHD
+	// (whose container bytes we deliberately don't hash) that would otherwise pass as a successful
+	// download and only fail at load time. Catch it here so a truncated ROM is never downloaded=1.
+	if resp.ContentLength > 0 && n != resp.ContentLength {
+		return n, fmt.Errorf("short read: got %d of %d bytes", n, resp.ContentLength)
+	}
 	return n, nil
 }
 

@@ -41,10 +41,14 @@ type romClient interface {
 	DownloadCover(coverPath string) ([]byte, error)
 }
 
-// platformIndex holds the two lookup tables for one platform.
+// platformIndex holds the lookup tables for one platform.
 type platformIndex struct {
-	ByBasename map[string]int `json:"by_basename"`
-	ByFsname   map[string]int `json:"by_fsname"`
+	ByBasename map[string]int    `json:"by_basename"`
+	ByFsname   map[string]int    `json:"by_fsname"`
+	// ByID maps rom_id -> SDCARD-relative path for every stubbed/present ROM, so
+	// --mirror-collections can resolve collection members WITHOUT re-fetching the whole
+	// library (that per-platform refetch was the multi-minute "collections hang").
+	ByID map[int]string `json:"by_id,omitempty"`
 }
 
 // index is the on-disk catalog-index.json shape (BLUEPRINT §5).
@@ -175,6 +179,7 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 		if pi.ByBasename == nil {
 			pi.ByBasename = map[string]int{}
 			pi.ByFsname = map[string]int{}
+			pi.ByID = map[int]string{}
 		}
 		for i := range page.Items {
 			rom := page.Items[i]
@@ -229,6 +234,9 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 				skipped++
 				continue
 			}
+			// Record rom_id -> SDCARD-relative path so --mirror-collections resolves members
+			// from the index instead of re-fetching the library.
+			pi.ByID[rom.ID] = strings.TrimPrefix(path, sdcardRoot())
 			if _, statErr := os.Stat(path); statErr == nil {
 				existing++
 				continue
@@ -305,36 +313,46 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 	}
 	total = len(collections)
 
-	sdRoot := sdcardRoot()
-
-	platforms, perr := getMappedPlatforms(client, cfg)
-	if perr != nil {
-		return 0, 0, total, perr
-	}
-
-	// rom_id -> SDCARD-relative path, over mapped platforms only, for ROMs present on card.
-	// This indexing pass walks the same per-platform pages as the catalog mirror, so we
-	// drive the bar 0..50 across it, then 50..100 across the collection writes below.
-	nPlat := len(platforms)
+	// rom_id -> SDCARD-relative path. FAST PATH: reuse the by_id map the preceding
+	// --mirror-catalog already wrote to the index. This avoids re-fetching the WHOLE
+	// library here (35 platforms / thousands of roms + an os.Stat each) — that refetch was
+	// the multi-minute "Updating collections" hang. The index is local: near-instant.
 	idPath := map[int]string{}
-	for pi2, p := range platforms {
-		rep.phase(fmt.Sprintf("Indexing %s (%d/%d)…", platformDisplay(p), pi2+1, nPlat))
-		if nPlat > 0 {
-			rep.percent((pi2 + 1) * 50 / nPlat)
+	if idx, lerr := loadIndex(IndexPath(cfg)); lerr == nil {
+		for _, pidx := range idx.Platforms {
+			for id, rel := range pidx.ByID {
+				idPath[id] = rel
+			}
 		}
-		page, gerr := client.GetRoms(romm.GetRomsQuery{PlatformIDs: []int{p.ID}})
-		if gerr != nil {
-			continue
+	}
+	// FALLBACK (rare): no usable index yet (collections run before any catalog mirror).
+	// Do the live per-platform walk so collections still work — just slowly, this once.
+	if len(idPath) == 0 {
+		sdRoot := sdcardRoot()
+		platforms, perr := getMappedPlatforms(client, cfg)
+		if perr != nil {
+			return 0, 0, total, perr
 		}
-		for i := range page.Items {
-			abs := platform.LocalRomPath(cfg, page.Items[i])
-			if abs == "" {
+		nPlat := len(platforms)
+		for pi2, p := range platforms {
+			rep.phase(fmt.Sprintf("Indexing %s (%d/%d)…", platformDisplay(p), pi2+1, nPlat))
+			if nPlat > 0 {
+				rep.percent((pi2 + 1) * 50 / nPlat)
+			}
+			page, gerr := client.GetRoms(romm.GetRomsQuery{PlatformIDs: []int{p.ID}})
+			if gerr != nil {
 				continue
 			}
-			if _, statErr := os.Stat(abs); statErr != nil {
-				continue // only list ROMs whose file (real or stub) exists on card
+			for i := range page.Items {
+				abs := platform.LocalRomPath(cfg, page.Items[i])
+				if abs == "" {
+					continue
+				}
+				if _, statErr := os.Stat(abs); statErr != nil {
+					continue // only list ROMs whose file (real or stub) exists on card
+				}
+				idPath[page.Items[i].ID] = strings.TrimPrefix(abs, sdRoot)
 			}
-			idPath[page.Items[i].ID] = strings.TrimPrefix(abs, sdRoot)
 		}
 	}
 
