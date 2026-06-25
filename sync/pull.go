@@ -30,6 +30,11 @@ const (
 	PullResolveFail
 	// PullError: a download/write failure (Reason carries a short host-free string).
 	PullError
+	// PullSnapshotFail: the restore was ABORTED by the Flashback lose-proof guard because
+	// the device's current save could not be preserved to the timeline first. Nothing
+	// was overwritten — distinct from PullError so the UI can say "your current save
+	// wasn't safe to overwrite" instead of a generic failure.
+	PullSnapshotFail
 )
 
 func (o PullOutcome) String() string {
@@ -44,6 +49,8 @@ func (o PullOutcome) String() string {
 		return "ResolveFail"
 	case PullError:
 		return "Error"
+	case PullSnapshotFail:
+		return "SnapshotFail"
 	default:
 		return "Unknown"
 	}
@@ -120,18 +127,18 @@ func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save r
 		return PullResult{Outcome: PullResolveFail, Reason: "no save directory"}
 	}
 
-	// Rewind Pillar A — lose-proof. Before this restore overwrites the live save,
+	// Flashback Pillar A — lose-proof. Before this restore overwrites the live save,
 	// preserve the device's CURRENT save by pushing it to the server timeline first.
-	// A rewind to an older point can then never silently destroy unsynced progress:
-	// that progress becomes its own permanent point you can rewind back to. Content-
+	// A flashback to an older point can then never silently destroy unsynced progress:
+	// that progress becomes its own permanent point you can flash back to. Content-
 	// hash dedup makes it a no-op when the current save is already backed up. If a real
 	// local save exists and CANNOT be preserved, the restore is aborted (mirroring
 	// "if the backup fails, abort") rather than trading known progress for old bytes.
 	if ok, pushed, reason := snapshotLocalSaves(client, cfg, rom); !ok {
-		fmt.Fprintf(os.Stderr, "rewind: restore ABORTED — %s (rom %d)\n", reason, rom.ID)
-		return PullResult{Outcome: PullError, Reason: reason}
+		fmt.Fprintf(os.Stderr, "flashback: restore ABORTED — %s (rom %d)\n", reason, rom.ID)
+		return PullResult{Outcome: PullSnapshotFail, Reason: reason}
 	} else if pushed > 0 {
-		fmt.Fprintf(os.Stderr, "rewind: preserved %d current save(s) to the timeline before restore (rom %d)\n", pushed, rom.ID)
+		fmt.Fprintf(os.Stderr, "flashback: preserved %d current save(s) to the timeline before restore (rom %d)\n", pushed, rom.ID)
 	}
 
 	if res := writeSave(client, cfg, save.ID, localPath); res.Outcome != PullWritten {
@@ -141,7 +148,7 @@ func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save r
 }
 
 // snapshotLocalSaves preserves the device's current local save(s) for a ROM by pushing
-// them to the server timeline BEFORE a restore overwrites them (Rewind Pillar A). It
+// them to the server timeline BEFORE a restore overwrites them (Flashback Pillar A). It
 // reuses the already-resolved rom (no extra GetRom). ok is true when it is SAFE to
 // proceed with the overwrite — either nothing local exists to lose, or every local
 // save is now on the server (freshly pushed, or already there by content hash). ok is
@@ -158,7 +165,7 @@ func snapshotLocalSaves(client *romm.Client, cfg *config.Config, rom romm.Rom) (
 		case OutcomePushed, OutcomeAlreadyOnServer:
 			pushed++
 		case OutcomeUploadError, OutcomeHashMismatch:
-			return false, pushed, "couldn't preserve current save before rewind"
+			return false, pushed, "couldn't preserve current save before flashback"
 		}
 	}
 	return true, pushed, ""

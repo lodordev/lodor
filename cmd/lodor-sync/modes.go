@@ -664,14 +664,31 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 		os.Exit(0)
 	}
 	restored := false
+	reason := "notfound" // save id not among this ROM's saves
 	for _, s := range saves {
 		if s.ID == saveID {
 			res := sync.RestoreSave(client, cfg, romPath, s)
 			restored = res.Pulled()
+			// "unsafe" = the lose-proof guard aborted (current save couldn't be
+			// preserved). Distinct from a plain download/write failure so the UI can be
+			// honest about WHY nothing changed. The reason token is additive on the
+			// RESULT line; older parsers that only read restored= are unaffected.
+			switch res.Outcome {
+			case sync.PullSnapshotFail:
+				reason = "unsafe"
+			case sync.PullResolveFail:
+				reason = "resolve"
+			case sync.PullError:
+				reason = "download"
+			}
 			break
 		}
 	}
-	fmt.Printf("RESULT restored=%d\n", b2i(restored))
+	if restored {
+		fmt.Println("RESULT restored=1")
+	} else {
+		fmt.Printf("RESULT restored=0 reason=%s\n", reason)
+	}
 	os.Exit(0)
 }
 
