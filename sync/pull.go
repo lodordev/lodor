@@ -1,7 +1,6 @@
 package sync
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,48 +126,66 @@ func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save r
 		return PullResult{Outcome: PullResolveFail, Reason: "no save directory"}
 	}
 
-	// Flashback Pillar A — lose-proof. Before this restore overwrites the live save,
-	// preserve the device's CURRENT save by pushing it to the server timeline first.
-	// A flashback to an older point can then never silently destroy unsynced progress:
-	// that progress becomes its own permanent point you can flash back to. Content-
-	// hash dedup makes it a no-op when the current save is already backed up. If a real
-	// local save exists and CANNOT be preserved, the restore is aborted (mirroring
-	// "if the backup fails, abort") rather than trading known progress for old bytes.
-	if ok, pushed, reason := snapshotLocalSaves(client, cfg, rom); !ok {
-		fmt.Fprintf(os.Stderr, "flashback: restore ABORTED — %s (rom %d)\n", reason, rom.ID)
-		return PullResult{Outcome: PullSnapshotFail, Reason: reason}
-	} else if pushed > 0 {
-		fmt.Fprintf(os.Stderr, "flashback: preserved %d current save(s) to the timeline before restore (rom %d)\n", pushed, rom.ID)
-	}
-
+	// Pure overwrite. Preserving the device's CURRENT save before this lands (Flashback
+	// Pillar A, lose-proof) is the CALLER's job (cmd runRestoreSave), because it must
+	// work OFFLINE: when the current save can't be pushed to the timeline right now, the
+	// caller stages its bytes and queues them for a later upload rather than blocking the
+	// flashback. writeSave still renames the existing local save to .bak as a local net.
 	if res := writeSave(client, cfg, save.ID, localPath); res.Outcome != PullWritten {
 		return res
 	}
 	return PullResult{Outcome: PullWritten, LocalPath: localPath}
 }
 
-// snapshotLocalSaves preserves the device's current local save(s) for a ROM by pushing
-// them to the server timeline BEFORE a restore overwrites them (Flashback Pillar A). It
-// reuses the already-resolved rom (no extra GetRom). ok is true when it is SAFE to
-// proceed with the overwrite — either nothing local exists to lose, or every local
-// save is now on the server (freshly pushed, or already there by content hash). ok is
-// false ONLY when a real local save could not be preserved (a genuine upload error),
-// so the caller can abort instead of destroying unsynced progress. pushed counts saves
-// newly secured this call (for an honest log line); reason is host-free.
-func snapshotLocalSaves(client *romm.Client, cfg *config.Config, rom romm.Rom) (ok bool, pushed int, reason string) {
-	saves := findLocalSavesForRom(rom.PlatformFsSlug, rom)
-	if len(saves) == 0 {
-		return true, 0, "" // nothing on the device to lose
+// LocalSaveFilesForRom returns the absolute paths of the save file(s) currently on the
+// card for the ROM at romPath — the bytes a flashback is about to overwrite. Exported so
+// the cmd layer can stage them for deferred upload before calling RestoreSave. Empty when
+// the ROM doesn't resolve or has no local save yet.
+func LocalSaveFilesForRom(client *romm.Client, cfg *config.Config, romPath string) []string {
+	rom, _, ok := resolveRomAndLocalSavePath(client, cfg, romPath, "")
+	if !ok {
+		return nil
 	}
-	for _, sf := range saves {
-		switch pushOne(client, cfg, rom, sf).Outcome {
-		case OutcomePushed, OutcomeAlreadyOnServer:
-			pushed++
-		case OutcomeUploadError, OutcomeHashMismatch:
-			return false, pushed, "couldn't preserve current save before flashback"
+	var out []string
+	for _, sf := range findLocalSavesForRom(rom.PlatformFsSlug, rom) {
+		out = append(out, sf.path)
+	}
+	return out
+}
+
+// PushSaveFile uploads ONE explicit save file to the timeline for the ROM at romPath,
+// independent of what's currently in the save directory. This is how a STAGED pre-
+// flashback save (copied aside before the overwrite) reaches the server later via
+// --push-pending, even though the live save file now holds the flashed-back bytes.
+// emulator labels the timeline point's origin; "" is acceptable.
+func PushSaveFile(client *romm.Client, cfg *config.Config, romPath, filePath, emulator string) PushResult {
+	res := PushResult{SaveFile: filepath.Base(filePath), Emulator: emulator}
+	romID, ok := catalog.ResolveRomID(cfg, romPath)
+	if !ok || romID == 0 {
+		res.Outcome = OutcomeResolveFail
+		return res
+	}
+	rom, err := client.GetRom(romID)
+	if err != nil || rom.ID == 0 {
+		res.Outcome = OutcomeResolveFail
+		res.Err = cleanErr(orErr(err))
+		return res
+	}
+	q := romm.UploadSaveQuery{
+		RomID: rom.ID, DeviceID: deviceID(cfg), Emulator: emulator,
+		Slot: "autosave", Autocleanup: true, AutocleanupLimit: 25,
+	}
+	if _, err := client.UploadSave(q, filePath); err != nil {
+		if AlreadyOnServer(client, rom.ID, filePath) {
+			res.Outcome = OutcomeAlreadyOnServer
+			return res
 		}
+		res.Outcome = OutcomeUploadError
+		res.Err = cleanErr(err)
+		return res
 	}
-	return true, pushed, ""
+	res.Outcome = OutcomePushed
+	return res
 }
 
 // resolveRomAndLocalSavePath reverses romPath to a rom_id (catalog index), fetches

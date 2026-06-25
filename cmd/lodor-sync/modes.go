@@ -521,10 +521,28 @@ func runPushPending(client *romm.Client, cfg *config.Config) {
 	var remaining []string   // entries to keep in the queue (not landed)
 	var stuckLines []string  // human "STUCK\t<game>\t<why>" lines for the launcher (stdout)
 
-	for i, romPath := range pending {
+	for i, line := range pending {
+		romPath, stagedPath, emu, isStaged := parseQueueLine(line)
 		writePhase(fmt.Sprintf("Uploading %s (%d/%d)…", filepath.Base(romPath), i+1, total))
 		if total > 0 {
 			writeProgress((i + 1) * 100 / total)
+		}
+
+		// Staged entry: upload the parked pre-flashback FILE (the live save now holds the
+		// flashed-back bytes), then delete the staged copy once it's safely on the timeline.
+		if isStaged {
+			r := sync.PushSaveFile(client, cfg, romPath, stagedPath, emu)
+			allResults = append(allResults, r)
+			fmt.Fprintln(os.Stderr, r.Line())
+			if r.Outcome == sync.OutcomePushed || r.Outcome == sync.OutcomeAlreadyOnServer {
+				_ = os.Remove(stagedPath)
+				continue // landed → drop from queue
+			}
+			if why := stuckReason(r); why != "" {
+				stuckLines = append(stuckLines, fmt.Sprintf("STUCK\t%s\t%s", filepath.Base(romPath), why))
+			}
+			remaining = append(remaining, line) // keep the staged line to retry
+			continue
 		}
 
 		results := sync.PushSaveDirect(client, cfg, romPath)
@@ -644,49 +662,75 @@ func runListSaves(client *romm.Client, cfg *config.Config, romPath string) {
 	os.Exit(0)
 }
 
-// runRestoreSave restores one specific server save (by id) for a ROM and writes it
-// to the local save file (backing up the existing one). Contract:
-// RESULT restored=<0|1>. The save id is the positional arg.
+// runRestoreSave flashes one specific server save (by id) onto the local save file.
+// Contract: RESULT restored=<0|1> [staged=<N>] [reason=<...>]. The save id is the
+// positional arg.
+//
+// Flashback Pillar A — lose-proof, OFFLINE-FIRST: before overwriting the live save, the
+// device's CURRENT save is preserved. We first try to push it to the timeline now; when
+// that fails (offline), its bytes are STAGED and queued so they upload on the next sync
+// instead of blocking the flashback. The flashback is never aborted just because we're
+// offline — staged=N reports how many current saves were parked for later upload, so the
+// launcher can say so honestly.
 func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg string) {
 	id, ok := catalog.ResolveRomID(cfg, romPath)
 	if !ok || id == 0 {
-		fmt.Println("RESULT restored=0")
+		fmt.Println("RESULT restored=0 reason=resolve")
 		os.Exit(0)
 	}
 	saveID, perr := strconv.Atoi(strings.TrimSpace(saveIDArg))
 	if perr != nil {
-		fmt.Println("RESULT restored=0")
+		fmt.Println("RESULT restored=0 reason=badid")
 		os.Exit(0)
 	}
 	saves, err := client.GetSaves(romm.SaveQuery{RomID: id})
 	if err != nil {
-		fmt.Println("RESULT restored=0")
+		fmt.Println("RESULT restored=0 reason=download")
 		os.Exit(0)
 	}
-	restored := false
-	reason := "notfound" // save id not among this ROM's saves
+	var chosen romm.Save
+	found := false
 	for _, s := range saves {
 		if s.ID == saveID {
-			res := sync.RestoreSave(client, cfg, romPath, s)
-			restored = res.Pulled()
-			// "unsafe" = the lose-proof guard aborted (current save couldn't be
-			// preserved). Distinct from a plain download/write failure so the UI can be
-			// honest about WHY nothing changed. The reason token is additive on the
-			// RESULT line; older parsers that only read restored= are unaffected.
-			switch res.Outcome {
-			case sync.PullSnapshotFail:
-				reason = "unsafe"
-			case sync.PullResolveFail:
-				reason = "resolve"
-			case sync.PullError:
-				reason = "download"
-			}
+			chosen = s
+			found = true
 			break
 		}
 	}
-	if restored {
-		fmt.Println("RESULT restored=1")
+	if !found {
+		fmt.Println("RESULT restored=0 reason=notfound")
+		os.Exit(0)
+	}
+
+	// Preserve the current save before the overwrite. Push it to the timeline now; if
+	// that doesn't land (offline), stage each current save file and queue it for later.
+	staged := 0
+	if current := sync.LocalSaveFilesForRom(client, cfg, romPath); len(current) > 0 {
+		if !entryLanded(sync.PushSaveDirect(client, cfg, romPath)) {
+			for _, f := range current {
+				sp, serr := stageSaveFile(f)
+				if serr != nil {
+					fmt.Fprintf(os.Stderr, "flashback: WARN couldn't stage current save: %s\n", safeErr(serr))
+					continue
+				}
+				if qerr := enqueueStaged(romPath, sp, filepath.Base(filepath.Dir(f))); qerr != nil {
+					fmt.Fprintf(os.Stderr, "flashback: WARN couldn't queue staged save: %s\n", safeErr(qerr))
+					_ = os.Remove(sp)
+					continue
+				}
+				staged++
+			}
+		}
+	}
+
+	res := sync.RestoreSave(client, cfg, romPath, chosen)
+	if res.Pulled() {
+		fmt.Printf("RESULT restored=1 staged=%d\n", staged)
 	} else {
+		reason := "download"
+		if res.Outcome == sync.PullResolveFail {
+			reason = "resolve"
+		}
 		fmt.Printf("RESULT restored=0 reason=%s\n", reason)
 	}
 	os.Exit(0)

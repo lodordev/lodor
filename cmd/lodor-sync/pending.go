@@ -1,10 +1,76 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// stagingDir holds pre-flashback save snapshots until --push-pending uploads them to the
+// timeline. Under the pak dir so it travels with the queue (offline-first Flashback).
+func stagingDir() string { return filepath.Join(pakDir(), ".flashback-staging") }
+
+// stageSaveFile copies srcSavePath to a unique file under stagingDir and returns its
+// absolute path, capturing the CURRENT save bytes before a flashback overwrites the live
+// file so they can still be uploaded later. Empty path + error on failure.
+func stageSaveFile(srcSavePath string) (string, error) {
+	if err := os.MkdirAll(stagingDir(), 0o755); err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(srcSavePath)
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(srcSavePath)
+	var lastErr error
+	for i := 0; i < 10000; i++ {
+		cand := filepath.Join(stagingDir(), fmt.Sprintf("%s.%d.staged", base, i))
+		f, err := os.OpenFile(cand, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil { // name taken — try the next index (no time/rand needed for uniqueness)
+			lastErr = err
+			continue
+		}
+		_, werr := f.Write(data)
+		cerr := f.Close()
+		if werr != nil {
+			_ = os.Remove(cand)
+			return "", werr
+		}
+		if cerr != nil {
+			return "", cerr
+		}
+		return cand, nil
+	}
+	return "", lastErr
+}
+
+// enqueueStaged appends a staged-save entry to pending-saves.txt under the queue lock.
+// Format: "<rompath>\t<stagedAbsPath>\t<emulator>" — three TAB fields mark a staged entry
+// (vs the bare rompath line the minarch shim writes); the banner still counts it as one
+// pending save, and --push-pending uploads the staged FILE (not the now-overwritten live
+// save) then deletes it.
+func enqueueStaged(romPath, stagedPath, emulator string) error {
+	release := acquireQueueLock()
+	defer release()
+	cur := pendingRead()
+	cur = append(cur, romPath+"\t"+stagedPath+"\t"+emulator)
+	return pendingWrite(cur)
+}
+
+// parseQueueLine classifies a pending-saves.txt line. A bare line is a ROM path (push the
+// current live save); a TAB-split line is a staged pre-flashback snapshot (push the named
+// staged file for that ROM). emu is "" when absent.
+func parseQueueLine(line string) (romPath, stagedPath, emu string, staged bool) {
+	parts := strings.Split(line, "\t")
+	if len(parts) < 2 {
+		return line, "", "", false
+	}
+	if len(parts) >= 3 {
+		emu = parts[2]
+	}
+	return parts[0], parts[1], emu, true
+}
 
 // pending-saves.txt is the offline-first upload queue the minarch shim appends to
 // after a game whose save changed (BLUEPRINT §8): one ABSOLUTE on-card ROM path per
