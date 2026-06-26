@@ -78,6 +78,25 @@ type DirMapping struct {
 	RelativePath string `json:"relative_path,omitempty"`
 }
 
+// Mirror modes govern HOW the RomM library is laid down on the card relative to a
+// user's own existing games (BLUEPRINT §coexist / issue #68).
+//
+// "own" is the LodorOS default: the card IS the RomM library — folders are named
+// "<Display> (<TAG>)" and stub basenames are byte-identical to the server's (the
+// historical, only behavior). "separate" is the NextUI default: RomM is mirrored into
+// distinct "<Display> RomM (<TAG>)" folders that bind the right emulator yet never
+// collide with the user's own "<Display> (<TAG>)" folders, and stub basenames are
+// disambiguated so a RomM stub never shares a save file with a user's local game — the
+// user's existing folders and games are NEVER touched. "merge" (adopt-folder-by-tag +
+// filename-normalize dedup + scoped prune + saves-off-until-opt-in) is NOT YET
+// IMPLEMENTED and is treated as "separate" (safe, non-destructive) until the #68 design
+// lands; see the TODO in catalog/generate.go.
+const (
+	MirrorModeOwn      = "own"
+	MirrorModeSeparate = "separate"
+	MirrorModeMerge    = "merge"
+)
+
 // Config is the parsed config.json. ApiTimeout and DownloadTimeout are stored in
 // whole seconds; see Seconds-typed unmarshal for the legacy nanosecond fallback.
 type Config struct {
@@ -85,6 +104,12 @@ type Config struct {
 	DirectoryMappings map[string]DirMapping `json:"directory_mappings,omitempty"`
 	ApiTimeout        Seconds               `json:"api_timeout"`
 	DownloadTimeout   Seconds               `json:"download_timeout"`
+
+	// MirrorMode is the coexist mode (own|separate|merge). Written by the pak's
+	// settings toggle. Absent/unrecognized => ResolvedMirrorMode() picks a host-aware
+	// default (own on LodorOS, separate elsewhere), so an older config stays own and a
+	// NextUI card defaults to the non-destructive separate layout.
+	MirrorMode string `json:"mirror_mode,omitempty"`
 
 	// FetchCovers gates ONLY the BULK box-art fetch during --mirror-catalog. It is a
 	// *bool whose DEFAULT is OFF (opt-in): an absent key (older configs, the
@@ -107,6 +132,44 @@ func (c *Config) CoversEnabled() bool {
 		return false
 	}
 	return *c.FetchCovers
+}
+
+// ResolvedMirrorMode returns the effective coexist mode. An explicit, recognized
+// mirror_mode (case/space-insensitive) always wins. When absent or unrecognized it
+// falls back to the host default: "own" on a LodorOS host (byte-identical to today),
+// "separate" on any other host so RomM games land in distinct, non-colliding folders.
+// Nil-safe.
+func (c *Config) ResolvedMirrorMode() string {
+	if c != nil {
+		switch strings.ToLower(strings.TrimSpace(c.MirrorMode)) {
+		case MirrorModeOwn:
+			return MirrorModeOwn
+		case MirrorModeSeparate:
+			return MirrorModeSeparate
+		case MirrorModeMerge:
+			return MirrorModeMerge
+		}
+	}
+	return hostMirrorModeDefault()
+}
+
+// hostMirrorModeDefault picks the mirror mode for a config that carries no explicit
+// mirror_mode. The host is identified by the LODOR_HOST_OS env the launcher exports:
+// "nextui" (or any other recognized non-LodorOS host) => separate; "lodoros"/"minui"
+// => own. When the hint is ABSENT we assume LodorOS and return "own", so existing
+// LodorOS cards — which export nothing new — stay byte-identical to today, while the
+// NextUI Lodor.pak (which writes mirror_mode explicitly AND exports LODOR_HOST_OS=
+// nextui) gets separate. An explicitly-set but unrecognized host is, by definition,
+// not LodorOS, so it defaults separate.
+func hostMirrorModeDefault() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LODOR_HOST_OS"))) {
+	case "", "lodoros", "lodor", "minui":
+		return MirrorModeOwn
+	case "nextui":
+		return MirrorModeSeparate
+	default:
+		return MirrorModeSeparate
+	}
 }
 
 // Seconds is a duration expressed as whole seconds in JSON. To stay compatible
