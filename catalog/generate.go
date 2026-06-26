@@ -27,13 +27,16 @@ type platformLister interface {
 }
 
 // GenerateDirectoryMappings builds a directory_mappings map from the user's RomM
-// platforms: for each platform the engine has a known MinUI emulator tag for, it
-// emits fs_slug -> {slug: fs_slug, relative_path: "<Display Name> (<TAG>)"} where
-// <TAG> is platform.PrimaryTag(fs_slug) and <Display Name> is the platform's RomM
-// name (custom_name preferred, then name, falling back to fs_slug). Platforms with
-// NO known tag are SKIPPED (no folder invented) and counted. Returns the generated
-// map plus generated/skipped counts; never logs or returns a secret.
-func GenerateDirectoryMappings(client platformLister) (mappings map[string]config.DirMapping, generated, skipped int, err error) {
+// platforms: for each platform the engine has a known MinUI emulator tag for AND a
+// launchable Emu pak installed, it emits fs_slug -> {slug: fs_slug, relative_path}
+// where relative_path is mode-aware (mirrorFolderName): "<Display> (<TAG>)" in "own"
+// mode, "<Display> RomM (<TAG>)" in "separate"/"merge" so RomM folders never collide
+// with the user's own "<Display> (<TAG>)". <TAG> is platform.PrimaryTag(fs_slug) and
+// <Display> is the platform's RomM name (custom_name preferred, then name, falling back
+// to fs_slug). Platforms with NO known tag, or no installed pak, are SKIPPED (no folder
+// invented) and counted. Returns the generated map plus generated/skipped counts; never
+// logs or returns a secret.
+func GenerateDirectoryMappings(client platformLister, mode string) (mappings map[string]config.DirMapping, generated, skipped int, err error) {
 	platforms, perr := client.GetPlatforms()
 	if perr != nil {
 		return nil, 0, 0, perr
@@ -53,20 +56,35 @@ func GenerateDirectoryMappings(client platformLister) (mappings map[string]confi
 		}
 		if !platform.HasEmuPak(tag) {
 			// Known tag, but NO emulator pak installed on this device (e.g. DS/3DS/PSP on a
-			// Mini Flip). Mapping it would stub a library of games that can't launch — and a
-			// search would happily download them. Skip it; a device that later adds the pak
-			// picks the platform up on the next mapping generation.
+			// Mini Flip, or N64 on a Trimui/tg5040 that ships no N64 pak). Mapping it would
+			// stub a library of games that can't launch — and a search would happily download
+			// them. Skip it; a device that later adds the pak picks the platform up on the
+			// next mapping generation.
 			skipped++
 			continue
 		}
 		display := sanitizeFolderName(platformDisplayName(p))
 		mappings[p.FsSlug] = config.DirMapping{
 			Slug:         p.FsSlug,
-			RelativePath: fmt.Sprintf("%s (%s)", display, tag),
+			RelativePath: mirrorFolderName(display, tag, mode),
 		}
 		generated++
 	}
 	return mappings, generated, skipped, nil
+}
+
+// mirrorFolderName builds the Roms/ folder a platform's RomM games are mirrored into.
+// In "own" mode (LodorOS — the card IS the library) it is the historical "<Display>
+// (<TAG>)". In "separate"/"merge" it is "<Display> RomM (<TAG>)": NextUI's getEmuName
+// binds off the LAST paren so this still launches <TAG>.pak, getDisplayName strips the
+// trailing paren so it reads "<Display> RomM", and it can never collide with the user's
+// own "<Display> (<TAG>)" folder (verified naming, issue #68). "merge" reuses the
+// separate layout until the adopt-by-tag design lands (see ensureDirectoryMappings).
+func mirrorFolderName(display, tag, mode string) string {
+	if mode == config.MirrorModeOwn {
+		return fmt.Sprintf("%s (%s)", display, tag)
+	}
+	return fmt.Sprintf("%s RomM (%s)", display, tag)
 }
 
 // sanitizeFolderName makes a platform display name safe as a SINGLE flat folder
@@ -119,7 +137,18 @@ func ensureDirectoryMappings(client romClient, cfg *config.Config) error {
 		return errNoPlatforms
 	}
 
-	mappings, generated, skipped, gerr := GenerateDirectoryMappings(lister)
+	mode := cfg.ResolvedMirrorMode()
+	if mode == config.MirrorModeMerge {
+		// TODO(#68): merge mode (adopt user folder by tag + filename-normalize dedup +
+		// scoped prune + saves-off-until-opt-in) is not implemented yet. Fall back to the
+		// SEPARATE layout, which is the safe subset: RomM lands in its own "… RomM (TAG)"
+		// folders and the user's library is never touched. Logged (host-free) so the run
+		// is honest about what it did.
+		fmt.Fprintf(os.Stderr, "MAPGEN mirror_mode=merge not yet implemented — using separate layout (user library untouched)\n")
+		mode = config.MirrorModeSeparate
+	}
+
+	mappings, generated, skipped, gerr := GenerateDirectoryMappings(lister, mode)
 	if gerr != nil {
 		return gerr
 	}
