@@ -18,7 +18,8 @@ has no UI; the front-end (menus, onboarding, progress) lives in the OS and port 
   device's per-system folders, and emit a resolution index (no database needed).
 - **Fetch on launch** — resolve a tapped stub to its RomM ROM, stream the real file to disk, verify it.
 - **Save sync** — push local saves to RomM (additive, versioned) and pull/restore newer ones, with a
-  pending queue for offline writes.
+  pending queue for offline writes. A restore preserves the current save first — pushing it, or staging
+  it for deferred upload when offline — so it can never trade away unsynced progress.
 - **Catalog & collections** — mirror platforms and RomM collections to the device.
 - **Box art & BIOS** — fetch covers (lazily) and per-platform firmware.
 - **Onboarding** — pair to a server with a one-time code (no admin credentials on the device).
@@ -56,13 +57,14 @@ Configuration lives in `config.json` next to the binary (see `config.json.exampl
 | `--pair <code>` | Exchange a RomM pairing code for a client token; write `config.json`. |
 | `--register-device <name>` / `--rename-device <name>` | Register/rename this device. |
 | `--validate` | Check reachability + auth. Prints `reachable=<0\|1> auth=<0\|1>`. |
-| `--mirror-catalog` | Stub every not-downloaded ROM into `Roms/`; write the resolution index. |
+| `--mirror-catalog` | Stub every not-downloaded ROM into `Roms/` (only platforms with an installed emulator pak — never games the device can't launch); write the resolution index. |
 | `--mirror-collections` | Write `Collections/<name>.txt` per RomM collection. |
 | `--download <rom>` | Fetch one ROM's real file (resolve → stream → verify). Multi-disc aware. |
 | `--download-bios` | Fetch BIOS/firmware for every mapped platform. |
 | `--sync-save <rom>` | Pull-then-push the save for one ROM. |
 | `--list-saves <rom>` / `--restore-save <rom> <id>` | List / restore server save revisions. |
 | `--push-pending` | Upload every queued pending save. |
+| `--recent` | Print the single most-recently-played game across devices (powers the Continue tile). |
 | `--sync-feed` | List recent server saves, newest first. |
 
 Each prints a `RESULT …` summary line.
