@@ -214,21 +214,46 @@ func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string
 	return filepath.Join(RomsDir(), folder)
 }
 
+// romMDisambiguator is the marker appended to a RomM stub's basename in non-"own"
+// mirror modes. NextUI/MinUI key a save file off the ROM's on-disk basename
+// (Saves/<TAG>/<basename>.sav), so two same-named games in different folders that bind
+// the same TAG would share — and corrupt — one save. Appending this marker gives the
+// RomM copy its own save namespace. NextUI's getDisplayName strips trailing "(...)"
+// groups, so the on-screen game name is unchanged.
+const romMDisambiguator = " (RomM)"
+
+// LocalBasename returns the extension-less on-disk basename a ROM occupies under the
+// active mirror mode. In "own" mode it is rom.CanonicalLocalBasename() — byte-identical
+// to the server's name. In "separate"/"merge" modes it appends romMDisambiguator so a
+// RomM stub's save (and on-disk file) can never collide with a user's own same-named
+// game in a different folder that binds the same TAG. This is the single source of
+// truth shared by LocalRomPath and the catalog index keys, so a stub written here
+// resolves back to its rom_id by the same name.
+func LocalBasename(cfg *config.Config, rom romm.Rom) string {
+	base := rom.CanonicalLocalBasename()
+	if base == "" || cfg.ResolvedMirrorMode() == config.MirrorModeOwn {
+		return base
+	}
+	return base + romMDisambiguator
+}
+
 // LocalRomPath returns the absolute on-disk path a ROM occupies under RomsDir:
-// <RomsDir>/<mapped folder>/<rom.Files[0].FileName> for single-file ROMs, or
-// <RomsDir>/<mapped folder>/<FsNameNoExt>.m3u for multi-file ROMs. Mirrors grout's
-// Rom.GetLocalPath (BLUEPRINT §4). Returns "" when the ROM has no platform slug or
-// no resolvable file.
+// <RomsDir>/<mapped folder>/<basename><ext> for single-file ROMs, or
+// <RomsDir>/<mapped folder>/<basename>.m3u for multi-file ROMs, where <basename> is the
+// mode-aware LocalBasename (disambiguated in non-"own" modes). Byte-identical to grout's
+// Rom.GetLocalPath (BLUEPRINT §4) in "own" mode. Returns "" when the ROM has no platform
+// slug or no resolvable file.
 func LocalRomPath(cfg *config.Config, rom romm.Rom) string {
 	if rom.PlatformFsSlug == "" {
 		return ""
 	}
 	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
+	base := LocalBasename(cfg, rom)
 	if rom.HasMultipleFiles {
-		return filepath.Join(romDir, rom.FsNameNoExt+".m3u")
+		return filepath.Join(romDir, base+".m3u")
 	}
 	if len(rom.Files) > 0 {
-		return filepath.Join(romDir, rom.Files[0].FileName)
+		return filepath.Join(romDir, base+filepath.Ext(rom.Files[0].FileName))
 	}
 	return ""
 }

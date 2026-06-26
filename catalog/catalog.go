@@ -196,9 +196,13 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 		for i := range page.Items {
 			rom := page.Items[i]
 
-			// Index every ROM (single- and multi-file) so resolution works for all.
-			if rom.CanonicalLocalBasename() != "" {
-				pi.ByBasename[rom.CanonicalLocalBasename()] = rom.ID
+			// Index every ROM (single- and multi-file) so resolution works for all. Key
+			// by the mode-aware on-disk basename (LocalBasename) — the SAME name the stub
+			// is written under (disambiguated in non-"own" modes) — so ResolveRomID, which
+			// reverses the on-disk path, finds the rom_id. ByFsname keeps the raw server
+			// fs_name as a secondary key for any caller resolving by the original name.
+			if lb := platform.LocalBasename(cfg, rom); lb != "" {
+				pi.ByBasename[lb] = rom.ID
 			}
 			if rom.FsName != "" {
 				pi.ByFsname[rom.FsName] = rom.ID
