@@ -139,92 +139,10 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 	}
 	writeProgress(100)
 
-	finalPath := dest
-	if relocateOnDownload() {
-		if dl := platform.OnDeviceRomPath(cfg, rom); dl != "" && dl != dest {
-			if rerr := relocateDownloaded(dest, dl); rerr == nil {
-				finalPath = dl
-			} else {
-				fmt.Fprintf(os.Stderr, "DLMOVE warn rom=%d: %s (left in cloud folder)\n", rom.ID, safeErr(rerr))
-			}
-		}
-	}
-
-	fetchRomCover(client, rom, finalPath)
+	fetchRomCover(client, rom, dest)
 
 	fmt.Println("RESULT downloaded=1")
 	os.Exit(0)
-}
-
-// relocateOnDownload reports whether a verified download is RELOCATED out of its
-// "<System> RomM (<TAG>)" cloud folder into the on-device "<System> (<TAG>)" folder
-// (NextUI folder-as-badge). Default ON. The fetch-on-launch hook sets
-// LODOR_NO_RELOCATE=1 to SUPPRESS it: on stock NextUI the launcher's `eval $CMD`
-// (MinUI.pak/launch.sh) launches the ORIGINAL selected path immediately after the
-// synchronous pre-launch hook, and a pre-launch hook "cannot cancel the launch"
-// (NextUI HOOKS.md) — so moving the file out from under the in-flight launch would
-// make it open a dead path. With relocation suppressed the game stays put for the
-// immediate launch and the move-aware mirror relocates it on the next seed/refresh.
-func relocateOnDownload() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("LODOR_NO_RELOCATE"))) {
-	case "1", "true", "yes", "on":
-		return false
-	}
-	return true
-}
-
-// relocateDownloaded moves a verified single-file download from src to its on-device
-// twin dst, keeping the basename (save namespace preserved). Clears any stale stub at
-// dst, then best-effort moves the box-art. Same-filesystem rename (both under Roms/).
-func relocateDownloaded(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	_ = os.Remove(dst)
-	if err := os.Rename(src, dst); err != nil {
-		return err
-	}
-	moveMediaBesideRom(src, dst)
-	return nil
-}
-
-// relocateMultiDisc moves a verified multi-disc download (the .m3u AND its per-game
-// disc subfolder, plus box-art) into the on-device twin folder. The .m3u's relative
-// "<FsNameNoExt>/<disc>" lines resolve against the .m3u's own dir, so moving both keeps
-// them valid.
-func relocateMultiDisc(cfg *config.Config, rom romm.Rom, srcM3U, srcDiscDir, dstM3U string) error {
-	if err := os.MkdirAll(filepath.Dir(dstM3U), 0o755); err != nil {
-		return err
-	}
-	dstDiscDir := platform.OnDeviceMultiDiscDir(cfg, rom)
-	if srcDiscDir != "" && dstDiscDir != "" && srcDiscDir != dstDiscDir {
-		if _, err := os.Stat(srcDiscDir); err == nil {
-			_ = os.RemoveAll(dstDiscDir)
-			if err := os.Rename(srcDiscDir, dstDiscDir); err != nil {
-				return err
-			}
-		}
-	}
-	_ = os.Remove(dstM3U)
-	if err := os.Rename(srcM3U, dstM3U); err != nil {
-		return err
-	}
-	moveMediaBesideRom(srcM3U, dstM3U)
-	return nil
-}
-
-// moveMediaBesideRom best-effort relocates a ROM's box-art alongside a moved game.
-func moveMediaBesideRom(src, dst string) {
-	sc := cover.MediaPath(src)
-	dc := cover.MediaPath(dst)
-	if sc == dc {
-		return
-	}
-	if _, err := os.Stat(sc); err != nil {
-		return
-	}
-	_ = os.MkdirAll(filepath.Dir(dc), 0o755)
-	_ = os.Rename(sc, dc)
 }
 
 // isBareM3U reports whether a single-file ROM's one file is a bare `.m3u` playlist —
@@ -397,18 +315,7 @@ func runDownloadMultiDisc(client *romm.Client, cfg *config.Config, rom romm.Rom,
 	}
 	writeProgress(100)
 
-	finalM3U := m3uPath
-	if relocateOnDownload() {
-		if dlM3U := platform.OnDeviceRomPath(cfg, rom); dlM3U != "" && dlM3U != m3uPath {
-			if rerr := relocateMultiDisc(cfg, rom, m3uPath, discDir, dlM3U); rerr == nil {
-				finalM3U = dlM3U
-			} else {
-				fmt.Fprintf(os.Stderr, "DLMOVE warn multidisc rom=%d: %s (left in cloud folder)\n", rom.ID, safeErr(rerr))
-			}
-		}
-	}
-
-	fetchRomCover(client, rom, finalM3U)
+	fetchRomCover(client, rom, m3uPath)
 
 	fmt.Println("RESULT downloaded=1")
 	os.Exit(0)
