@@ -228,72 +228,57 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 				pi.ByFsname[rom.FsName] = rom.ID
 			}
 
-			// Box art: fetch this rom's cover into Roms/<System>/.media/<name>.png
-			// (NextUI convention) for the WHOLE library — stubs included — so the browser
-			// shows art before a game is even downloaded. Graceful + non-fatal: a coverless
-			// (unidentified) rom is skipped, an already-present cover is skipped, and any
-			// fetch/decode error is counted but NEVER aborts the mirror. Progress flows
-			// through the existing side-channels only. Multi-file roms are stubbed below as
-			// .m3u; we fetch their cover too (romPath is the .m3u path).
+			// Canonical (unmarked) on-disk path, then drop anything that isn't a
+			// launchable game (a save misfiled in Roms/, or a manual/video/info/box-art
+			// bundle member RomM returns as a standalone "rom").
+			path := platform.LocalRomPath(cfg, rom)
+			if path == "" || isSaveExt(path) || isNonGameAsset(path) {
+				skipped++
+				continue
+			}
+			// Multi-file (multi-disc) ROMs ARE stubbed: LocalRomPath returns the game's
+			// <FsNameNoExt>.m3u path, so a 0-byte .m3u stub drops exactly like a single-file
+			// game's. (Marker note: the multi-disc DOWNLOAD path still writes the canonical
+			// .m3u — marker-on-m3u is a tracked follow-up; single-file fills in place.)
+			if rom.HasMultipleFiles {
+				multifile++
+			}
+
+			// Reconcile to exactly one on-disk presence under the correct state marker:
+			// a 0-byte stub becomes "[^] " (in the cloud), a real downloaded file becomes
+			// "[v] " (on device), migrating saves + cover in lockstep if the marker flips.
+			// finalPath is the actual MARKED name on the card; didCreate is true only for a
+			// brand-new stub (preserving the created/existing contract counts).
+			finalPath, didCreate := platform.ReconcileMarkedPresence(cfg, rom, path)
+			if finalPath == "" {
+				skipped++
+				continue
+			}
+			// rom_id -> SDCARD-relative MARKED path so --mirror-collections lists the real
+			// on-disk name the launcher can open.
+			pi.ByID[rom.ID] = strings.TrimPrefix(finalPath, sdcardRoot())
+			if didCreate {
+				created++
+			} else {
+				existing++
+			}
+
+			// Box art: fetch this rom's cover into <rom dir>/.media/<marked stem>.png
+			// (NextUI convention) ANCHORED at the actual on-disk name so the launcher finds
+			// it. WHOLE-library (stubs included). Graceful + non-fatal: a coverless rom is
+			// skipped, an already-present cover is skipped, any fetch/decode error is counted
+			// but NEVER aborts the mirror; progress flows through the side-channels only.
 			if coversOn {
 				if cp := rom.CoverPath(); cp != "" {
-					if rp := platform.LocalRomPath(cfg, rom); rp != "" && !isSaveExt(rp) && !isNonGameAsset(rp) {
-						coverDone++
-						if coverTotal > 0 {
-							rep.phase(fmt.Sprintf("Fetching cover %d/%d…", coverDone, coverTotal))
-						}
-						if out, _ := cover.FetchAndSave(client, cp, rp); out == cover.OutcomeSaved {
-							covers++
-						}
+					coverDone++
+					if coverTotal > 0 {
+						rep.phase(fmt.Sprintf("Fetching cover %d/%d…", coverDone, coverTotal))
+					}
+					if out, _ := cover.FetchAndSave(client, cp, finalPath); out == cover.OutcomeSaved {
+						covers++
 					}
 				}
 			}
-
-			// Multi-file (multi-disc) ROMs ARE stubbed now: LocalRomPath returns the
-			// game's <FsNameNoExt>.m3u path, so a 0-byte .m3u stub is dropped exactly like
-			// a single-file game's stub. Tapping it runs the engine's multi-disc download
-			// (per-disc streamed + hash-verified), which replaces the stub with a real
-			// playlist and fills the disc subfolder. We still count it in multifile for
-			// visibility, but it is NO LONGER skipped — the old behavior left multi-disc
-			// games invisible (no stub to tap). The broken bare-.m3u single-file import is
-			// a different case, caught honestly at download time (isBareM3U).
-			if rom.HasMultipleFiles {
-				multifile++
-				// fall through to the normal stub-create below using the .m3u path.
-			}
-			path := platform.LocalRomPath(cfg, rom)
-			if path == "" {
-				skipped++
-				continue
-			}
-			if isSaveExt(path) {
-				skipped++
-				continue
-			}
-			// Drop non-game bundle members (manuals/videos/info/box-art) that RomM's API
-			// returns as standalone "rom" entries — never stub them as launchable games.
-			if isNonGameAsset(path) {
-				skipped++
-				continue
-			}
-			// Record rom_id -> SDCARD-relative path so --mirror-collections resolves members
-			// from the index instead of re-fetching the library.
-			pi.ByID[rom.ID] = strings.TrimPrefix(path, sdcardRoot())
-			if _, statErr := os.Stat(path); statErr == nil {
-				existing++
-				continue
-			}
-			if mkErr := os.MkdirAll(filepath.Dir(path), 0o755); mkErr != nil {
-				skipped++
-				continue
-			}
-			f, crErr := os.Create(path)
-			if crErr != nil {
-				skipped++
-				continue
-			}
-			_ = f.Close()
-			created++
 		}
 		idx.Platforms[p.FsSlug] = pi
 
@@ -453,7 +438,12 @@ func ResolveRomID(cfg *config.Config, romPath string) (romID int, ok bool) {
 		return 0, false
 	}
 
-	base := filepath.Base(romPath)
+	// Strip any leading cloud/on-device state marker the launcher kept on the on-disk
+	// filename: the index is keyed by the unmarked, server-matched canonical basename,
+	// so "[^] Game (USA).gba" and "[v] Game (USA).gba" must both reverse to the same
+	// rom_id as the bare "Game (USA)" key (BLUEPRINT §A). The local save path keeps the
+	// marked name; only resolution-to-RomM strips it.
+	base := platform.StripLeadingMarker(filepath.Base(romPath))
 	nameNoExt := strings.TrimSuffix(base, filepath.Ext(base))
 	if id, found := pi.ByBasename[nameNoExt]; found && id != 0 {
 		return id, true

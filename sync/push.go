@@ -51,7 +51,7 @@ func PushSaveDirect(client *romm.Client, cfg *config.Config, romPath string) []P
 		return []PushResult{{Outcome: OutcomeResolveFail, Err: cleanErr(orErr(err))}}
 	}
 
-	saves := findLocalSavesForRom(rom.PlatformFsSlug, rom)
+	saves := findLocalSavesForRom(cfg, rom)
 	if len(saves) == 0 {
 		return []PushResult{{Outcome: OutcomeNoLocalSave}}
 	}
@@ -132,9 +132,20 @@ func AlreadyOnServer(client *romm.Client, romID int, localPath string) bool {
 // ("Game (USA).gba.sav" — minarch) or its name-without-extension ("Game (USA).srm" —
 // RetroArch). Hidden files and directories are skipped; only ValidSaveExtensions
 // count.
-func findLocalSavesForRom(fsSlug string, rom romm.Rom) []localSaveFile {
+func findLocalSavesForRom(cfg *config.Config, rom romm.Rom) []localSaveFile {
 	var out []localSaveFile
-	for _, emuDir := range platform.EmulatorFoldersForFSSlug(fsSlug) {
+	// The on-disk save is named after the ACTUAL on-disk ROM basename, which carries the
+	// mode disambiguator (" (RomM)" in separate/merge mode) and any leading state marker
+	// ("[^] "/"[v] "). Match the marker-stripped save stem against every name the same ROM
+	// can occupy: the server fs_name (own mode) and the mode-aware LocalBasename
+	// (separate/merge), each with and without the ROM extension (minarch ".sav" appends to
+	// the full filename; RetroArch ".srm" replaces the extension).
+	localBase := ""
+	if p := platform.LocalRomPath(cfg, rom); p != "" {
+		localBase = filepath.Base(p)
+	}
+	localNoExt := strings.TrimSuffix(localBase, filepath.Ext(localBase))
+	for _, emuDir := range platform.EmulatorFoldersForFSSlug(rom.PlatformFsSlug) {
 		dir := filepath.Join(platform.SavesDir(), emuDir)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -147,8 +158,9 @@ func findLocalSavesForRom(fsSlug string, rom romm.Rom) []localSaveFile {
 			if !ValidSaveExtensions[strings.ToLower(filepath.Ext(e.Name()))] {
 				continue
 			}
-			stem := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
-			if stem == rom.FsName || stem == rom.FsNameNoExt {
+			stem := platform.StripLeadingMarker(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())))
+			if stem == rom.FsName || stem == rom.FsNameNoExt ||
+				(localBase != "" && (stem == localBase || stem == localNoExt)) {
 				out = append(out, localSaveFile{
 					path:   filepath.Join(dir, e.Name()),
 					emuDir: emuDir,

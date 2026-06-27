@@ -91,7 +91,7 @@ func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) Pul
 
 	// localPath was computed with the placeholder extension above; recompute with the
 	// chosen save's real extension so the on-disk name matches what minarch reads.
-	localPath = saveLocalPath(cfg, rom, newest.FileExtension)
+	localPath = saveLocalPath(cfg, rom, romPath, newest.FileExtension)
 	if localPath == "" {
 		return PullResult{Outcome: PullResolveFail, Reason: "no save directory"}
 	}
@@ -121,7 +121,7 @@ func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save r
 	if !ok {
 		return PullResult{Outcome: PullResolveFail, Reason: "not matched to a RomM game"}
 	}
-	localPath := saveLocalPath(cfg, rom, save.FileExtension)
+	localPath := saveLocalPath(cfg, rom, romPath, save.FileExtension)
 	if localPath == "" {
 		return PullResult{Outcome: PullResolveFail, Reason: "no save directory"}
 	}
@@ -147,7 +147,7 @@ func LocalSaveFilesForRom(client *romm.Client, cfg *config.Config, romPath strin
 		return nil
 	}
 	var out []string
-	for _, sf := range findLocalSavesForRom(rom.PlatformFsSlug, rom) {
+	for _, sf := range findLocalSavesForRom(cfg, rom) {
 		out = append(out, sf.path)
 	}
 	return out
@@ -214,7 +214,7 @@ func resolveRomAndLocalSavePath(client *romm.Client, cfg *config.Config, romPath
 	if err != nil || rom.ID == 0 {
 		return romm.Rom{}, "", false
 	}
-	localPath := saveLocalPath(cfg, rom, saveExt)
+	localPath := saveLocalPath(cfg, rom, romPath, saveExt)
 	if localPath == "" {
 		return rom, "", false
 	}
@@ -226,12 +226,19 @@ func resolveRomAndLocalSavePath(client *romm.Client, cfg *config.Config, romPath
 // on-disk filename (e.g. "Game (USA).gba") — the same basename grout passed — derived
 // from the ROM's local ROM path. Returns "" when the platform has no save directory
 // or the ROM has no resolvable on-disk file.
-func saveLocalPath(cfg *config.Config, rom romm.Rom, saveExt string) string {
+func saveLocalPath(cfg *config.Config, rom romm.Rom, romPath, saveExt string) string {
 	saveDir := platform.SaveDirectory(rom.PlatformFsSlug)
 	if saveDir == "" {
 		return ""
 	}
-	romBase := romBasename(cfg, rom)
+	// The save name must mirror the ACTUAL on-disk ROM filename the emulator launched —
+	// including any leading state marker ("[v] ") and mode disambiguator (" (RomM)") —
+	// because minarch derives "<rom filename>.sav" from exactly that name. Prefer the real
+	// launched path; reconstruct the canonical name only when no path was supplied.
+	romBase := filepath.Base(romPath)
+	if romPath == "" || romBase == "." || romBase == string(filepath.Separator) {
+		romBase = romBasename(cfg, rom)
+	}
 	if romBase == "" {
 		return ""
 	}

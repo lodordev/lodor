@@ -52,7 +52,14 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 		fmt.Println("RESULT downloaded=0")
 		os.Exit(0)
 	}
-	dest := platform.LocalRomPath(cfg, rom)
+	// Fill the stub IN PLACE at the exact path the launcher passed (and will launch).
+	// That path carries the leading state marker ("[^] Game.gba"); a NextUI pre-launch
+	// hook cannot redirect the post-hook launch and exFAT has no symlinks, so writing the
+	// real bytes anywhere else (e.g. the unmarked LocalRomPath) would leave the launcher
+	// opening a dead/empty path. The cloud->on-device marker SWAP happens later at mirror
+	// time (platform.ReconcileMarkedPresence), which carries the first save with it. For a
+	// single-file ROM romPath is the stub; multi-disc resolves its own paths below.
+	dest := romPath
 	if dest == "" {
 		fmt.Fprintf(os.Stderr, "DLFAIL dest-empty rom=%d\n", rom.ID)
 		fmt.Println("RESULT downloaded=0")
