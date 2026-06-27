@@ -226,5 +226,54 @@ func Load() (*Config, error) {
 		c.DownloadTimeout = 3600
 	}
 
+	// Overlay the pak's UI-owned toggles from settings.conf (same CWD as config.json).
+	// The launcher writes mirror_mode / fetch_covers there — NOT into the token-bearing
+	// config.json — so a UI toggle can never corrupt the RomM credentials. Present keys
+	// win over config.json (the toggle is the user's live choice).
+	applySettingsConf(&c)
+
 	return &c, nil
+}
+
+// settingsFileName is the pak's UI-toggle file, read CWD-relative beside config.json.
+const settingsFileName = "settings.conf"
+
+// applySettingsConf overlays the launcher's key=value UI toggles onto the loaded config.
+// Only the UI-owned keys are honored (mirror_mode, fetch_covers); everything else in the
+// file is ignored. A missing file is a no-op. This is the single coordination point with
+// the host launcher's settings.conf writer (Lodor.pak launch.sh).
+func applySettingsConf(c *Config) {
+	data, err := os.ReadFile(settingsFileName)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		switch k {
+		case "mirror_mode":
+			// ResolvedMirrorMode validates/host-defaults an unrecognized value.
+			c.MirrorMode = v
+		case "fetch_covers":
+			b := settingTruthy(v)
+			c.FetchCovers = &b
+		}
+	}
+}
+
+// settingTruthy reads a settings.conf boolean (on/true/1/yes => true; anything else false).
+func settingTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "true", "1", "yes", "y":
+		return true
+	}
+	return false
 }
