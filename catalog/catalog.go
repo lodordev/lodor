@@ -250,13 +250,39 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 				skipped++
 				continue
 			}
-			// Record rom_id -> SDCARD-relative path so --mirror-collections resolves members
-			// from the index instead of re-fetching the library.
-			pi.ByID[rom.ID] = strings.TrimPrefix(path, sdcardRoot())
-			if _, statErr := os.Stat(path); statErr == nil {
+			// Move-aware mirror (NextUI folder-as-badge, doc lodor-nextui-cloud-ondevice-
+			// folders): a DOWNLOADED game lives in the on-device "<System> (<TAG>)" twin of
+			// its "<System> RomM (<TAG>)" cloud folder. Downloaded-state is authoritative =
+			// a REAL file in the on-device folder; never re-stub it and never list it twice.
+			// A real file still sitting in the cloud folder (a fetch-on-launch download the
+			// in-flight NextUI launch could not relocate — pre-launch hooks "cannot cancel
+			// the launch", NextUI HOOKS.md) is consolidated here. ByID always records the
+			// file's REAL location so collections resolve to the playable path.
+			onDev := platform.OnDeviceRomPath(cfg, rom)
+			switch {
+			case onDev != "" && onDev != path && existsNonEmptyFile(onDev):
 				existing++
+				pi.ByID[rom.ID] = strings.TrimPrefix(onDev, sdcardRoot())
+				continue
+			case existsNonEmptyFile(path):
+				rec := path
+				if onDev != "" && onDev != path {
+					if rerr := relocateDownloadedEntry(cfg, rom, path, onDev); rerr == nil {
+						rec = onDev
+					} else {
+						fmt.Fprintf(os.Stderr, "MIRROR relocate warn rom=%d: %s (left in cloud folder)\n", rom.ID, rerr)
+					}
+				}
+				existing++
+				pi.ByID[rom.ID] = strings.TrimPrefix(rec, sdcardRoot())
+				continue
+			case fileExists(path):
+				existing++
+				pi.ByID[rom.ID] = strings.TrimPrefix(path, sdcardRoot())
 				continue
 			}
+			// Nothing on disk yet -> drop the 0-byte cloud stub.
+			pi.ByID[rom.ID] = strings.TrimPrefix(path, sdcardRoot())
 			if mkErr := os.MkdirAll(filepath.Dir(path), 0o755); mkErr != nil {
 				skipped++
 				continue
@@ -457,6 +483,20 @@ func slugForRomPath(cfg *config.Config, romPath string) (string, bool) {
 			return slug, true
 		}
 	}
+	// On-device twin: a VERIFIED download relocates a game out of its
+	// "<Display> RomM (<TAG>)" cloud folder into the plain on-device
+	// "<Display> (<TAG>)" folder (NextUI folder-as-badge). That folder name is not a
+	// RelativePath key, so match it by deriving each mapping's on-device twin — this is
+	// what keeps list-saves / sync-save / restore / download resolution working from
+	// the moved file's path (the save filename itself is folder-independent).
+	for slug, m := range cfg.DirectoryMappings {
+		if m.RelativePath != "" && platform.OnDeviceFolderName(m.RelativePath) == dir {
+			if m.Slug != "" {
+				return m.Slug, true
+			}
+			return slug, true
+		}
+	}
 	for slug, m := range cfg.DirectoryMappings {
 		if m.Slug == dir || slug == dir {
 			if m.Slug != "" {
@@ -481,6 +521,59 @@ func sanitizeCollectionName(name string) string {
 		}
 	}
 	return b.String()
+}
+
+// fileExists reports whether path exists (file or dir).
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// existsNonEmptyFile reports whether path is a non-empty regular file — a DOWNLOADED
+// game, as opposed to a 0-byte stub, a directory, or a missing path.
+func existsNonEmptyFile(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir() && fi.Size() > 0
+}
+
+// relocateDownloadedEntry moves a downloaded game's real file from its cloud-folder
+// path (src) to its on-device twin (dst), creating the on-device folder. For a multi-
+// disc game it also moves the per-game disc subfolder, so the .m3u's relative disc
+// references (resolved against the .m3u's own dir) still hold, then best-effort moves
+// the box-art. Same-filesystem renames (both under Roms/); never fatal to the mirror.
+func relocateDownloadedEntry(cfg *config.Config, rom romm.Rom, src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if rom.HasMultipleFiles {
+		srcDisc := platform.MultiDiscDir(cfg, rom)
+		dstDisc := platform.OnDeviceMultiDiscDir(cfg, rom)
+		if srcDisc != "" && dstDisc != "" && srcDisc != dstDisc {
+			if _, err := os.Stat(srcDisc); err == nil {
+				_ = os.RemoveAll(dstDisc)
+				if err := os.Rename(srcDisc, dstDisc); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	_ = os.Remove(dst)
+	if err := os.Rename(src, dst); err != nil {
+		return err
+	}
+	moveCoverBeside(src, dst)
+	return nil
+}
+
+// moveCoverBeside best-effort relocates a ROM's box-art alongside a moved game.
+func moveCoverBeside(src, dst string) {
+	sc := cover.MediaPath(src)
+	dc := cover.MediaPath(dst)
+	if sc == dc {
+		return
+	}
+	if _, err := os.Stat(sc); err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(dc), 0o755)
+	_ = os.Rename(sc, dc)
 }
 
 func sdcardRoot() string {

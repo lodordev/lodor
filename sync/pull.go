@@ -153,6 +153,20 @@ func LocalSaveFilesForRom(client *romm.Client, cfg *config.Config, romPath strin
 	return out
 }
 
+// LocalSaveHashesForRom returns the lower-case MD5 content hashes of the save file(s)
+// currently on the card for the ROM at romPath — the SAME signal RomM stores as a save's
+// content_hash (see AlreadyOnServer). Used by --list-saves to mark which server revision
+// matches the bytes currently on the device. Empty when there's no local save or none read.
+func LocalSaveHashesForRom(client *romm.Client, cfg *config.Config, romPath string) []string {
+	var out []string
+	for _, p := range LocalSaveFilesForRom(client, cfg, romPath) {
+		if sum, ok := fileMD5(p); ok {
+			out = append(out, sum)
+		}
+	}
+	return out
+}
+
 // PushSaveFile uploads ONE explicit save file to the timeline for the ROM at romPath,
 // independent of what's currently in the save directory. This is how a STAGED pre-
 // flashback save (copied aside before the overwrite) reaches the server later via

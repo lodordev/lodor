@@ -9,6 +9,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"lodor/config"
 	"lodor/romm"
@@ -271,6 +272,61 @@ func MultiDiscDir(cfg *config.Config, rom romm.Rom) string {
 	}
 	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
 	return filepath.Join(romDir, rom.FsNameNoExt)
+}
+
+// OnDeviceFolderName returns the on-device ("downloaded") twin of a coexist mirror
+// folder name. In separate/merge modes a not-yet-downloaded game is stubbed into a
+// "<Display> RomM (<TAG>)" cloud folder; a VERIFIED download relocates it into the
+// plain on-device "<Display> (<TAG>)" folder (the NextUI folder-as-badge scheme, doc
+// lodor-nextui-cloud-ondevice-folders). The transform is anchored on the trailing
+// " (<TAG>)" so a Display name that itself contains " RomM (" earlier is never
+// mis-rewritten; an "own"-mode or unmarked folder is returned UNCHANGED (there is no
+// separate cloud folder to move out of).
+func OnDeviceFolderName(folder string) string {
+	open := strings.LastIndex(folder, " (")
+	if open < 0 || !strings.HasSuffix(folder, ")") {
+		return folder
+	}
+	head := folder[:open] // "<Display> RomM" or "<Display>"
+	tag := folder[open:]  // " (<TAG>)"
+	const marker = " RomM"
+	if strings.HasSuffix(head, marker) {
+		return head[:len(head)-len(marker)] + tag
+	}
+	return folder
+}
+
+// onDeviceTwinOf rewrites ONLY the platform-folder component of an absolute Roms path
+// to its on-device twin, leaving the RomsDir prefix and the basename untouched — so a
+// moved game keeps the exact same basename (the save namespace is basename+TAG, never
+// the parent folder).
+func onDeviceTwinOf(p string) string {
+	dir := filepath.Dir(p)
+	parent := filepath.Dir(dir)
+	twin := OnDeviceFolderName(filepath.Base(dir))
+	return filepath.Join(parent, twin, filepath.Base(p))
+}
+
+// OnDeviceRomPath returns the absolute path a single-file ROM occupies AFTER a
+// verified download relocates it out of its "<System> RomM (<TAG>)" cloud folder into
+// the on-device "<System> (<TAG>)" folder. In "own" mode (no cloud folder) it equals
+// LocalRomPath. Returns "" when LocalRomPath does.
+func OnDeviceRomPath(cfg *config.Config, rom romm.Rom) string {
+	src := LocalRomPath(cfg, rom)
+	if src == "" {
+		return ""
+	}
+	return onDeviceTwinOf(src)
+}
+
+// OnDeviceMultiDiscDir returns the on-device twin of MultiDiscDir — the per-game disc
+// subfolder a relocated multi-disc game's discs live in. "" when MultiDiscDir is "".
+func OnDeviceMultiDiscDir(cfg *config.Config, rom romm.Rom) string {
+	d := MultiDiscDir(cfg, rom)
+	if d == "" {
+		return ""
+	}
+	return onDeviceTwinOf(d)
 }
 
 // PrimaryTag returns the canonical MinUI emulator tag for a RomM filesystem slug —
