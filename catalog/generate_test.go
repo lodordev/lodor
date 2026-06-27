@@ -63,3 +63,41 @@ func TestGenerateDirectoryMappings(t *testing.T) {
 		}
 	})
 }
+
+// TestConsoleCoverageMapping locks the 2026-06-27 console-coverage fix end to end: a
+// strong device (tg5040) with installed Emus paks for Dreamcast (DC), Saturn (SATURN),
+// Arcade (FBN) and N64 now MAPS those RomM platforms. Before the fix, dreamcast had no
+// engine tag at all and saturn's tag was empty, so the mirror skipped them even with the
+// pak present. GameCube (gc) has no viable emulator and stays unmapped.
+func TestConsoleCoverageMapping(t *testing.T) {
+	sd := t.TempDir()
+	t.Setenv("SDCARD_PATH", sd)
+	t.Setenv("PLATFORM", "tg5040")
+	for _, tag := range []string{"FC", "DC", "SATURN", "FBN", "N64"} {
+		if err := os.MkdirAll(filepath.Join(sd, "Emus", "tg5040", tag+".pak"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lister := fakeLister{platforms: []romm.Platform{
+		{ID: 1, FsSlug: "dreamcast", Name: "Dreamcast"},
+		{ID: 2, FsSlug: "saturn", Name: "Sega Saturn"},
+		{ID: 3, FsSlug: "fbneo", Name: "Arcade"},
+		{ID: 4, FsSlug: "n64", Name: "Nintendo 64"},
+		{ID: 5, FsSlug: "gc", Name: "Nintendo GameCube"},
+	}}
+	m, gen, skip, err := GenerateDirectoryMappings(lister, config.MirrorModeSeparate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slug := range []string{"dreamcast", "saturn", "fbneo", "n64"} {
+		if _, ok := m[slug]; !ok {
+			t.Errorf("%s not mapped despite its Emus pak present — console-coverage gap", slug)
+		}
+	}
+	if _, ok := m["gc"]; ok {
+		t.Error("gc mapped — GameCube has no viable tg5040 emulator and must stay unmapped")
+	}
+	if gen != 4 || skip != 1 {
+		t.Fatalf("generated=%d skipped=%d, want 4/1 (gc skipped)", gen, skip)
+	}
+}

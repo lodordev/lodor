@@ -130,3 +130,29 @@ func mustMkPak(t *testing.T, dir string) {
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
 }
+
+// TestPrimaryTagConsoleCoverage locks the engine tags for consoles that were previously
+// unmapped (dreamcast) or empty (saturn, jaguar/atarijaguar), so a strong device with
+// the matching Emus pak can sync them. GameCube (gc) has no viable handheld emulator and
+// must stay unmapped (the honest "hardware can't" column).
+func TestPrimaryTagConsoleCoverage(t *testing.T) {
+	cases := map[string]string{
+		"dreamcast":   "DC",
+		"saturn":      "SATURN",
+		"jaguar":      "JAGUAR",
+		"atarijaguar": "JAGUAR",
+		"n64":         "N64",
+		"psp":         "PSP",
+		"fbneo":       "FBN",
+		"arcade":      "FBN",
+	}
+	for slug, want := range cases {
+		got, ok := PrimaryTag(slug)
+		if !ok || got != want {
+			t.Errorf("PrimaryTag(%q) = %q,%v; want %q,true", slug, got, ok, want)
+		}
+	}
+	if _, ok := PrimaryTag("gc"); ok {
+		t.Error("PrimaryTag(gc) ok=true; GameCube must stay unmapped (no viable handheld emulator)")
+	}
+}

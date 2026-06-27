@@ -51,7 +51,7 @@ var emulatorFolders = map[string][]string{
 	"genesis":                    {"MD"},
 	"intellivision":              {},
 	"j2me":                       {},
-	"jaguar":                     {},
+	"jaguar":                     {"JAGUAR"},
 	"karaoke":                    {},
 	"lowres":                     {},
 	"lua":                        {},
@@ -84,7 +84,7 @@ var emulatorFolders = map[string][]string{
 	"psx":                        {"PS"},
 	"quake":                      {},
 	"rpg-maker":                  {},
-	"saturn":                     {},
+	"saturn":                     {"SATURN"},
 	"scummvm":                    {},
 	"sega32":                     {"32X"},
 	"segacd":                     {"SEGACD"},
@@ -123,6 +123,13 @@ var emulatorFolders = map[string][]string{
 	"pokemini":        {"PKM"},
 	"sega32x":         {"32X"},
 	"wonderswancolor": {"WSC"},
+	// --- console-coverage additions (2026-06-27): RomM fs_slugs a strong device
+	// (e.g. tg5040 / Trimui Smart Pro) can run via an installed Emus/<TAG>.pak but
+	// the engine previously had NO tag for, so --mirror-catalog skipped them even
+	// with the pak present (the block-(a) gap). The HasEmuPak gate still decides,
+	// per device, whether to actually stub; these just make the console mappable.
+	"dreamcast":   {"DC"},     // RomM slug for Sega Dreamcast (flycast); engine had only "dc"
+	"atarijaguar": {"JAGUAR"}, // RomM slug for Atari Jaguar (virtualjaguar)
 }
 
 // BasePath returns the SD-card root: BASE_PATH if set, otherwise the first of
