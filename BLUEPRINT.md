@@ -65,7 +65,7 @@ Exit: 0 ok, 2 config, 3 unreachable/resolve, 4 ran-but-errored. Modes print ONLY
 - `--mirror-collections` → `COLLECTIONS written=%d empty=%d total=%d`
 - `--download <p>` → `RESULT downloaded=<0|1>` (+ /tmp/dl-progress 0→90→100, /tmp/romm-phase)
 - `--download-bios` → `RESULT bios=<n>`
-- `--push-pending` → `RESULT pushed=<N> total=<M> stuck=<K>` (reads `<SDCARD>/Tools/<PLAT>/RomM Sync.pak/pending-saves.txt`, removes landed; mkdir .queue.lock)
+- `--push-pending` → `RESULT pushed=<N> total=<M> stuck=<K>` (reads `<LODOR_PAK_DIR>/pending-saves.txt` — the pak working dir, exported by the launch scripts; falls back to CWD — removes landed; mkdir .queue.lock)
 - `--sync-save <p>` → `RESULT pulled=<0|1> pushed=<0|1>`
 - `--list-saves <p>` → per save newest-first `<id>\t<YYYY-MM-DD HH:MM>\t<device|emulator>\t<kb>KB`; zero→nothing
 - `--restore-save <p> <saveID positional>` → `RESULT restored=<0|1>`

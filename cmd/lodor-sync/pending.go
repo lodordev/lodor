@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"lodor/platform"
 )
 
 // stagingDir holds pre-flashback save snapshots until --push-pending uploads them to the
@@ -74,31 +76,18 @@ func parseQueueLine(line string) (romPath, stagedPath, emu string, staged bool) 
 
 // pending-saves.txt is the offline-first upload queue the minarch shim appends to
 // after a game whose save changed (BLUEPRINT §8): one ABSOLUTE on-card ROM path per
-// line, deduplicated. It lives at:
+// line, deduplicated. It lives inside the host pak's working directory:
 //
-//	<SDCARD>/Tools/<PLAT>/RomM Sync.pak/pending-saves.txt
+//	<LODOR_PAK_DIR>/pending-saves.txt
 //
-// where SDCARD comes from SDCARD_PATH (default /mnt/SDCARD) and PLAT from PLATFORM
-// (default miyoomini) — the SAME env the launcher scripts and catalog.IndexPath use,
-// so every component agrees on the path.
+// where LODOR_PAK_DIR is the absolute pak path the launch scripts export (falling back
+// to the script CWD) — the SAME dir catalog.IndexPath resolves via platform.PakDir(), so
+// every component agrees on the path without the engine knowing the host's pak name.
 
-func sdcardPath() string {
-	if sd := os.Getenv("SDCARD_PATH"); sd != "" {
-		return sd
-	}
-	return "/mnt/SDCARD"
-}
-
-func platformName() string {
-	if p := os.Getenv("PLATFORM"); p != "" {
-		return p
-	}
-	return "miyoomini"
-}
-
-// pakDir returns <SDCARD>/Tools/<PLAT>/RomM Sync.pak — the pak's working directory.
+// pakDir returns the host pak's working directory (platform.PakDir(), resolved from
+// LODOR_PAK_DIR / the script CWD). The engine owns no host pak name.
 func pakDir() string {
-	return filepath.Join(sdcardPath(), "Tools", platformName(), "RomM Sync.pak")
+	return platform.PakDir()
 }
 
 // pendingPath returns the absolute path of pending-saves.txt.

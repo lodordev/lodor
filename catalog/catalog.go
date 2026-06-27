@@ -125,19 +125,11 @@ func platformDisplay(p romm.Platform) string {
 	return p.FsSlug
 }
 
-// IndexPath returns the absolute path of catalog-index.json:
-// <SDCARD>/Tools/<PLATFORM>/RomM Sync.pak/catalog-index.json, honoring the
-// SDCARD_PATH and PLATFORM environment variables (defaults /mnt/SDCARD, miyoomini).
+// IndexPath returns the absolute path of catalog-index.json inside the host pak's
+// working directory (platform.PakDir(), resolved from LODOR_PAK_DIR / the script CWD).
+// The engine owns no host pak name.
 func IndexPath(cfg *config.Config) string {
-	sd := os.Getenv("SDCARD_PATH")
-	if sd == "" {
-		sd = "/mnt/SDCARD"
-	}
-	plat := os.Getenv("PLATFORM")
-	if plat == "" {
-		plat = "miyoomini"
-	}
-	return filepath.Join(sd, "Tools", plat, "RomM Sync.pak", "catalog-index.json")
+	return filepath.Join(platform.PakDir(), "catalog-index.json")
 }
 
 // MirrorCatalog stubs every not-yet-downloaded single-file ROM of each mapped

@@ -9,6 +9,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"lodor/config"
 	"lodor/romm"
@@ -144,6 +145,25 @@ func BasePath() string {
 		}
 	}
 	return "/mnt/SDCARD"
+}
+
+// PakDir returns the absolute working directory of the host's Lodor pak — the directory
+// the pak's launch scripts cd into before invoking the engine, and where pak-local state
+// (pending-saves.txt, catalog-index.json, the flashback staging/cache) lives.
+//
+// The engine is host-agnostic and MUST NOT know the host's pak name: LodorOS names the
+// pak "Lodor.pak", NextUI/my355 ship it as a Tool pak with whatever name the host gives
+// it. So the path is supplied at runtime via LODOR_PAK_DIR (an absolute path, exported by
+// the pak's launch.sh and bin/* scripts). Fallback: the current working directory, which
+// those same scripts already cd into before calling lodor-sync. Last resort: ".".
+func PakDir() string {
+	if d := strings.TrimSpace(os.Getenv("LODOR_PAK_DIR")); d != "" {
+		return d
+	}
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		return wd
+	}
+	return "."
 }
 
 // RomsDir returns <BasePath>/Roms.
