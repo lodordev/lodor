@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -200,6 +201,51 @@ func (c *Client) GetCollections() ([]Collection, error) {
 	return out, err
 }
 
+// GetVirtualCollections returns RomM's auto-generated "virtual" collections — the
+// metadata-derived shelves (by genre, franchise, company, game mode, etc.) the server
+// builds from library metadata (GET /api/collections/virtual?type=<type>). The "type"
+// query param is REQUIRED by the server; the sentinel value "all" returns every virtual
+// collection regardless of type (handler: filter OR literal(type=="all")). Each result
+// carries a name + rom_ids, so the subset of Collection the engine consumes parses
+// cleanly from a VirtualCollectionSchema. Older RomM servers without this endpoint
+// return 404 — surfaced as a *StatusError{Code:404} the caller treats as "no virtual
+// collections" rather than a failure.
+func (c *Client) GetVirtualCollections(collectionType string) ([]Collection, error) {
+	v := url.Values{}
+	if collectionType == "" {
+		collectionType = "all"
+	}
+	v.Set("type", collectionType)
+	var out []Collection
+	err := c.doJSON("GET", "/api/collections/virtual?"+v.Encode(), nil, &out)
+	return out, err
+}
+
+// GetSmartCollections returns the user's "smart" collections — saved filter-criteria
+// shelves whose membership the server evaluates dynamically (GET /api/collections/smart).
+// Each result carries a name + rom_ids, so it parses into the Collection subset the
+// engine consumes. Older RomM servers without this endpoint return 404 — surfaced as a
+// *StatusError{Code:404} the caller treats as "no smart collections".
+func (c *Client) GetSmartCollections() ([]Collection, error) {
+	var out []Collection
+	err := c.doJSON("GET", "/api/collections/smart", nil, &out)
+	return out, err
+}
+
+// ReportPlaySessions reports a batch of finished play sessions to RomM
+// (POST /api/play-sessions), feeding cross-device Continue / recently-played. The
+// device_id travels at the top level (the server also falls back to the token's bound
+// device). Older RomM servers without this endpoint return 404 — surfaced as a
+// *StatusError{Code:404} so the caller no-ops instead of failing a game-quit hook.
+// The server requires each session's end_time strictly after start_time and a
+// non-empty batch; callers must enforce that before calling.
+func (c *Client) ReportPlaySessions(deviceID string, sessions []PlaySessionEntry) (PlaySessionIngestResponse, error) {
+	var out PlaySessionIngestResponse
+	payload := PlaySessionIngestPayload{DeviceID: deviceID, Sessions: sessions}
+	err := c.doJSON("POST", "/api/play-sessions", payload, &out)
+	return out, err
+}
+
 // DownloadSaveContent fetches the raw bytes of a save
 // (GET /api/saves/{id}/content?device_id=&optimistic=). The optimistic flag is
 // ALWAYS written literally (true|false) — even false — so the server does not mark
@@ -233,6 +279,19 @@ func (c *Client) DownloadRomContent(romID int, fsName string) ([]byte, error) {
 func (c *Client) DownloadRomContentTo(romID int, fsName string, dst io.Writer, onProgress func(done, total int64)) (int64, error) {
 	path := fmt.Sprintf("/api/roms/%d/content/%s", romID, fsName)
 	return c.doRawStreamTo(path, dst, onProgress)
+}
+
+// DownloadRomContentResumeTo streams a single-file ROM's content into the open file f,
+// RESUMING from startOffset (the size of an existing partial .tmp) via an HTTP Range
+// request. It targets the same /api/roms/{id}/content/{fs_name} endpoint as
+// DownloadRomContentTo, streamed (never buffered). Pass startOffset=0 for a fresh
+// download (identical effect to DownloadRomContentTo). The full 206/200/416 handling
+// (append vs rewrite-from-zero vs self-heal a stale partial) lives in doRawStreamResumeTo
+// so a resume can never corrupt the file; the returned count is the TOTAL bytes now on
+// disk. The caller owns f and runs the final hash verify.
+func (c *Client) DownloadRomContentResumeTo(romID int, fsName string, f *os.File, startOffset int64, onProgress func(done, total int64)) (int64, error) {
+	path := fmt.Sprintf("/api/roms/%d/content/%s", romID, fsName)
+	return c.doRawStreamResumeTo(path, f, startOffset, onProgress)
 }
 
 // DownloadRomFileTo streams ONE constituent file of a ROM (selected by its file id)

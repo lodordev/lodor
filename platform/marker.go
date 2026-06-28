@@ -38,16 +38,21 @@ import (
 
 const (
 	// MarkerCloud prefixes a 0-byte stub (game available in the cloud, not downloaded).
-	MarkerCloud = "[^] "
+	MarkerCloud = "✘ "
 	// MarkerOnDevice prefixes a real, downloaded ROM file present on the device. It is
 	// always the SAME string, so a downloaded game's on-disk name (and therefore its
 	// save filename) is STABLE across delete/redownload.
-	MarkerOnDevice = "[v] "
+	MarkerOnDevice = "✓ "
 )
 
-// allMarkers is every leading state marker the engine writes, so StripLeadingMarker can
-// reverse whichever one an on-disk name carries.
-var allMarkers = []string{MarkerCloud, MarkerOnDevice}
+// legacyMarkers are the old ASCII markers earlier builds wrote ([^]/[v]). Kept so
+// StripLeadingMarker/ReconcileMarkedPresence still recognize + migrate cards mirrored
+// before the check/X switch (instead of duplicating the stub under a new marker).
+var legacyMarkers = []string{"[^] ", "[v] "}
+
+// allMarkers is every leading state marker the engine may encounter (current + legacy),
+// so StripLeadingMarker can reverse whichever one an on-disk name carries.
+var allMarkers = append([]string{MarkerCloud, MarkerOnDevice}, legacyMarkers...)
 
 // StripLeadingMarker removes a leading cloud/on-device state marker from a ROM base name
 // (or full filename), returning the canonical, server-matched name. A name with no
@@ -105,7 +110,12 @@ func ReconcileMarkedPresence(cfg *config.Config, rom romm.Rom, unmarked string) 
 	// and whether it holds real bytes.
 	var src string
 	var srcReal bool
-	for _, c := range []string{dev, cloud, legacy} {
+	candidates := []string{dev, cloud}
+	for _, m := range legacyMarkers {
+		candidates = append(candidates, filepath.Join(dir, m+canonBase))
+	}
+	candidates = append(candidates, legacy)
+	for _, c := range candidates {
 		if fi, err := os.Stat(c); err == nil {
 			src = c
 			srcReal = fi.Size() > 0

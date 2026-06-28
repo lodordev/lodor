@@ -66,6 +66,8 @@ func isNonGameAsset(p string) bool {
 type romClient interface {
 	GetRoms(query romm.GetRomsQuery) (romm.PaginatedRoms, error)
 	GetCollections() ([]romm.Collection, error)
+	GetVirtualCollections(collectionType string) ([]romm.Collection, error)
+	GetSmartCollections() ([]romm.Collection, error)
 	DownloadCover(coverPath string) ([]byte, error)
 }
 
@@ -330,15 +332,25 @@ func mirrorPct(platformsDone, platformsTotal, doneWork, totalWork int) int {
 // listing the SDCARD-relative path of each member ROM that is actually present on
 // the card. Empty collections are skipped. Returns written, empty, and total counts
 // (total = number of collections fetched). BLUEPRINT §4.
-func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total int, err error) {
+// MirrorCollections writes one Collections/<sanitized>.txt per collection, listing the
+// SDCARD-relative path of each member ROM actually present on the card. It covers THREE
+// sources: the user's MANUAL collections (GET /api/collections), RomM's auto-generated
+// VIRTUAL collections (metadata-derived shelves by genre/franchise/etc., GET
+// /api/collections/virtual?type=all) and the user's SMART collections (saved-filter
+// shelves, GET /api/collections/smart). Empty collections (no on-card members) are
+// skipped, and a virtual/smart name that would clobber an already-written file is
+// skipped (manual wins, then smart, then virtual) so the auto shelves never overwrite a
+// user's manual one. The virtual/smart endpoints are OPTIONAL: an older RomM that lacks
+// them returns 404 and is gracefully treated as "none" rather than failing the mirror.
+// Returns written/empty/total plus the per-source written breakdown. BLUEPRINT §4.
+func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total, manual, virtual, smart int, err error) {
 	rep.percent(0)
 	rep.phase("Reading collections…")
 
 	collections, cerr := client.GetCollections()
 	if cerr != nil {
-		return 0, 0, 0, cerr
+		return 0, 0, 0, 0, 0, 0, cerr
 	}
-	total = len(collections)
 
 	// rom_id -> SDCARD-relative path. FAST PATH: reuse the by_id map the preceding
 	// --mirror-catalog already wrote to the index. This avoids re-fetching the WHOLE
@@ -358,7 +370,7 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 		sdRoot := sdcardRoot()
 		platforms, perr := getMappedPlatforms(client, cfg)
 		if perr != nil {
-			return 0, 0, total, perr
+			return 0, 0, len(collections), 0, 0, 0, perr
 		}
 		nPlat := len(platforms)
 		for pi2, p := range platforms {
@@ -385,37 +397,74 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 
 	colDir := filepath.Join(platform.RomsDir(), "..", "Collections")
 	if mkErr := os.MkdirAll(colDir, 0o755); mkErr != nil {
-		return 0, 0, total, mkErr
+		return 0, 0, len(collections), 0, 0, 0, mkErr
 	}
 
-	for ci, col := range collections {
-		rep.phase(fmt.Sprintf("Building collections (%d/%d)…", ci+1, total))
-		if total > 0 {
-			rep.percent(50 + (ci+1)*50/total)
-		}
-		var lines []string
-		for _, rid := range col.RomIDs {
-			if rel, ok := idPath[rid]; ok {
-				lines = append(lines, rel)
+	// AUTO shelves are OPTIONAL: pull them up front, but a 404 (endpoint absent on an
+	// older RomM) or any other error degrades to "none" — never fails the whole mirror.
+	smartCols := fetchOptionalCollections(client.GetSmartCollections)
+	virtualCols := fetchOptionalCollections(func() ([]romm.Collection, error) {
+		return client.GetVirtualCollections("all")
+	})
+	total = len(collections) + len(smartCols) + len(virtualCols)
+
+	// Track names already written so an auto shelf never clobbers a manual one (and the
+	// two auto sources never clobber each other). Precedence: manual, then smart, then virtual.
+	taken := map[string]bool{}
+
+	writeSet := func(cols []romm.Collection, phaseLabel string, baseDone, span int) (w, e int) {
+		n := len(cols)
+		for ci, col := range cols {
+			rep.phase(fmt.Sprintf("%s (%d/%d)…", phaseLabel, ci+1, n))
+			if n > 0 && span > 0 {
+				rep.percent(baseDone + (ci+1)*span/n)
 			}
+			var lines []string
+			for _, rid := range col.RomIDs {
+				if rel, ok := idPath[rid]; ok {
+					lines = append(lines, rel)
+				}
+			}
+			if len(lines) == 0 {
+				e++
+				continue
+			}
+			name := sanitizeCollectionName(col.Name)
+			if name == "" || taken[strings.ToLower(name)] {
+				continue // unnamed, or would clobber a higher-precedence shelf
+			}
+			if werr := os.WriteFile(filepath.Join(colDir, name+".txt"),
+				[]byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
+				continue // a single bad name must not abort the whole set
+			}
+			taken[strings.ToLower(name)] = true
+			w++
 		}
-		if len(lines) == 0 {
-			empty++
-			continue
-		}
-		name := sanitizeCollectionName(col.Name)
-		if name == "" {
-			continue
-		}
-		if werr := os.WriteFile(filepath.Join(colDir, name+".txt"),
-			[]byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
-			return written, empty, total, werr
-		}
-		written++
+		return w, e
 	}
+
+	// Split the 50→100 progress band across the three sources by their relative size.
+	manual, mEmpty := writeSet(collections, "Building collections", 50, 17)
+	smart, sEmpty := writeSet(smartCols, "Building smart shelves", 67, 16)
+	virtual, vEmpty := writeSet(virtualCols, "Building auto shelves", 83, 16)
+
+	written = manual + smart + virtual
+	empty = mEmpty + sEmpty + vEmpty
 	rep.percent(100)
 	rep.phase(fmt.Sprintf("Collections updated — %d", written))
-	return written, empty, total, nil
+	return written, empty, total, manual, virtual, smart, nil
+}
+
+// fetchOptionalCollections runs an OPTIONAL collection fetch (virtual/smart), returning
+// an empty slice when the server lacks the endpoint (404) or the call otherwise fails.
+// These auto shelves are a bonus on top of the user's manual collections; their absence
+// must never fail --mirror-collections, so every error degrades to "no shelves".
+func fetchOptionalCollections(fetch func() ([]romm.Collection, error)) []romm.Collection {
+	cols, err := fetch()
+	if err != nil {
+		return nil
+	}
+	return cols
 }
 
 // ResolveRomID reverses a local ROM path back to its rom_id using the catalog
@@ -609,4 +658,71 @@ func loadIndex(path string) (index, error) {
 		return index{}, err
 	}
 	return idx, nil
+}
+
+// ReconcileAfterDownload flips ONE ROM's on-disk state marker to match the bytes now
+// present on the card, in the POST-LAUNCH window (the game has exited, so the rename is
+// safe — renaming during the download→launch sequence would pull the file out from under
+// the launcher, which is exactly why decision #69 reverted relocate). It is the per-game
+// equivalent of the bulk marker reconcile MirrorCatalog runs: a freshly-downloaded game
+// whose 0-byte stub was filled IN PLACE under the cloud marker ("✘ Game.gb") is promoted
+// to the on-device marker ("✓ Game.gb"), carrying its save + cover with the rename via
+// platform.ReconcileMarkedPresence so nothing orphans. A game still a 0-byte stub stays
+// "✘". Net behavior: after you download a game and play it once, its ✘ becomes ✓.
+//
+// Offline by design — it needs NO network. The platform fs_slug (which save folders to
+// migrate) is derived from the on-disk path with the same directory_mappings reversal
+// ResolveRomID uses; the rom_id (to keep the catalog index's by_id path current so
+// --mirror-collections lists a path that exists) is a best-effort local index lookup,
+// silently skipped on any failure since the next Refresh rebuilds the index.
+//
+// Returns whether the on-disk marker actually flipped.
+func ReconcileAfterDownload(cfg *config.Config, romPath string) (flipped bool) {
+	if cfg == nil || romPath == "" {
+		return false
+	}
+	slug, ok := slugForRomPath(cfg, romPath)
+	if !ok {
+		return false
+	}
+	dir := filepath.Dir(romPath)
+	canonBase := platform.StripLeadingMarker(filepath.Base(romPath))
+	unmarked := filepath.Join(dir, canonBase)
+
+	// ReconcileMarkedPresence only reads rom.PlatformFsSlug (to find this game's save
+	// folders for the lockstep rename), so a minimal rom carrying just the slug is enough
+	// and keeps the reconcile fully offline.
+	rom := romm.Rom{PlatformFsSlug: slug}
+	final, _ := platform.ReconcileMarkedPresence(cfg, rom, unmarked)
+	if final == "" {
+		return false
+	}
+	flipped = filepath.Base(final) != filepath.Base(romPath)
+
+	if flipped {
+		updateIndexByID(cfg, slug, final)
+	}
+	return flipped
+}
+
+// updateIndexByID best-effort patches the catalog index's by_id path for the ROM now on
+// disk at finalAbs so --mirror-collections emits a path that exists after a marker flip.
+// Any failure is silent: a stale index entry is harmless and the next library Refresh
+// rebuilds it.
+func updateIndexByID(cfg *config.Config, slug, finalAbs string) {
+	id, ok := ResolveRomID(cfg, finalAbs)
+	if !ok || id == 0 {
+		return
+	}
+	idx, err := loadIndex(IndexPath(cfg))
+	if err != nil {
+		return
+	}
+	pi, pok := idx.Platforms[slug]
+	if !pok || pi.ByID == nil {
+		return
+	}
+	pi.ByID[id] = strings.TrimPrefix(finalAbs, sdcardRoot())
+	idx.Platforms[slug] = pi
+	_ = writeIndexAtomic(IndexPath(cfg), idx)
 }

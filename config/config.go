@@ -71,6 +71,110 @@ func (h Host) AuthHeader() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
 }
 
+// ActiveProfileName returns the name of the currently selected profile: the
+// LODOR_PROFILE env (the launcher exports it on a switch) wins over the config's
+// active_profile field. Returns "" when no profile is selected (single-user card),
+// in which case ActiveHost is hosts[0] verbatim. Trimmed; case preserved (labels are
+// user-facing). Nil-safe.
+func (c *Config) ActiveProfileName() string {
+	if env := strings.TrimSpace(os.Getenv("LODOR_PROFILE")); env != "" && !strings.EqualFold(env, "default") {
+		return env
+	}
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.ActiveProfile)
+}
+
+// ActiveProfileIndex returns the index of the active profile in Profiles, matched by
+// Label (case-insensitive, trimmed), or -1 when none is selected/found. Nil-safe.
+func (c *Config) ActiveProfileIndex() int {
+	name := c.ActiveProfileName()
+	if name == "" || c == nil {
+		return -1
+	}
+	for i := range c.Profiles {
+		if strings.EqualFold(strings.TrimSpace(c.Profiles[i].Label), name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// ActiveProfile returns a pointer to the selected Profile, or nil when none is
+// selected/resolvable. Nil-safe.
+func (c *Config) ActiveProfilePtr() *Profile {
+	i := c.ActiveProfileIndex()
+	if i < 0 {
+		return nil
+	}
+	return &c.Profiles[i]
+}
+
+// ActiveHost returns the host the engine should authenticate AND sync as. It starts
+// from hosts[0] (the shared family server: root_uri/port/insecure/timeouts) and, when
+// a profile is selected and resolvable, OVERLAYS that profile's per-user identity —
+// token, device_id, device_name, username, and token metadata. The shared server
+// address is NEVER taken from the profile. When no profile is selected (single-user
+// card, the historical case) this is hosts[0] byte-identical, so existing configs are
+// unaffected. Caller must have checked len(Hosts) > 0 (same precondition as Hosts[0]).
+//
+// SECURITY: returns a value; never logs the token/device_id (callers already scrub).
+func (c *Config) ActiveHost() Host {
+	host := c.Hosts[0]
+	p := c.ActiveProfilePtr()
+	if p == nil {
+		return host
+	}
+	if p.Token != "" {
+		host.Token = p.Token
+		host.Password = "" // token-only at rest: a profile bearer never authenticates with a stale password
+	}
+	if p.DeviceID != "" {
+		host.DeviceID = p.DeviceID
+	}
+	if p.DeviceName != "" {
+		host.DeviceName = p.DeviceName
+	}
+	if p.Username != "" {
+		host.Username = p.Username
+	}
+	if p.TokenName != "" {
+		host.TokenName = p.TokenName
+	}
+	if p.TokenExpiresAt != "" {
+		host.TokenExpiresAt = p.TokenExpiresAt
+	}
+	if len(p.Scopes) > 0 {
+		host.Scopes = p.Scopes
+	}
+	return host
+}
+
+// Profile is one family member's per-user identity on the SHARED family server
+// (multi-user, approach #1). hosts[0] holds the shared server address (root_uri/
+// port/insecure); a Profile layers that user's OWN client token + server-registered
+// device_id on top so saves/states/Continue sync under THEIR account. Label is the
+// display name (its first letter drives the corner badge); Username is the RomM
+// account handle (best-effort, for display). A profile is selected by name via
+// active_profile (config) or the LODOR_PROFILE env (the launcher exports it on a
+// switch); ActiveHost() merges the selected profile onto hosts[0].
+//
+// SECURITY: Token is a secret at rest exactly like Host.Token — never logged/printed.
+type Profile struct {
+	Label      string `json:"label"`
+	Token      string `json:"token,omitempty"`
+	DeviceID   string `json:"device_id,omitempty"`
+	DeviceName string `json:"device_name,omitempty"`
+	Username   string `json:"username,omitempty"`
+
+	// Token metadata captured at pairing, same role as Host's (expiry warnings /
+	// per-device revoke). Optional; omitempty keeps older configs clean.
+	TokenName      string   `json:"token_name,omitempty"`
+	TokenExpiresAt string   `json:"token_expires_at,omitempty"`
+	Scopes         []string `json:"scopes,omitempty"`
+}
+
 // DirMapping overrides where a RomM platform's ROMs live on the card: an optional
 // slug override and a relative folder under the ROM root.
 type DirMapping struct {
@@ -101,6 +205,12 @@ const (
 // whole seconds; see Seconds-typed unmarshal for the legacy nanosecond fallback.
 type Config struct {
 	Hosts             []Host                `json:"hosts,omitempty"`
+	// Profiles are the per-user identities sharing hosts[0] (multi-user). Empty/absent
+	// on a single-user card — every existing single-account config stays byte-identical
+	// (ActiveHost falls back to hosts[0] verbatim). ActiveProfile names the selected one;
+	// the LODOR_PROFILE env overrides it at runtime when the launcher switches.
+	Profiles      []Profile `json:"profiles,omitempty"`
+	ActiveProfile string    `json:"active_profile,omitempty"`
 	DirectoryMappings map[string]DirMapping `json:"directory_mappings,omitempty"`
 	ApiTimeout        Seconds               `json:"api_timeout"`
 	DownloadTimeout   Seconds               `json:"download_timeout"`
@@ -121,6 +231,15 @@ type Config struct {
 	// ALWAYS fetches the downloaded game's own cover regardless of this toggle, so a
 	// downloaded game's Details view shows art even with bulk off.
 	FetchCovers *bool `json:"fetch_covers,omitempty"`
+
+	// RAUsername / RAToken are the RetroAchievements credential spine (task #46):
+	// the RA account handle and its long-lived login token, stored TOP-LEVEL (not
+	// under a host) because RA is account-global, independent of any RomM host. The
+	// RA PASSWORD is NEVER stored — only the token, mirroring the token-only-at-rest
+	// rule for the RomM bearer. Written by `lodor-sync --ra-login`; read by the menu
+	// (--ra-status) and, on LodorOS, by the minarch fork's vendored rc_client.
+	RAUsername string `json:"ra_username,omitempty"`
+	RAToken    string `json:"ra_token,omitempty"`
 }
 
 // CoversEnabled reports whether the BULK cover fetch on --mirror-catalog is on.
@@ -132,6 +251,13 @@ func (c *Config) CoversEnabled() bool {
 		return false
 	}
 	return *c.FetchCovers
+}
+
+// RALoggedIn reports whether a usable RetroAchievements credential pair (username +
+// token) is stored. The menu surfaces "Logged in as <user>" off this; the minarch
+// fork skips rc_client login when it is false. Nil-safe.
+func (c *Config) RALoggedIn() bool {
+	return c != nil && c.RAUsername != "" && c.RAToken != ""
 }
 
 // ResolvedMirrorMode returns the effective coexist mode. An explicit, recognized
@@ -166,9 +292,9 @@ func hostMirrorModeDefault() string {
 	case "", "lodoros", "lodor", "minui":
 		return MirrorModeOwn
 	case "nextui":
-		return MirrorModeSeparate
+		return MirrorModeOwn // RomM-first: merge in place, no " (RomM)" disambiguator (cut 2026-06-28)
 	default:
-		return MirrorModeSeparate
+		return MirrorModeOwn
 	}
 }
 

@@ -164,3 +164,33 @@ func parseConflictError(body []byte) error {
 	}
 	return &ConflictError{ErrorType: "conflict", Message: string(body)}
 }
+
+// PlaySessionEntry is one play session reported to RomM (POST /api/play-sessions).
+// The wire shape mirrors the server's PlaySessionEntry pydantic model
+// (backend/endpoints/play_sessions.py): StartTime/EndTime are RFC3339 datetimes the
+// server truncates to whole seconds, DurationMs is the played time in MILLISECONDS
+// (>=0), and the server REJECTS an entry whose EndTime is not strictly after
+// StartTime (422). SaveSlot is optional and omitted by the engine. rom_id is an int
+// here because the engine only ever reports a session for a resolved ROM.
+type PlaySessionEntry struct {
+	RomID      int    `json:"rom_id"`
+	SaveSlot   string `json:"save_slot,omitempty"`
+	StartTime  string `json:"start_time"`
+	EndTime    string `json:"end_time"`
+	DurationMs int64  `json:"duration_ms"`
+}
+
+// PlaySessionIngestPayload is the POST /api/play-sessions request body: an optional
+// top-level device_id plus a batch of sessions (server cap: 100 per request).
+type PlaySessionIngestPayload struct {
+	DeviceID string             `json:"device_id,omitempty"`
+	Sessions []PlaySessionEntry `json:"sessions"`
+}
+
+// PlaySessionIngestResponse is the subset of the 201 response the engine consumes:
+// how many sessions the server created vs skipped (deduped).
+type PlaySessionIngestResponse struct {
+	CreatedCount int `json:"created_count"`
+	SkippedCount int `json:"skipped_count"`
+}
+

@@ -23,6 +23,18 @@ import (
 	"lodor/romm"
 )
 
+// writeIdentity routes a per-user identity write (token/device_id/device_name/
+// username) to the ACTIVE profile when one is selected (multi-user), else to
+// hosts[0]. The server-address fields are NEVER per-user, so those still go through
+// WriteHostUpdate/SetServer directly. This is the single seam that makes the existing
+// pair/register/rename modes profile-aware without changing their RESULT contract.
+func writeIdentity(cfg *config.Config, u config.HostUpdate) error {
+	if name := cfg.ActiveProfileName(); name != "" {
+		return config.WriteProfileUpdate(name, u)
+	}
+	return config.WriteHostUpdate(u)
+}
+
 // runSetServer persists the wizard's server URL (scheme+host), optional port, and
 // the HTTPS skip-verify toggle to config.json BEFORE pairing — the engine's --pair
 // reads root_uri from the config, so the address must land first. It creates
@@ -96,7 +108,7 @@ func runPair(cfg *config.Config, code string) {
 		fmt.Println("RESULT paired=0 scopes_ok=0")
 		os.Exit(2)
 	}
-	host := cfg.Hosts[0]
+	host := cfg.ActiveHost()
 
 	// Exchange runs PRE-token using only the base URL + TLS-skip flag.
 	exch, err := romm.ExchangeToken(host.URL(), code, host.InsecureSkipVerify)
@@ -147,7 +159,7 @@ func runPair(cfg *config.Config, code string) {
 
 	upd := config.HostUpdate{Username: username}
 	upd.SetToken(exch.RawToken, exch.Name, exch.ExpiresAt, exch.Scopes)
-	if werr := config.WriteHostUpdate(upd); werr != nil {
+	if werr := writeIdentity(cfg, upd); werr != nil {
 		fmt.Fprintf(os.Stderr, "PAIRFAIL write: %s\n", safeErr(werr))
 		fmt.Println("RESULT paired=0 scopes_ok=0")
 		os.Exit(4)
@@ -168,7 +180,7 @@ func runRegisterDevice(cfg *config.Config, name string) {
 		fmt.Println("RESULT registered=0")
 		os.Exit(2)
 	}
-	host := cfg.Hosts[0]
+	host := cfg.ActiveHost()
 	apiTimeout := time.Duration(cfg.ApiTimeout.Int()) * time.Second
 	client := romm.NewClient(host, apiTimeout)
 
@@ -188,7 +200,7 @@ func runRegisterDevice(cfg *config.Config, name string) {
 		os.Exit(4)
 	}
 
-	if werr := config.WriteHostUpdate(config.HostUpdate{DeviceID: dev.ID, DeviceName: name}); werr != nil {
+	if werr := writeIdentity(cfg, config.HostUpdate{DeviceID: dev.ID, DeviceName: name}); werr != nil {
 		fmt.Fprintf(os.Stderr, "REGFAIL write: %s\n", safeErr(werr))
 		fmt.Println("RESULT registered=0")
 		os.Exit(4)
@@ -209,7 +221,7 @@ func runRenameDevice(cfg *config.Config, name string) {
 		fmt.Println("RESULT renamed=0")
 		os.Exit(2)
 	}
-	host := cfg.Hosts[0]
+	host := cfg.ActiveHost()
 	if host.DeviceID == "" {
 		fmt.Fprintln(os.Stderr, "RENAMEFAIL no device_id — register the device first")
 		fmt.Println("RESULT renamed=0")
@@ -228,7 +240,7 @@ func runRenameDevice(cfg *config.Config, name string) {
 		os.Exit(4)
 	}
 
-	if werr := config.WriteHostUpdate(config.HostUpdate{DeviceName: name}); werr != nil {
+	if werr := writeIdentity(cfg, config.HostUpdate{DeviceName: name}); werr != nil {
 		fmt.Fprintf(os.Stderr, "RENAMEFAIL write: %s\n", safeErr(werr))
 		fmt.Println("RESULT renamed=0")
 		os.Exit(4)
@@ -247,7 +259,7 @@ func runRenameDevice(cfg *config.Config, name string) {
 // judged, reported 0), 4 reachable-but-auth-failed, 0 both ok. auth is only trusted
 // when reachable=1, so an unreachable host always prints auth=0.
 func runValidate(cfg *config.Config) {
-	host := cfg.Hosts[0]
+	host := cfg.ActiveHost()
 	apiTimeout := time.Duration(cfg.ApiTimeout.Int()) * time.Second
 	client := romm.NewClient(host, apiTimeout)
 

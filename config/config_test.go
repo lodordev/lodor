@@ -100,9 +100,9 @@ func TestResolvedMirrorMode(t *testing.T) {
 		{"unset, no host hint -> own", "", "", MirrorModeOwn},
 		{"unset, lodoros -> own", "", "lodoros", MirrorModeOwn},
 		{"unset, minui -> own", "", "minui", MirrorModeOwn},
-		{"unset, nextui -> separate", "", "nextui", MirrorModeSeparate},
-		{"unset, unknown host -> separate", "", "weirdos", MirrorModeSeparate},
-		{"unknown value falls back to host default", "garbage", "nextui", MirrorModeSeparate},
+		{"unset, nextui -> own", "", "nextui", MirrorModeOwn},
+		{"unset, unknown host -> own", "", "weirdos", MirrorModeOwn},
+		{"unknown value falls back to host default", "garbage", "nextui", MirrorModeOwn},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -117,7 +117,7 @@ func TestResolvedMirrorMode(t *testing.T) {
 	// Nil receiver must not panic and must use the host default.
 	t.Setenv("LODOR_HOST_OS", "nextui")
 	var nilCfg *Config
-	if got := nilCfg.ResolvedMirrorMode(); got != MirrorModeSeparate {
-		t.Errorf("nil Config ResolvedMirrorMode() = %q, want %q", got, MirrorModeSeparate)
+	if got := nilCfg.ResolvedMirrorMode(); got != MirrorModeOwn {
+		t.Errorf("nil Config ResolvedMirrorMode() = %q, want %q", got, MirrorModeOwn)
 	}
 }

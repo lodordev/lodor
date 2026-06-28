@@ -1,3 +1,5 @@
+//go:build !onion
+
 package catalog
 
 import (

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // configFileName is the canonical config the engine loads CWD-relative. Kept in one
@@ -158,6 +159,184 @@ func WriteHostUpdate(u HostUpdate) error {
 	}
 
 	return writeJSONAtomic(path, root)
+}
+
+// WriteRACredentials persists the RetroAchievements username + long-lived token to
+// the TOP LEVEL of config.json (ra_username / ra_token), preserving every other key
+// (hosts, directory_mappings, the launcher's own keys) byte-for-value via the same
+// generic-tree edit WriteHostUpdate uses. The RA PASSWORD is never written — only the
+// token, mirroring the token-only-at-rest rule for the RomM bearer. An empty token
+// CLEARS both keys (logout). Atomic 0600 write. NEVER logs the token; errors name only
+// the failing step.
+func WriteRACredentials(username, token string) error {
+	path := configFileName
+
+	var root map[string]any
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if uerr := json.Unmarshal(data, &root); uerr != nil {
+			return fmt.Errorf("parse config: %w", uerr)
+		}
+		if root == nil {
+			root = map[string]any{}
+		}
+	case os.IsNotExist(err):
+		root = map[string]any{}
+	default:
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	if token == "" {
+		delete(root, "ra_username")
+		delete(root, "ra_token")
+	} else {
+		root["ra_username"] = username
+		root["ra_token"] = token
+	}
+
+	return writeJSONAtomic(path, root)
+}
+
+// WriteProfileUpdate applies u to the profile named label in config.json (matched by
+// label, case-insensitive), creating the profile entry if it does not yet exist, and
+// persists atomically. Used by the multi-user onboarding modes (--add-profile pairing
+// + --register-device) so a family member's token/device_id land on THEIR profile, not
+// on hosts[0] (the shared server). hosts[] is left untouched. Same generic-tree edit as
+// WriteHostUpdate: every other key (known or not) survives byte-for-value. NEVER logs
+// the token/device_id; errors name only the failing step.
+//
+// When ALSO marking the profile active, callers follow with SetActiveProfile (or pass
+// it through the higher-level helper) — this function only writes the profile fields.
+func WriteProfileUpdate(label string, u HostUpdate) error {
+	path := configFileName
+	root, err := readConfigTree(path)
+	if err != nil {
+		return err
+	}
+	prof := profileMapByLabel(root, label)
+	applyHostUpdateFields(prof, u)
+	// A profile always carries its label (it is the selector + badge source).
+	if _, ok := prof["label"]; !ok {
+		prof["label"] = label
+	}
+	return writeJSONAtomic(path, root)
+}
+
+// SetActiveProfile writes the top-level active_profile selector. An empty name CLEARS
+// it (single-user). Atomic; preserves every other key.
+func SetActiveProfile(label string) error {
+	path := configFileName
+	root, err := readConfigTree(path)
+	if err != nil {
+		return err
+	}
+	if label == "" {
+		delete(root, "active_profile")
+	} else {
+		root["active_profile"] = label
+	}
+	return writeJSONAtomic(path, root)
+}
+
+// RemoveProfile deletes the profile named label (case-insensitive) from profiles[]
+// and clears active_profile when it pointed at that label. A no-op (still nil error)
+// when the label is absent. Atomic; preserves every other key.
+func RemoveProfile(label string) error {
+	path := configFileName
+	root, err := readConfigTree(path)
+	if err != nil {
+		return err
+	}
+	want := strings.ToLower(strings.TrimSpace(label))
+	arr, _ := root["profiles"].([]any)
+	kept := arr[:0:0]
+	for _, e := range arr {
+		if m, ok := e.(map[string]any); ok {
+			if l, _ := m["label"].(string); strings.ToLower(strings.TrimSpace(l)) == want {
+				continue // drop
+			}
+		}
+		kept = append(kept, e)
+	}
+	if len(kept) == 0 {
+		delete(root, "profiles")
+	} else {
+		root["profiles"] = kept
+	}
+	if ap, _ := root["active_profile"].(string); strings.ToLower(strings.TrimSpace(ap)) == want {
+		delete(root, "active_profile")
+	}
+	return writeJSONAtomic(path, root)
+}
+
+// readConfigTree reads config.json into a generic mutable tree, repairing a missing
+// file into an empty object so a fresh card can be written. Shared by the profile
+// writers; mirrors the read prologue of WriteHostUpdate.
+func readConfigTree(path string) (map[string]any, error) {
+	var root map[string]any
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if uerr := json.Unmarshal(data, &root); uerr != nil {
+			return nil, fmt.Errorf("parse config: %w", uerr)
+		}
+		if root == nil {
+			root = map[string]any{}
+		}
+	case os.IsNotExist(err):
+		root = map[string]any{}
+	default:
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	return root, nil
+}
+
+// profileMapByLabel returns the profiles[] entry whose "label" matches (case-insensitive,
+// trimmed), as a mutable map, creating and appending a fresh entry when none exists.
+func profileMapByLabel(root map[string]any, label string) map[string]any {
+	want := strings.ToLower(strings.TrimSpace(label))
+	arr, _ := root["profiles"].([]any)
+	for i := range arr {
+		if m, ok := arr[i].(map[string]any); ok {
+			if l, _ := m["label"].(string); strings.ToLower(strings.TrimSpace(l)) == want {
+				return m
+			}
+		}
+	}
+	prof := map[string]any{"label": label}
+	arr = append(arr, prof)
+	root["profiles"] = arr
+	return prof
+}
+
+// applyHostUpdateFields writes the non-empty fields of u onto an arbitrary host/profile
+// map (the shared field-write logic factored out of WriteHostUpdate so profiles and
+// hosts persist identically). Server-address fields are intentionally NOT written here —
+// profiles never carry their own server.
+func applyHostUpdateFields(host map[string]any, u HostUpdate) {
+	if u.setToken || u.Token != "" {
+		setOrDelete(host, "token", u.Token)
+		delete(host, "password")
+	}
+	if u.TokenName != "" {
+		host["token_name"] = u.TokenName
+	}
+	if u.TokenExpiresAt != "" {
+		host["token_expires_at"] = u.TokenExpiresAt
+	}
+	if u.Scopes != nil {
+		host["scopes"] = u.Scopes
+	}
+	if u.Username != "" {
+		host["username"] = u.Username
+	}
+	if u.DeviceID != "" {
+		host["device_id"] = u.DeviceID
+	}
+	if u.DeviceName != "" {
+		host["device_name"] = u.DeviceName
+	}
 }
 
 // firstHostMap returns hosts[0] as a mutable map, normalizing a missing, non-array,

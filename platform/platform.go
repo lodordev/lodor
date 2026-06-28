@@ -1,3 +1,5 @@
+//go:build !onion
+
 // Package platform re-expresses the miyoomini/MinUI save-directory data (BLUEPRINT
 // §6) as our own and provides the path helpers the engine needs: where ROMs, BIOS,
 // and saves live on the card, and how a RomM ROM maps to a concrete on-disk path.
@@ -172,8 +174,64 @@ func RomsDir() string { return filepath.Join(BasePath(), "Roms") }
 // BiosDir returns <BasePath>/Bios.
 func BiosDir() string { return filepath.Join(BasePath(), "Bios") }
 
-// SavesDir returns <BasePath>/Saves.
-func SavesDir() string { return filepath.Join(BasePath(), "Saves") }
+// SavesDir returns the save root. MULTI-USER (approach #1): the per-platform boot
+// script exports SAVES_PATH="$SDCARD_PATH/Saves/$LODOR_PROFILE" (profile-namespaced),
+// and minarch reads the SAME env, so the emulator's write dir and the engine's sync
+// dir stay in lockstep. When SAVES_PATH is unset (single-user card, or a tool invoked
+// outside the boot env) we fall back to <BasePath>/Saves — byte-identical to the
+// historical behavior, so existing cards are unaffected.
+func SavesDir() string {
+	if sp := strings.TrimSpace(os.Getenv("SAVES_PATH")); sp != "" {
+		return sp
+	}
+	return filepath.Join(BasePath(), "Saves")
+}
+
+// ActiveProfile returns the active multi-user profile name from LODOR_PROFILE, or
+// "" (single-user) when unset/blank/"default". Used to namespace the integrity-
+// critical per-profile sync state (sync-anchors.<profile>.json / pending-saves.<profile>.txt)
+// so one user's reconcile can never touch another's. "default"/"" => the historical
+// un-namespaced filenames, keeping existing single-user cards byte-identical.
+func ActiveProfile() string {
+	p := strings.TrimSpace(os.Getenv("LODOR_PROFILE"))
+	if p == "" || strings.EqualFold(p, "default") {
+		return ""
+	}
+	return p
+}
+
+// ProfileStateName returns the per-profile filename for a pak-local state file:
+// "<base>.<profile>.<ext>" when a profile is active, else the un-namespaced
+// "<base>.<ext>" (single-user, historical). E.g. ProfileStateName("sync-anchors",
+// "json") => "sync-anchors.json" (default) or "sync-anchors.alice.json" (profile
+// "alice"). The profile segment is sanitized to a filesystem-safe token so a label
+// with spaces/slashes can never escape the pak dir or collide.
+func ProfileStateName(base, ext string) string {
+	prof := ActiveProfile()
+	if prof == "" {
+		return base + "." + ext
+	}
+	return base + "." + sanitizeProfileToken(prof) + "." + ext
+}
+
+// sanitizeProfileToken reduces a profile label to a safe filename segment: keep
+// [A-Za-z0-9._-], map everything else (spaces, slashes, etc.) to "_". Never empty
+// (an all-unsafe label yields "_"), so the namespaced filename is always well-formed.
+func sanitizeProfileToken(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "_"
+	}
+	return b.String()
+}
 
 // EmulatorFoldersForFSSlug returns the MinUI emulator/save folder names for a RomM
 // filesystem slug. An unknown slug or one with no save directory returns nil/empty.

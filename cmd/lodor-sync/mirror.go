@@ -42,25 +42,30 @@ func runMirrorCatalog(client *romm.Client, cfg *config.Config) {
 	os.Exit(0)
 }
 
-// runMirrorCollections writes one Collections/<name>.txt per RomM collection and
-// prints the §8 contract:
+// runMirrorCollections writes one Collections/<name>.txt per collection — manual,
+// smart, and virtual (auto) — and prints the §8 contract:
 //
-//	COLLECTIONS written=%d empty=%d total=%d
+//	COLLECTIONS written=%d empty=%d total=%d manual=%d virtual=%d smart=%d
 //
-// The collection list comes from the network; a failure there is exit 3.
+// written/empty/total are the COMBINED counts across all three sources (the original
+// three fields keep their meaning); the trailing manual/virtual/smart fields are an
+// additive per-source breakdown for diagnostics. The manual collection list comes from
+// the network and a failure there is exit 3; the virtual/smart shelves are optional and
+// a missing endpoint (older RomM) is a silent no-op, never an error.
 func runMirrorCollections(client *romm.Client, cfg *config.Config) {
 	writeProgress(0)
 	writePhase("Reading collections…")
 
 	rep := &catalog.Reporter{Phase: writePhase, Percent: writeProgress}
 
-	written, empty, total, err := catalog.MirrorCollections(client, cfg, rep)
+	written, empty, total, manual, virtual, smart, err := catalog.MirrorCollections(client, cfg, rep)
 	if err != nil {
 		writeProgress(0)
 		writePhase("Couldn't reach RomM")
 		fmt.Fprintf(os.Stderr, "FATAL collections: %s\n", safeErr(err))
 		os.Exit(3)
 	}
-	fmt.Printf("COLLECTIONS written=%d empty=%d total=%d\n", written, empty, total)
+	fmt.Printf("COLLECTIONS written=%d empty=%d total=%d manual=%d virtual=%d smart=%d\n",
+		written, empty, total, manual, virtual, smart)
 	os.Exit(0)
 }

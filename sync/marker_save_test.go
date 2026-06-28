@@ -42,7 +42,10 @@ func TestSaveLocalPathMirrorsMarkedRomName(t *testing.T) {
 		cfg, rom, canonical := markerSaveEnv(t, mode)
 		marked := filepath.Join(filepath.Dir(canonical), platform.MarkerOnDevice+filepath.Base(canonical))
 		got := saveLocalPath(cfg, rom, marked, "")
-		want := filepath.Join(platform.SaveDirectory("gba"), filepath.Base(marked)+".sav")
+		// Derive the expected save name through the platform helper so this asserts the
+		// real property on BOTH CFWs: MinUI yields "<name>.sav" (unchanged); OnionOS yields
+		// the RetroArch basename rule. saveLocalPath builds the name the same way.
+		want := filepath.Join(platform.SaveDirectory("gba"), platform.SaveFileName(filepath.Base(marked), ""))
 		if got != want {
 			t.Errorf("[%s] saveLocalPath = %q, want %q", mode, got, want)
 		}

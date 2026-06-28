@@ -60,6 +60,26 @@ func enqueueStaged(romPath, stagedPath, emulator string) error {
 	return pendingWrite(cur)
 }
 
+// enqueueBare appends a BARE ROM-path entry to pending-saves.txt under the queue lock,
+// deduplicated (never adds a line that already exists). This is the offline-first
+// fallback the HYBRID post-game push uses when it could not push AND could not stage a
+// snapshot (e.g. the server was unreachable so the ROM's save files couldn't be
+// resolved): the bare line guarantees the changed save is still recorded for later, and
+// --push-pending resolves+uploads the live save when WiFi returns (parseQueueLine treats
+// a one-field line as a bare ROM path).
+func enqueueBare(romPath string) error {
+	release := acquireQueueLock()
+	defer release()
+	cur := pendingRead()
+	for _, line := range cur {
+		if line == romPath {
+			return nil // already queued — dedup
+		}
+	}
+	cur = append(cur, romPath)
+	return pendingWrite(cur)
+}
+
 // parseQueueLine classifies a pending-saves.txt line. A bare line is a ROM path (push the
 // current live save); a TAB-split line is a staged pre-flashback snapshot (push the named
 // staged file for that ROM). emu is "" when absent.
@@ -90,9 +110,12 @@ func pakDir() string {
 	return platform.PakDir()
 }
 
-// pendingPath returns the absolute path of pending-saves.txt.
+// pendingPath returns the absolute path of pending-saves.txt. MULTI-USER: the
+// filename is profile-namespaced (pending-saves.<profile>.txt) so one user's offline
+// upload queue can never push another user's save; single-user cards keep the
+// historical un-namespaced pending-saves.txt.
 func pendingPath() string {
-	return filepath.Join(pakDir(), "pending-saves.txt")
+	return filepath.Join(pakDir(), platform.ProfileStateName("pending-saves", "txt"))
 }
 
 // lockPath returns the advisory lock directory used to serialize queue mutations.

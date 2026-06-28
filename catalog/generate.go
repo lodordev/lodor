@@ -81,10 +81,8 @@ func GenerateDirectoryMappings(client platformLister, mode string) (mappings map
 // own "<Display> (<TAG>)" folder (verified naming, issue #68). "merge" reuses the
 // separate layout until the adopt-by-tag design lands (see ensureDirectoryMappings).
 func mirrorFolderName(display, tag, mode string) string {
-	if mode == config.MirrorModeOwn {
-		return fmt.Sprintf("%s (%s)", display, tag)
-	}
-	return fmt.Sprintf("%s RomM (%s)", display, tag)
+	// CFW-variant: MinUI builds "<Display> (<TAG>)"; OnionOS builds the bare <TAG>.
+	return platform.MirrorFolderName(display, tag, mode)
 }
 
 // sanitizeFolderName makes a platform display name safe as a SINGLE flat folder
