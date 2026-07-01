@@ -66,8 +66,6 @@ func isNonGameAsset(p string) bool {
 type romClient interface {
 	GetRoms(query romm.GetRomsQuery) (romm.PaginatedRoms, error)
 	GetCollections() ([]romm.Collection, error)
-	GetVirtualCollections(collectionType string) ([]romm.Collection, error)
-	GetSmartCollections() ([]romm.Collection, error)
 	DownloadCover(coverPath string) ([]byte, error)
 }
 
@@ -140,7 +138,7 @@ func IndexPath(cfg *config.Config) string {
 // counted and skipped (v1). A ROM whose local path resolves to a save extension is
 // skipped; an already-present file is counted as existing; otherwise a 0-byte stub
 // is created.
-func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created, existing, skipped, multifile, covers int, err error) {
+func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverForce bool) (created, existing, skipped, multifile, covers int, err error) {
 	idx := index{Version: 1, Platforms: map[string]platformIndex{}}
 	coversOn := cfg.CoversEnabled()
 
@@ -251,7 +249,14 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 			// "[v] " (on device), migrating saves + cover in lockstep if the marker flips.
 			// finalPath is the actual MARKED name on the card; didCreate is true only for a
 			// brand-new stub (preserving the created/existing contract counts).
-			finalPath, didCreate := platform.ReconcileMarkedPresence(cfg, rom, path)
+			var finalPath string
+			var didCreate bool
+			if platform.HostShowsStateNatively() {
+				// LodorOS forked launcher dims by file size -> keep canonical names, no markers.
+				finalPath, didCreate = platform.ReconcileCanonicalPresence(cfg, rom, path)
+			} else {
+				finalPath, didCreate = platform.ReconcileMarkedPresence(cfg, rom, path)
+			}
 			if finalPath == "" {
 				skipped++
 				continue
@@ -276,7 +281,7 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter) (created
 					if coverTotal > 0 {
 						rep.phase(fmt.Sprintf("Fetching cover %d/%d…", coverDone, coverTotal))
 					}
-					if out, _ := cover.FetchAndSave(client, cp, finalPath); out == cover.OutcomeSaved {
+					if out, _ := cover.FetchAndSave(client, cp, finalPath, coverForce); out == cover.OutcomeSaved {
 						covers++
 					}
 				}
@@ -332,25 +337,15 @@ func mirrorPct(platformsDone, platformsTotal, doneWork, totalWork int) int {
 // listing the SDCARD-relative path of each member ROM that is actually present on
 // the card. Empty collections are skipped. Returns written, empty, and total counts
 // (total = number of collections fetched). BLUEPRINT §4.
-// MirrorCollections writes one Collections/<sanitized>.txt per collection, listing the
-// SDCARD-relative path of each member ROM actually present on the card. It covers THREE
-// sources: the user's MANUAL collections (GET /api/collections), RomM's auto-generated
-// VIRTUAL collections (metadata-derived shelves by genre/franchise/etc., GET
-// /api/collections/virtual?type=all) and the user's SMART collections (saved-filter
-// shelves, GET /api/collections/smart). Empty collections (no on-card members) are
-// skipped, and a virtual/smart name that would clobber an already-written file is
-// skipped (manual wins, then smart, then virtual) so the auto shelves never overwrite a
-// user's manual one. The virtual/smart endpoints are OPTIONAL: an older RomM that lacks
-// them returns 404 and is gracefully treated as "none" rather than failing the mirror.
-// Returns written/empty/total plus the per-source written breakdown. BLUEPRINT §4.
-func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total, manual, virtual, smart int, err error) {
+func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total int, err error) {
 	rep.percent(0)
 	rep.phase("Reading collections…")
 
 	collections, cerr := client.GetCollections()
 	if cerr != nil {
-		return 0, 0, 0, 0, 0, 0, cerr
+		return 0, 0, 0, cerr
 	}
+	total = len(collections)
 
 	// rom_id -> SDCARD-relative path. FAST PATH: reuse the by_id map the preceding
 	// --mirror-catalog already wrote to the index. This avoids re-fetching the WHOLE
@@ -370,7 +365,7 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 		sdRoot := sdcardRoot()
 		platforms, perr := getMappedPlatforms(client, cfg)
 		if perr != nil {
-			return 0, 0, len(collections), 0, 0, 0, perr
+			return 0, 0, total, perr
 		}
 		nPlat := len(platforms)
 		for pi2, p := range platforms {
@@ -397,74 +392,51 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 
 	colDir := filepath.Join(platform.RomsDir(), "..", "Collections")
 	if mkErr := os.MkdirAll(colDir, 0o755); mkErr != nil {
-		return 0, 0, len(collections), 0, 0, 0, mkErr
+		return 0, 0, total, mkErr
 	}
 
-	// AUTO shelves are OPTIONAL: pull them up front, but a 404 (endpoint absent on an
-	// older RomM) or any other error degrades to "none" — never fails the whole mirror.
-	smartCols := fetchOptionalCollections(client.GetSmartCollections)
-	virtualCols := fetchOptionalCollections(func() ([]romm.Collection, error) {
-		return client.GetVirtualCollections("all")
-	})
-	total = len(collections) + len(smartCols) + len(virtualCols)
-
-	// Track names already written so an auto shelf never clobbers a manual one (and the
-	// two auto sources never clobber each other). Precedence: manual, then smart, then virtual.
-	taken := map[string]bool{}
-
-	writeSet := func(cols []romm.Collection, phaseLabel string, baseDone, span int) (w, e int) {
-		n := len(cols)
-		for ci, col := range cols {
-			rep.phase(fmt.Sprintf("%s (%d/%d)…", phaseLabel, ci+1, n))
-			if n > 0 && span > 0 {
-				rep.percent(baseDone + (ci+1)*span/n)
+	kept := map[string]bool{}
+	for ci, col := range collections {
+		rep.phase(fmt.Sprintf("Building collections (%d/%d)…", ci+1, total))
+		if total > 0 {
+			rep.percent(50 + (ci+1)*50/total)
+		}
+		var lines []string
+		for _, rid := range col.RomIDs {
+			if rel, ok := idPath[rid]; ok {
+				lines = append(lines, rel)
 			}
-			var lines []string
-			for _, rid := range col.RomIDs {
-				if rel, ok := idPath[rid]; ok {
-					lines = append(lines, rel)
-				}
-			}
-			if len(lines) == 0 {
-				e++
+		}
+		if len(lines) == 0 {
+			empty++
+			continue
+		}
+		name := sanitizeCollectionName(col.Name)
+		if name == "" {
+			continue
+		}
+		if werr := os.WriteFile(filepath.Join(colDir, name+".txt"),
+			[]byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
+			return written, empty, total, werr
+		}
+		kept[name+".txt"] = true
+		written++
+	}
+	// Prune stale collection files: any Collections/*.txt we did NOT just write is no
+	// longer a current RomM collection (or is now empty on this device) — remove it so a
+	// previous engine's auto/virtual collections cannot linger across refreshes.
+	if entries, derr := os.ReadDir(colDir); derr == nil {
+		for _, e := range entries {
+			n := e.Name()
+			if e.IsDir() || !strings.HasSuffix(n, ".txt") || kept[n] {
 				continue
 			}
-			name := sanitizeCollectionName(col.Name)
-			if name == "" || taken[strings.ToLower(name)] {
-				continue // unnamed, or would clobber a higher-precedence shelf
-			}
-			if werr := os.WriteFile(filepath.Join(colDir, name+".txt"),
-				[]byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
-				continue // a single bad name must not abort the whole set
-			}
-			taken[strings.ToLower(name)] = true
-			w++
+			_ = os.Remove(filepath.Join(colDir, n))
 		}
-		return w, e
 	}
-
-	// Split the 50→100 progress band across the three sources by their relative size.
-	manual, mEmpty := writeSet(collections, "Building collections", 50, 17)
-	smart, sEmpty := writeSet(smartCols, "Building smart shelves", 67, 16)
-	virtual, vEmpty := writeSet(virtualCols, "Building auto shelves", 83, 16)
-
-	written = manual + smart + virtual
-	empty = mEmpty + sEmpty + vEmpty
 	rep.percent(100)
 	rep.phase(fmt.Sprintf("Collections updated — %d", written))
-	return written, empty, total, manual, virtual, smart, nil
-}
-
-// fetchOptionalCollections runs an OPTIONAL collection fetch (virtual/smart), returning
-// an empty slice when the server lacks the endpoint (404) or the call otherwise fails.
-// These auto shelves are a bonus on top of the user's manual collections; their absence
-// must never fail --mirror-collections, so every error degrades to "no shelves".
-func fetchOptionalCollections(fetch func() ([]romm.Collection, error)) []romm.Collection {
-	cols, err := fetch()
-	if err != nil {
-		return nil
-	}
-	return cols
+	return written, empty, total, nil
 }
 
 // ResolveRomID reverses a local ROM path back to its rom_id using the catalog
@@ -530,7 +502,27 @@ func slugForRomPath(cfg *config.Config, romPath string) (string, bool) {
 			return slug, true
 		}
 	}
+	// Fallback: the folder is not in directory_mappings (a platform discovered by
+	// installed pak, e.g. an NDS.pak added after onboarding). Derive the fs_slug from the
+	// folder's trailing "(TAG)" — the same convention the mirror writes — so download and
+	// save resolution work for capability-discovered platforms too.
+	if tag := tagFromFolderName(dir); tag != "" {
+		if slug, ok := platform.FsSlugForTag(tag); ok {
+			return slug, true
+		}
+	}
 	return "", false
+}
+
+// tagFromFolderName extracts the trailing "(TAG)" from a Roms folder name, e.g.
+// "Nintendo DS (NDS)" -> "NDS". Returns "" when absent.
+func tagFromFolderName(dir string) string {
+	o := strings.LastIndex(dir, "(")
+	c := strings.LastIndex(dir, ")")
+	if o >= 0 && c > o {
+		return dir[o+1 : c]
+	}
+	return ""
 }
 
 // sanitizeCollectionName makes a collection name safe as a filename, replacing the
@@ -614,10 +606,19 @@ func getMappedPlatforms(client romClient, cfg *config.Config) ([]romm.Platform, 
 	}
 	var out []romm.Platform
 	for _, p := range all {
+		mapped := false
 		if cfg != nil {
-			if _, mapped := cfg.DirectoryMappings[p.FsSlug]; mapped {
-				out = append(out, p)
-			}
+			_, mapped = cfg.DirectoryMappings[p.FsSlug]
+		}
+		// Also discover platforms the device can actually launch (a matching emulator
+		// pak is installed) even when onboarding-baked directory_mappings predate the
+		// pak — otherwise e.g. an NDS.pak added later never gets its library stubbed.
+		capable := false
+		if tag, ok := platform.PrimaryTag(p.FsSlug); ok && platform.HasEmuPak(tag) {
+			capable = true
+		}
+		if mapped || capable {
+			out = append(out, p)
 		}
 	}
 	return out, nil
@@ -678,6 +679,11 @@ func loadIndex(path string) (index, error) {
 //
 // Returns whether the on-disk marker actually flipped.
 func ReconcileAfterDownload(cfg *config.Config, romPath string) (flipped bool) {
+	// LodorOS keeps canonical names (no markers), so a downloaded game already
+	// carries its final name in place and there is no ✘->✓ flip to perform.
+	if platform.HostShowsStateNatively() {
+		return false
+	}
 	if cfg == nil || romPath == "" {
 		return false
 	}

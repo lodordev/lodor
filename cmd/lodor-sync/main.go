@@ -30,16 +30,24 @@ import (
 	"lodor/romm"
 )
 
+// tierProbeTimeout bounds the tier-1 (Tailscale) reachability check that
+// ResolveHost uses to decide between the preferred internal endpoint and the
+// public Cloudflare Access fallback. It must be SHORT: a device off the tailnet
+// should fail fast and fall back, not stall the whole sync. Only consulted when a
+// config actually carries more than one endpoint (a single-host config never
+// probes), so it adds zero latency to existing single-endpoint cards.
+const tierProbeTimeout = 2 * time.Second
+
 func main() {
 	var (
 		mirrorCatalog     bool
+		mirrorFull        bool
 		mirrorCollections bool
 		pushPending       bool
 		downloadBios      bool
 		downloadQueue     bool
 		syncFeed          bool
 		recent            bool
-		negotiateSync     bool
 		syncSave          string
 		pushSave          string
 		listSaves         string
@@ -47,6 +55,7 @@ func main() {
 		downloadRom       string
 		reconcile         string
 		pair              string
+		pairProfile       string
 		registerDevice    string
 		renameDevice      string
 		validate          bool
@@ -55,23 +64,25 @@ func main() {
 		setServerInsecure bool
 		raLogin           string
 		raStatus          bool
-		reportSession     string
-		sessionStarted    int64
-		sessionEnded      int64
-		// MULTI-USER profile management (offline, config-only).
 		listProfiles      bool
-		switchProfile     string
-		addProfile        string
-		removeProfile     string
+		listUsers         bool
+		loginProfile      string
+		loginUser         string
+		loginDevice       string
 	)
-	flag.BoolVar(&mirrorCatalog, "mirror-catalog", false, "stub every not-downloaded RomM game into Roms/ and write catalog-index.json; prints MIRROR created=.. existing=.. skipped=.. multifile=..")
+	flag.BoolVar(&mirrorCatalog, "mirror-catalog", false, "stub every not-downloaded RomM game into Roms/ and write catalog-index.json; prints MIRROR created=.. existing=.. skipped=.. multifile=.. covers=..  (UPDATE: only new games + missing covers)")
+	flag.BoolVar(&mirrorFull, "full", false, "with --mirror-catalog: FULL refresh — re-fetch every cover even if already present (default is the fast incremental update)")
 	flag.BoolVar(&mirrorCollections, "mirror-collections", false, "write Collections/<name>.txt per RomM collection; prints COLLECTIONS written=.. empty=.. total=..")
+	flag.BoolVar(&listProfiles, "list-profiles", false, "MULTI-USER: print the profile list the Switch-Profile menu parses: one line per host '<active>\\t<label>\\t<hastoken>\\t<hasdevice>'")
+	flag.BoolVar(&listUsers, "list-users", false, "MULTI-USER: list the RomM server's users for the Switch-User picker: '<active>\\t<username>\\t<role>\\t<signedin>' per line (admin token; falls back to stored profiles offline)")
+	flag.StringVar(&loginProfile, "login-profile", "", "MULTI-USER: sign in as an existing RomM user under this profile LABEL (OAuth password grant; password on STDIN, never argv); needs --login-user; prints RESULT logged_in=<0|1>")
+	flag.StringVar(&loginUser, "login-user", "", "with --login-profile: the existing RomM username to sign in as")
+	flag.StringVar(&loginDevice, "login-device", "", "with --login-profile: optional device id to attach to the profile")
 	flag.BoolVar(&pushPending, "push-pending", false, "upload every save in pending-saves.txt; prints RESULT pushed=<N> total=<M> stuck=<K>")
 	flag.BoolVar(&downloadBios, "download-bios", false, "download BIOS/firmware for every mapped platform; prints RESULT bios=<count>")
 	flag.BoolVar(&downloadQueue, "download-queue", false, "download every ROM queued in download-queue.txt (resolve, fetch, hash-verify each, reusing the --download path), dropping landed entries and keeping failures for retry; prints RESULT downloaded=<N> failed=<M> remaining=<K>")
 	flag.BoolVar(&syncFeed, "sync-feed", false, "list recent server saves across mapped platforms, newest first, tab-separated")
 	flag.BoolVar(&recent, "recent", false, "print the single most-recently-played game across devices as <localRomPath>\\t<game>\\t<when>\\t<device> (drives the Continue tile); empty if unreachable/none")
-	flag.BoolVar(&negotiateSync, "negotiate-sync", false, "SYNC V2 (experimental, RomM >= 4.9.0): server-side negotiated whole-library save sync; falls back to legacy when the server can't negotiate; prints RESULT negotiated=<0|1> pulled=<N> pushed=<N> conflicts=<N> errors=<N>")
 	flag.StringVar(&syncSave, "sync-save", "", "pull-then-push the save for one ROM; prints RESULT pulled=<0|1> pushed=<0|1>")
 	flag.StringVar(&pushSave, "push-save", "", "HYBRID post-game push for one ROM: push the changed save directly; on a LANDED push write last-synced.txt (the launcher's synced-✓ signal); if it does NOT land, stage the save into pending-saves.txt for later; prints RESULT pushed=<0|1> staged=<N>")
 	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated")
@@ -79,6 +90,7 @@ func main() {
 	flag.StringVar(&downloadRom, "download", "", "download one ROM's real file (resolve, fetch, hash-verify); prints RESULT downloaded=<0|1>")
 	flag.StringVar(&reconcile, "reconcile", "", "post-launch: flip ONE downloaded ROM's on-disk state marker (✘→✓) to match the bytes now present, carrying its save+cover with the rename; offline, no device; prints RESULT reconciled=<0|1>")
 	flag.StringVar(&pair, "pair", "", "exchange a RomM pairing code for a client-token, validate it, write config.json (clearing any password); prints RESULT paired=<0|1> scopes_ok=<0|1>")
+	flag.StringVar(&pairProfile, "pair-profile", "", "MULTI-USER: sign a profile in with a RomM PAIRING CODE (client-token exchange, not a password); stores the token owner as a profile; prints RESULT paired=<0|1> username=<name>")
 	flag.StringVar(&registerDevice, "register-device", "", "register this device by name, store device_id+device_name in config.json; prints RESULT registered=<0|1>")
 	flag.StringVar(&renameDevice, "rename-device", "", "rename the registered device, update config.json; prints RESULT renamed=<0|1>")
 	flag.BoolVar(&validate, "validate", false, "check host reachability (heartbeat) + auth (token); prints RESULT reachable=<0|1> auth=<0|1>")
@@ -87,13 +99,6 @@ func main() {
 	flag.BoolVar(&setServerInsecure, "insecure", false, "for --set-server: skip TLS verification (HTTPS only)")
 	flag.StringVar(&raLogin, "ra-login", "", "log in to RetroAchievements as <user>; reads the password from STDIN (never argv), exchanges it for the long-lived RA token, stores {ra_username, ra_token} in config.json (never the password); prints RESULT ra_login=<0|1>")
 	flag.BoolVar(&raStatus, "ra-status", false, "report RetroAchievements login state; prints RESULT ra_logged_in=<0|1> ra_user=<username>")
-	flag.StringVar(&reportSession, "report-session", "", "report ONE finished play session for the given ROM path to RomM (POST /api/play-sessions), feeding cross-device Continue/recently-played; needs --started/--ended unix epochs; best-effort, always exits 0; prints RESULT reported=<0|1>")
-	flag.BoolVar(&listProfiles, "list-profiles", false, "MULTI-USER: list configured profiles as <active?>\t<label>\t<has_token>\t<has_device> per line; offline, no host")
-	flag.StringVar(&switchProfile, "switch-profile", "", "MULTI-USER: set active_profile to <label> (must already exist); offline; prints RESULT switched=<0|1>")
-	flag.StringVar(&addProfile, "add-profile", "", "MULTI-USER: create profile <label> (if absent) and mark it active so the subsequent --pair/--register-device land on it; offline; prints RESULT added=<0|1>")
-	flag.StringVar(&removeProfile, "remove-profile", "", "MULTI-USER: remove profile <label> (and clear active_profile if it was active); offline; prints RESULT removed=<0|1>")
-	flag.Int64Var(&sessionStarted, "started", 0, "unix epoch (seconds) the play session started — used by --report-session")
-	flag.Int64Var(&sessionEnded, "ended", 0, "unix epoch (seconds) the play session ended — used by --report-session")
 	flag.Parse()
 
 	// --set-server runs BEFORE config.Load(): the fresh-device case has no config.json
@@ -118,25 +123,6 @@ func main() {
 		runReconcile(cfg, reconcile)
 		return // runReconcile always exits; defensive
 	}
-	// MULTI-USER profile management is filesystem-only (config.json edits): no host,
-	// no network, no device_id. Run before the hosts gate so adding the FIRST profile
-	// works on a server-only config.
-	if listProfiles {
-		runListProfiles(cfg)
-		return
-	}
-	if switchProfile != "" {
-		runSwitchProfile(cfg, switchProfile)
-		return
-	}
-	if addProfile != "" {
-		runAddProfile(cfg, addProfile)
-		return
-	}
-	if removeProfile != "" {
-		runRemoveProfile(cfg, removeProfile)
-		return
-	}
 	// RetroAchievements credential-spine modes (task #46): account-global, they need
 	// config.json (to read/write the RA creds) but NOT a RomM host, so they run before
 	// the hosts gate. --ra-status is read-only; --ra-login does its own RA-host network
@@ -158,14 +144,19 @@ func main() {
 	// --mirror-catalog is filesystem-only: it walks the live library to stub ROMs
 	// and write the index. It still needs the network (GetRoms), so build the client
 	// for it too — but it requires no device_id.
-	// MULTI-USER: ActiveHost() is hosts[0] (shared family server) with the SELECTED
-	// profile's token + device_id overlaid (or hosts[0] verbatim when no profile is
-	// active — the single-user case stays byte-identical). Every client + sync op below
-	// authenticates and syncs as the active profile.
-	host := cfg.ActiveHost()
+	// MULTI-USER + TWO-TIER: ResolveHost() picks the preferred reachable endpoint
+	// (tier-1 Tailscale when up — probed THROUGH its SOCKS5 proxy with a short
+	// timeout — else the tier-2 public Cloudflare Access fallback, which carries the
+	// CF-Access service-token headers), then keeps the multi-user identity: when an
+	// active profile is selected it stays byte-identical to ActiveHost (no probe). A
+	// legacy single-endpoint, single-profile config resolves to hosts[0] byte-identical
+	// (and does NO probe), so existing cards are unaffected.
+	host := cfg.ResolveHost(func(h config.Host) bool {
+		return romm.ProbeReachableHost(h, tierProbeTimeout)
+	})
 	// RTC-less handhelds boot to a garbage date; set the clock from the server before any HTTPS
 	// (a wrong clock fails TLS cert validation -> every fetch dies). No-op when already sane.
-	if err := clocksync.Ensure(host.URL(), host.InsecureSkipVerify); err != nil {
+	if err := clocksync.Ensure(host.URL(), host.SkipTLSVerify()); err != nil {
 		fmt.Fprintf(os.Stderr, "clocksync: %v\n", err)
 	}
 	apiTimeout := time.Duration(cfg.ApiTimeout.Int()) * time.Second
@@ -176,12 +167,20 @@ func main() {
 		runValidate(cfg)
 	case pair != "":
 		runPair(cfg, pair)
+	case pairProfile != "":
+		runPairProfile(cfg, pairProfile)
 	case registerDevice != "":
 		runRegisterDevice(cfg, registerDevice)
 	case renameDevice != "":
 		runRenameDevice(cfg, renameDevice)
+	case listProfiles:
+		runListProfiles(cfg)
+	case listUsers:
+		runListUsers(cfg)
+	case loginProfile != "":
+		runLoginProfile(cfg, loginProfile, loginUser, loginDevice)
 	case mirrorCatalog:
-		runMirrorCatalog(client, cfg)
+		runMirrorCatalog(client, cfg, mirrorFull)
 	case mirrorCollections:
 		runMirrorCollections(client, cfg)
 	case downloadRom != "":
@@ -221,16 +220,8 @@ func main() {
 		// Save uploads can be large; use the download timeout for the transfer path.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
 		runPushPending(dlClient, cfg)
-	case negotiateSync:
-		requireDevice(host)
-		// Whole-library negotiated sync transfers saves; use the download timeout.
-		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
-		runNegotiateSync(dlClient, cfg)
-	case reportSession != "":
-		requireDevice(host)
-		runReportSession(client, cfg, reportSession, sessionStarted, sessionEnded)
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --push-pending --sync-save --push-save --list-saves --restore-save --sync-feed --negotiate-sync --report-session --ra-login --ra-status)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --push-pending --sync-save --push-save --list-saves --restore-save --sync-feed --ra-login --ra-status)")
 		os.Exit(2)
 	}
 }

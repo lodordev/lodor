@@ -23,18 +23,6 @@ import (
 	"lodor/romm"
 )
 
-// writeIdentity routes a per-user identity write (token/device_id/device_name/
-// username) to the ACTIVE profile when one is selected (multi-user), else to
-// hosts[0]. The server-address fields are NEVER per-user, so those still go through
-// WriteHostUpdate/SetServer directly. This is the single seam that makes the existing
-// pair/register/rename modes profile-aware without changing their RESULT contract.
-func writeIdentity(cfg *config.Config, u config.HostUpdate) error {
-	if name := cfg.ActiveProfileName(); name != "" {
-		return config.WriteProfileUpdate(name, u)
-	}
-	return config.WriteHostUpdate(u)
-}
-
 // runSetServer persists the wizard's server URL (scheme+host), optional port, and
 // the HTTPS skip-verify toggle to config.json BEFORE pairing — the engine's --pair
 // reads root_uri from the config, so the address must land first. It creates
@@ -108,14 +96,31 @@ func runPair(cfg *config.Config, code string) {
 		fmt.Println("RESULT paired=0 scopes_ok=0")
 		os.Exit(2)
 	}
-	host := cfg.ActiveHost()
+	host := cfg.Hosts[0]
 
-	// Exchange runs PRE-token using only the base URL + TLS-skip flag.
-	exch, err := romm.ExchangeToken(host.URL(), code, host.InsecureSkipVerify)
-	if err != nil {
-		// Distinguish unreachable (network) from a server-rejected code (ran but
-		// errored): a network error scrubs to "network error" via safeErr.
+	// Exchange runs PRE-token using only the base URL + CF/TLS transport. A transport
+	// failure (a flaky handheld radio like the 8188fu on the Mini Plus) never reaches
+	// RomM, so the pairing code is NOT consumed and the SAME code is safe to re-send
+	// within its ~60s TTL. Retry ONLY those transient failures; a real 4xx ("invalid or
+	// expired code") means the code is spent or wrong and MUST NOT be retried (it would
+	// just burn RomM's 5-attempts/minute pair rate limit). This is the fix for the
+	// on-device "PAIRFAIL exchange: network error" that killed pairing after one blip.
+	const exchangeAttempts = 3
+	var exch romm.TokenExchangeResponse
+	var err error
+	for attempt := 1; ; attempt++ {
+		exch, err = romm.ExchangeToken(host, code)
+		if err == nil {
+			break
+		}
+		// A network error scrubs to "network error" via safeErr; anything else is a
+		// server response (bad code, rate limit) that a retry cannot fix.
 		msg := safeErr(err)
+		if msg == "network error" && attempt < exchangeAttempts {
+			fmt.Fprintf(os.Stderr, "PAIRRETRY exchange attempt %d/%d: transient network error, retrying\n", attempt, exchangeAttempts)
+			time.Sleep(time.Duration(attempt) * time.Second) // 1s, then 2s — well inside the code TTL
+			continue
+		}
 		fmt.Fprintf(os.Stderr, "PAIRFAIL exchange: %s\n", msg)
 		fmt.Println("RESULT paired=0 scopes_ok=0")
 		if msg == "network error" {
@@ -159,7 +164,7 @@ func runPair(cfg *config.Config, code string) {
 
 	upd := config.HostUpdate{Username: username}
 	upd.SetToken(exch.RawToken, exch.Name, exch.ExpiresAt, exch.Scopes)
-	if werr := writeIdentity(cfg, upd); werr != nil {
+	if werr := config.WriteHostUpdate(upd); werr != nil {
 		fmt.Fprintf(os.Stderr, "PAIRFAIL write: %s\n", safeErr(werr))
 		fmt.Println("RESULT paired=0 scopes_ok=0")
 		os.Exit(4)
@@ -180,7 +185,7 @@ func runRegisterDevice(cfg *config.Config, name string) {
 		fmt.Println("RESULT registered=0")
 		os.Exit(2)
 	}
-	host := cfg.ActiveHost()
+	host := cfg.Hosts[0]
 	apiTimeout := time.Duration(cfg.ApiTimeout.Int()) * time.Second
 	client := romm.NewClient(host, apiTimeout)
 
@@ -200,7 +205,7 @@ func runRegisterDevice(cfg *config.Config, name string) {
 		os.Exit(4)
 	}
 
-	if werr := writeIdentity(cfg, config.HostUpdate{DeviceID: dev.ID, DeviceName: name}); werr != nil {
+	if werr := config.WriteHostUpdate(config.HostUpdate{DeviceID: dev.ID, DeviceName: name}); werr != nil {
 		fmt.Fprintf(os.Stderr, "REGFAIL write: %s\n", safeErr(werr))
 		fmt.Println("RESULT registered=0")
 		os.Exit(4)
@@ -221,7 +226,7 @@ func runRenameDevice(cfg *config.Config, name string) {
 		fmt.Println("RESULT renamed=0")
 		os.Exit(2)
 	}
-	host := cfg.ActiveHost()
+	host := cfg.Hosts[0]
 	if host.DeviceID == "" {
 		fmt.Fprintln(os.Stderr, "RENAMEFAIL no device_id — register the device first")
 		fmt.Println("RESULT renamed=0")
@@ -240,7 +245,7 @@ func runRenameDevice(cfg *config.Config, name string) {
 		os.Exit(4)
 	}
 
-	if werr := writeIdentity(cfg, config.HostUpdate{DeviceName: name}); werr != nil {
+	if werr := config.WriteHostUpdate(config.HostUpdate{DeviceName: name}); werr != nil {
 		fmt.Fprintf(os.Stderr, "RENAMEFAIL write: %s\n", safeErr(werr))
 		fmt.Println("RESULT renamed=0")
 		os.Exit(4)
@@ -259,7 +264,7 @@ func runRenameDevice(cfg *config.Config, name string) {
 // judged, reported 0), 4 reachable-but-auth-failed, 0 both ok. auth is only trusted
 // when reachable=1, so an unreachable host always prints auth=0.
 func runValidate(cfg *config.Config) {
-	host := cfg.ActiveHost()
+	host := cfg.Hosts[0]
 	apiTimeout := time.Duration(cfg.ApiTimeout.Int()) * time.Second
 	client := romm.NewClient(host, apiTimeout)
 

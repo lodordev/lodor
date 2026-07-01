@@ -1,125 +1,195 @@
 package main
 
-// MULTI-USER profile management — the engine half of the launcher's Switch Profile /
-// Add Profile UI (lodor-multiuser). All four modes are OFFLINE config.json edits: no
-// host, no network, no device_id, so main dispatches them BEFORE the hosts gate.
-//
-// Identity model (config.go): hosts[0] is the SHARED family server; profiles[] each
-// carry one user's token + server-registered device_id; active_profile (or the
-// LODOR_PROFILE env) selects which one ActiveHost() overlays. Adding a profile here only
-// creates the entry + marks it active; the launcher then runs the normal --pair and
-// --register-device with LODOR_PROFILE set, so writeIdentity routes those onto the new
-// profile. Switching just rewrites active_profile.
-//
-// SECURITY (HARD): no token/device_id ever reaches stdout. --list-profiles prints only
-// the LABEL and boolean has-token/has-device flags (never the secrets themselves).
+// MULTI-USER profile modes (task #102 / the Switch-Profile feature). A "profile" is a
+// host entry in config.json carrying that RomM user's token + label. --list-profiles
+// feeds the launcher's Switch-Profile list; --login-profile signs IN as an existing RomM
+// user (OAuth password grant) and stores their token under a new/updated profile. The
+// active profile is named by active-profile.txt (written by the launcher); the engine's
+// ActiveHost() resolves it for every other mode, so per-user auth + save namespacing
+// follow the active profile automatically. CGO-free, stdlib only.
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	"lodor/clocksync"
 	"lodor/config"
+	"lodor/romm"
 )
 
-// runListProfiles prints one line per configured profile:
+// runListUsers prints the list the launcher's Switch-User picker parses: one line per
+// RomM SERVER user, "<active>\t<username>\t<role>\t<signedin>". STDOUT only — the
+// launcher reads it byte-for-byte, so NOTHING else may reach stdout on this path
+// (diagnostics go to stderr). Always exits 0 with a usable list.
 //
-//	<active?0|1>\t<label>\t<has_token 0|1>\t<has_device 0|1>
+//	active   = 1 if username == the active profile's user, else 0
+//	role     = the user's RomM role (admin/viewer); "" in the offline/non-admin fallback
+//	signedin = 1 if a stored host (profile) for this username already holds a token
 //
-// Secrets are NEVER printed — only presence flags. Always exits 0 (a config with no
-// profiles prints nothing, which the launcher reads as the single-user case).
+// Lists via cfg.Hosts[0] (the admin/onboarding token) — a VIEWER profile token cannot
+// read /api/users, so ActiveHost would 403. If the list fails (offline, or 403 no
+// users.read), it FALLS BACK to emitting the locally stored signed-in profiles in the
+// SAME 4-field shape, so the picker still shows who is signed in. Exit 0 either way.
+func runListUsers(cfg *config.Config) {
+	activeLabel := config.ActiveProfileLabel()
+	activeUser := cfg.ActiveHost().Username
+	if activeUser == "" {
+		activeUser = activeLabel
+	}
+	isActive := func(username string) int {
+		if username != "" && (strings.EqualFold(username, activeUser) || strings.EqualFold(username, activeLabel)) {
+			return 1
+		}
+		return 0
+	}
+	isSignedIn := func(username string) int {
+		for _, h := range cfg.Hosts {
+			if h.Token == "" {
+				continue
+			}
+			if strings.EqualFold(h.ProfileLabel, username) || strings.EqualFold(h.Username, username) {
+				return 1
+			}
+		}
+		return 0
+	}
+
+	base := cfg.Hosts[0] // admin/onboarding token — the only one allowed to list users
+	// RTC-less handhelds: set the clock before HTTPS so TLS cert validation passes.
+	if cerr := clocksync.Ensure(base.URL(), base.SkipTLSVerify()); cerr != nil {
+		fmt.Fprintf(os.Stderr, "clocksync: %v\n", cerr)
+	}
+	client := romm.NewClient(base, time.Duration(cfg.ApiTimeout.Int())*time.Second)
+	users, err := client.GetUsers()
+	if err != nil {
+		// Offline or no users.read: fall back to the locally stored signed-in profiles
+		// so the picker still lists who is signed in (active flag honored, role blank).
+		fmt.Fprintf(os.Stderr, "list-users: %s (falling back to stored profiles)\n", safeErr(err))
+		seen := map[string]bool{}
+		for _, h := range cfg.Hosts {
+			if h.Token == "" {
+				continue
+			}
+			u := h.Username
+			if u == "" {
+				u = h.ProfileLabel
+			}
+			if u == "" || seen[strings.ToLower(u)] {
+				continue
+			}
+			seen[strings.ToLower(u)] = true
+			fmt.Printf("%d\t%s\t%s\t%d\n", isActive(u), u, "", 1)
+		}
+		os.Exit(0)
+	}
+	for _, u := range users {
+		if u.Username == "" {
+			continue
+		}
+		fmt.Printf("%d\t%s\t%s\t%d\n", isActive(u.Username), u.Username, u.Role, isSignedIn(u.Username))
+	}
+	os.Exit(0)
+}
+
+// runListProfiles prints the multi-user list the launcher's Switch-Profile menu parses:
+// one line per host, "<active>\t<label>\t<hastoken>\t<hasdevice>". STDOUT only — the
+// launcher reads exactly this. label = profile_label, else username, else "Default".
 func runListProfiles(cfg *config.Config) {
-	active := cfg.ActiveProfileName()
-	for i := range cfg.Profiles {
-		p := cfg.Profiles[i]
-		isActive := 0
-		if active != "" && strings.EqualFold(strings.TrimSpace(p.Label), active) {
-			isActive = 1
+	activeLabel := config.ActiveProfileLabel()
+	hasExplicitActive := activeLabel != "" && !strings.EqualFold(activeLabel, "default")
+	for i, h := range cfg.Hosts {
+		label := h.ProfileLabel
+		if label == "" {
+			label = h.Username
 		}
-		fmt.Printf("%d\t%s\t%d\t%d\n", isActive, p.Label, b2i(p.Token != ""), b2i(p.DeviceID != ""))
-	}
-	os.Exit(0)
-}
-
-// runSwitchProfile sets active_profile to label, which MUST already exist in profiles[]
-// (you switch to a profile you added; you don't create one by switching). Contract:
-// RESULT switched=<0|1>. Exit: 2 unknown/empty label · 4 write failed · 0 switched.
-func runSwitchProfile(cfg *config.Config, label string) {
-	label = strings.TrimSpace(label)
-	if label == "" {
-		fmt.Fprintln(os.Stderr, "SWITCHFAIL empty profile label")
-		fmt.Println("RESULT switched=0")
-		os.Exit(2)
-	}
-	if !profileExists(cfg, label) {
-		fmt.Fprintln(os.Stderr, "SWITCHFAIL unknown profile (add it first)")
-		fmt.Println("RESULT switched=0")
-		os.Exit(2)
-	}
-	if err := config.SetActiveProfile(label); err != nil {
-		fmt.Fprintf(os.Stderr, "SWITCHFAIL write: %s\n", safeErr(err))
-		fmt.Println("RESULT switched=0")
-		os.Exit(4)
-	}
-	fmt.Println("RESULT switched=1")
-	os.Exit(0)
-}
-
-// runAddProfile creates the profile entry for label (idempotent — an existing label is
-// reused, not duplicated) and marks it active, so the launcher's next --pair and
-// --register-device (run with LODOR_PROFILE=<label>) land their token + device_id on
-// THIS profile. Contract: RESULT added=<0|1>. Exit: 2 empty label · 4 write failed ·
-// 0 added. No token is minted here — that is the pairing step the launcher runs next.
-func runAddProfile(cfg *config.Config, label string) {
-	label = strings.TrimSpace(label)
-	if label == "" {
-		fmt.Fprintln(os.Stderr, "ADDFAIL empty profile label")
-		fmt.Println("RESULT added=0")
-		os.Exit(2)
-	}
-	// Create/ensure the profile entry (WriteProfileUpdate with an empty update just
-	// guarantees the labeled entry exists) and mark it active.
-	if err := config.WriteProfileUpdate(label, config.HostUpdate{}); err != nil {
-		fmt.Fprintf(os.Stderr, "ADDFAIL write: %s\n", safeErr(err))
-		fmt.Println("RESULT added=0")
-		os.Exit(4)
-	}
-	if err := config.SetActiveProfile(label); err != nil {
-		fmt.Fprintf(os.Stderr, "ADDFAIL activate: %s\n", safeErr(err))
-		fmt.Println("RESULT added=0")
-		os.Exit(4)
-	}
-	fmt.Println("RESULT added=1")
-	os.Exit(0)
-}
-
-// runRemoveProfile deletes the profile and clears active_profile when it pointed at it.
-// Contract: RESULT removed=<0|1>. Exit: 2 empty label · 4 write failed · 0 removed
-// (idempotent — removing an absent label still succeeds, so the UI never wedges).
-func runRemoveProfile(cfg *config.Config, label string) {
-	label = strings.TrimSpace(label)
-	if label == "" {
-		fmt.Fprintln(os.Stderr, "REMOVEFAIL empty profile label")
-		fmt.Println("RESULT removed=0")
-		os.Exit(2)
-	}
-	if err := config.RemoveProfile(label); err != nil {
-		fmt.Fprintf(os.Stderr, "REMOVEFAIL write: %s\n", safeErr(err))
-		fmt.Println("RESULT removed=0")
-		os.Exit(4)
-	}
-	fmt.Println("RESULT removed=1")
-	os.Exit(0)
-}
-
-// profileExists reports whether a profile with the given label (case-insensitive) is
-// configured.
-func profileExists(cfg *config.Config, label string) bool {
-	want := strings.ToLower(strings.TrimSpace(label))
-	for i := range cfg.Profiles {
-		if strings.ToLower(strings.TrimSpace(cfg.Profiles[i].Label)) == want {
-			return true
+		if label == "" {
+			label = "Default"
 		}
+		active := 0
+		if hasExplicitActive {
+			if strings.EqualFold(label, activeLabel) {
+				active = 1
+			}
+		} else if i == 0 {
+			active = 1 // no active-profile.txt -> hosts[0] is live
+		}
+		hasTok := 0
+		if h.Token != "" {
+			hasTok = 1
+		}
+		hasDev := 0
+		if h.DeviceID != "" {
+			hasDev = 1
+		}
+		fmt.Printf("%d\t%s\t%d\t%d\n", active, label, hasTok, hasDev)
 	}
-	return false
+	os.Exit(0)
+}
+
+// runLoginProfile signs IN as an existing RomM user via OAuth password grant and stores
+// the token under a multi-user profile. label = profile name; username/deviceID from the
+// --login-user/--login-device flags. The PASSWORD is read from STDIN (never argv) and is
+// NEVER stored. Prints RESULT logged_in=<0|1>.
+func runLoginProfile(cfg *config.Config, label, username, deviceID string) {
+	label = strings.TrimSpace(label)
+	username = strings.TrimSpace(username)
+	if label == "" || username == "" {
+		fmt.Fprintln(os.Stderr, "LOGINFAIL: empty profile label or username")
+		fmt.Println("RESULT logged_in=0")
+		os.Exit(2)
+	}
+	// Password from stdin (first line only), never argv.
+	pw := ""
+	sc := bufio.NewScanner(os.Stdin)
+	if sc.Scan() {
+		pw = sc.Text()
+	}
+	if pw == "" {
+		fmt.Fprintln(os.Stderr, "LOGINFAIL: empty password")
+		fmt.Println("RESULT logged_in=0")
+		os.Exit(2)
+	}
+	if len(cfg.Hosts) == 0 {
+		fmt.Fprintln(os.Stderr, "LOGINFAIL: no host configured")
+		fmt.Println("RESULT logged_in=0")
+		os.Exit(2)
+	}
+	base := cfg.Hosts[0] // the server to authenticate against
+	// RTC-less handhelds: set the clock from the server before HTTPS (a wrong clock
+	// fails TLS cert validation). No-op when already sane.
+	if cerr := clocksync.Ensure(base.URL(), base.SkipTLSVerify()); cerr != nil {
+		fmt.Fprintf(os.Stderr, "clocksync: %v\n", cerr)
+	}
+
+	token, err := romm.PasswordGrant(base.URL(), username, pw, base.SkipTLSVerify())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "LOGINFAIL: %s\n", safeErr(err))
+		fmt.Println("RESULT logged_in=0")
+		os.Exit(4)
+	}
+
+	// Validate the new token + capture the canonical username from /api/users/me.
+	loginHost := base
+	loginHost.Token = token
+	loginHost.Password = ""
+	client := romm.NewClient(loginHost, time.Duration(cfg.ApiTimeout.Int())*time.Second)
+	if verr := client.ValidateToken(); verr != nil {
+		fmt.Fprintf(os.Stderr, "LOGINFAIL validate: %s\n", safeErr(verr))
+		fmt.Println("RESULT logged_in=0")
+		os.Exit(4)
+	}
+	if u, uerr := client.GetCurrentUser(); uerr == nil && u.Username != "" {
+		username = u.Username
+	}
+
+	if werr := config.WriteProfileHost(label, username, token, deviceID, nil); werr != nil {
+		fmt.Fprintf(os.Stderr, "LOGINFAIL write: %s\n", safeErr(werr))
+		fmt.Println("RESULT logged_in=0")
+		os.Exit(5)
+	}
+	fmt.Println("RESULT logged_in=1")
+	os.Exit(0)
 }

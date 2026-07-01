@@ -34,6 +34,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"lodor/config"
@@ -234,6 +235,32 @@ func PrimaryTag(fsSlug string) (tag string, ok bool) {
 	return "", false
 }
 
+// FsSlugForTag reverses onionRomTags: given an OnionOS Roms/ system TAG, return a RomM
+// fs_slug that maps to it. It exists because catalog.go (shared with the !onion build)
+// calls platform.FsSlugForTag to resolve a capability-discovered platform folder back to
+// its slug. Several slugs alias one OnionOS tag (snes/sfam->SFC, nes/famicom->FC), so we
+// return the lexicographically-first match for a STABLE, deterministic result. On real
+// OnionOS this path is effectively dead: the mirror writes BARE-tag folders, so catalog's
+// tagFromFolderName (which extracts a trailing "(TAG)") yields "" and never calls this.
+// Kept deterministic to avoid flaky download/save resolution if a MinUI-style "(TAG)"
+// folder is ever present on an onion build.
+func FsSlugForTag(tag string) (string, bool) {
+	if tag == "" {
+		return "", false
+	}
+	matches := make([]string, 0, 2)
+	for slug, t := range onionRomTags {
+		if t == tag {
+			matches = append(matches, slug)
+		}
+	}
+	if len(matches) == 0 {
+		return "", false
+	}
+	sort.Strings(matches)
+	return matches[0], true
+}
+
 // HasEmuPak reports whether OnionOS can actually LAUNCH this system on THIS card — i.e.
 // the Emu/<TAG>/ folder exists (OnionOS ships emulators as Emu/<TAG>/launch.sh). This is
 // the OnionOS analog of MinUI's Emus/<TAG>.pak gate: it stops us stubbing a library the
@@ -310,6 +337,47 @@ func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string
 	return filepath.Join(RomsDir(), folder)
 }
 
+// archiveRawExt maps a RomM fs_slug to the raw ROM extension its standalone emulator
+// needs when the server stores the game inside a .7z the emulator cannot open. The
+// engine extracts the .7z to this extension on download (via the bundled 7zz in the
+// launch wrap). NDS/DraStic is the case: DraStic reads raw .nds (and .zip) but NOT .7z.
+// On the Mini Plus (SSD202D) NDS is not launchable, so HasEmuPak gates it out and this
+// never fires there; kept for parity with the !onion build and any stronger Onion host.
+var archiveRawExt = map[string]string{
+	"nds": ".nds",
+}
+
+// ArchiveExtractTargetForRom reports whether a ROM is stored in a .7z that must be
+// extracted to a raw file on download, and the raw extension that file takes. Only .7z
+// triggers it -- .zip is left alone for emulators that read it natively. Mirrors the
+// !onion definition exactly so cmd/lodor-sync (shared) resolves the same on both builds.
+func ArchiveExtractTargetForRom(rom romm.Rom) (targetExt string, needsExtract bool) {
+	if len(rom.Files) == 0 {
+		return "", false
+	}
+	if !strings.EqualFold(filepath.Ext(rom.Files[0].FileName), ".7z") {
+		return "", false
+	}
+	if e, ok := archiveRawExt[rom.PlatformFsSlug]; ok {
+		return e, true
+	}
+	return "", false
+}
+
+// onDiskExt is the extension the local stub/file takes: the extracted raw extension
+// when the server stores the game in an extract-on-download .7z, else the server
+// file's own extension. Keeps the stub the OnionOS launcher sees (and the file the
+// emulator opens) a raw ROM rather than an unopenable .7z.
+func onDiskExt(rom romm.Rom) string {
+	if t, ok := ArchiveExtractTargetForRom(rom); ok {
+		return t
+	}
+	if len(rom.Files) > 0 {
+		return filepath.Ext(rom.Files[0].FileName)
+	}
+	return ""
+}
+
 // romMDisambiguator is the marker appended to a RomM stub's basename in non-"own"
 // mirror modes so a RomM stub's save (and on-disk file) can never collide with a user's
 // own same-named game in a different folder that binds the same TAG.
@@ -341,7 +409,7 @@ func LocalRomPath(cfg *config.Config, rom romm.Rom) string {
 		return filepath.Join(romDir, base+".m3u")
 	}
 	if len(rom.Files) > 0 {
-		return filepath.Join(romDir, base+filepath.Ext(rom.Files[0].FileName))
+		return filepath.Join(romDir, base+onDiskExt(rom))
 	}
 	return ""
 }

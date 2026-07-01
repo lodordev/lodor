@@ -9,6 +9,7 @@
 package platform
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,63 +175,15 @@ func RomsDir() string { return filepath.Join(BasePath(), "Roms") }
 // BiosDir returns <BasePath>/Bios.
 func BiosDir() string { return filepath.Join(BasePath(), "Bios") }
 
-// SavesDir returns the save root. MULTI-USER (approach #1): the per-platform boot
-// script exports SAVES_PATH="$SDCARD_PATH/Saves/$LODOR_PROFILE" (profile-namespaced),
-// and minarch reads the SAME env, so the emulator's write dir and the engine's sync
-// dir stay in lockstep. When SAVES_PATH is unset (single-user card, or a tool invoked
-// outside the boot env) we fall back to <BasePath>/Saves — byte-identical to the
-// historical behavior, so existing cards are unaffected.
+// SavesDir returns <BasePath>/Saves.
 func SavesDir() string {
-	if sp := strings.TrimSpace(os.Getenv("SAVES_PATH")); sp != "" {
-		return sp
+	// Honor SAVES_PATH (the boot script sets it to the active profile namespaced
+	// dir, Saves/<profile>) so the engine push/pull match exactly where the
+	// emulator reads/writes; absent (single-user / out-of-wrapper) -> Saves/.
+	if s := os.Getenv("SAVES_PATH"); s != "" {
+		return s
 	}
 	return filepath.Join(BasePath(), "Saves")
-}
-
-// ActiveProfile returns the active multi-user profile name from LODOR_PROFILE, or
-// "" (single-user) when unset/blank/"default". Used to namespace the integrity-
-// critical per-profile sync state (sync-anchors.<profile>.json / pending-saves.<profile>.txt)
-// so one user's reconcile can never touch another's. "default"/"" => the historical
-// un-namespaced filenames, keeping existing single-user cards byte-identical.
-func ActiveProfile() string {
-	p := strings.TrimSpace(os.Getenv("LODOR_PROFILE"))
-	if p == "" || strings.EqualFold(p, "default") {
-		return ""
-	}
-	return p
-}
-
-// ProfileStateName returns the per-profile filename for a pak-local state file:
-// "<base>.<profile>.<ext>" when a profile is active, else the un-namespaced
-// "<base>.<ext>" (single-user, historical). E.g. ProfileStateName("sync-anchors",
-// "json") => "sync-anchors.json" (default) or "sync-anchors.alice.json" (profile
-// "alice"). The profile segment is sanitized to a filesystem-safe token so a label
-// with spaces/slashes can never escape the pak dir or collide.
-func ProfileStateName(base, ext string) string {
-	prof := ActiveProfile()
-	if prof == "" {
-		return base + "." + ext
-	}
-	return base + "." + sanitizeProfileToken(prof) + "." + ext
-}
-
-// sanitizeProfileToken reduces a profile label to a safe filename segment: keep
-// [A-Za-z0-9._-], map everything else (spaces, slashes, etc.) to "_". Never empty
-// (an all-unsafe label yields "_"), so the namespaced filename is always well-formed.
-func sanitizeProfileToken(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	if b.Len() == 0 {
-		return "_"
-	}
-	return b.String()
 }
 
 // EmulatorFoldersForFSSlug returns the MinUI emulator/save folder names for a RomM
@@ -291,9 +244,16 @@ func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string
 			return filepath.Join(RomsDir(), folder)
 		}
 	}
-	// No mapping: prefer the platform display name (the MinUI "Name (TAG)" folder)
-	// when present, otherwise the fs_slug.
-	if displayName != "" {
+	// No mapping: build the canonical MinUI "Name (TAG)" folder from the primary tag so
+	// the device resolves the emulator pak by the trailing tag (e.g. "Nintendo DS (NDS)").
+	// Fall back to the display name, then the fs_slug.
+	if tag, ok := PrimaryTag(fsSlug); ok {
+		name := displayName
+		if name == "" {
+			name = fsSlug
+		}
+		folder = fmt.Sprintf("%s (%s)", name, tag)
+	} else if displayName != "" {
 		folder = displayName
 	}
 	return filepath.Join(RomsDir(), folder)
@@ -338,7 +298,45 @@ func LocalRomPath(cfg *config.Config, rom romm.Rom) string {
 		return filepath.Join(romDir, base+".m3u")
 	}
 	if len(rom.Files) > 0 {
-		return filepath.Join(romDir, base+filepath.Ext(rom.Files[0].FileName))
+		return filepath.Join(romDir, base+onDiskExt(rom))
+	}
+	return ""
+}
+
+// archiveRawExt maps a RomM fs_slug to the raw ROM extension its standalone emulator
+// needs when the server stores the game inside a .7z the emulator can't open. The engine
+// extracts the .7z to this extension on download. NDS/DraStic is the case: DraStic reads
+// raw .nds (and .zip) but NOT .7z; .zip is left as-is (DraStic handles it natively).
+var archiveRawExt = map[string]string{
+	"nds": ".nds",
+}
+
+// ArchiveExtractTargetForRom reports whether a ROM is stored in a .7z that must be
+// extracted to a raw file on download, and the raw extension that file takes. Only .7z
+// triggers it — .zip is left alone for emulators that read it natively.
+func ArchiveExtractTargetForRom(rom romm.Rom) (targetExt string, needsExtract bool) {
+	if len(rom.Files) == 0 {
+		return "", false
+	}
+	if !strings.EqualFold(filepath.Ext(rom.Files[0].FileName), ".7z") {
+		return "", false
+	}
+	if e, ok := archiveRawExt[rom.PlatformFsSlug]; ok {
+		return e, true
+	}
+	return "", false
+}
+
+// onDiskExt is the extension the local stub/file takes: the server file's extension, OR
+// the extracted raw extension when the server stores the game in an extract-on-download
+// .7z (see ArchiveExtractTargetForRom). This is what makes the stub the launcher sees,
+// and the file DraStic opens, a raw .nds rather than an unopenable .7z.
+func onDiskExt(rom romm.Rom) string {
+	if t, ok := ArchiveExtractTargetForRom(rom); ok {
+		return t
+	}
+	if len(rom.Files) > 0 {
+		return filepath.Ext(rom.Files[0].FileName)
 	}
 	return ""
 }
@@ -369,6 +367,24 @@ func PrimaryTag(fsSlug string) (tag string, ok bool) {
 		return "", false
 	}
 	return folders[0], true
+}
+
+// FsSlugForTag reverses emulatorFolders: given a MinUI emulator TAG, return the RomM
+// fs_slug that maps to it. Lets a capability-discovered platform folder (Roms/<Name> (TAG))
+// resolve back to its fs_slug when it is not in directory_mappings (e.g. an NDS.pak added
+// after onboarding baked the mappings).
+func FsSlugForTag(tag string) (string, bool) {
+	if tag == "" {
+		return "", false
+	}
+	for slug, tags := range emulatorFolders {
+		for _, t := range tags {
+			if t == tag {
+				return slug, true
+			}
+		}
+	}
+	return "", false
 }
 
 // HasEmuPak reports whether an emulator pak for the given MinUI tag is actually

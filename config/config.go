@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -33,6 +34,56 @@ type Host struct {
 	TokenName      string   `json:"token_name,omitempty"`
 	TokenExpiresAt string   `json:"token_expires_at,omitempty"`
 	Scopes         []string `json:"scopes,omitempty"`
+
+	// ProfileLabel is the MULTI-USER profile this host belongs to (e.g. "Player One").
+	// Empty on a single-user card. active-profile.txt names which label is live;
+	// ActiveHost() resolves it. Each profile = its own host (same server, that user's
+	// token), so per-user save namespacing + auth just work off the active host.
+	ProfileLabel string `json:"profile_label,omitempty"`
+
+	// Tier is the endpoint-preference rank for two-tier external access (#87):
+	// LOWER wins. Tier 1 = the Tailscale internal URL (PREFERRED — traffic never
+	// leaves the tailnet, origin never exposed); tier 2 = the public Cloudflare
+	// Access URL (FALLBACK for devices that can't run Tailscale). Absent/0 on a
+	// legacy single-endpoint config, which selects hosts[0] unconditionally
+	// (ResolveHost stays byte-identical to ActiveHost there). The two tiers point
+	// at the SAME RomM, so they share one identity (token/device).
+	Tier int `json:"tier,omitempty"`
+
+	// CFAccess carries THIS endpoint's Cloudflare Access service-token pair. Set
+	// ONLY on a tier-2 (public) host; a tier-1 (Tailscale) host has none. When
+	// present the romm client sends the two CF-Access-Client-* headers on every
+	// request to this host, IN ADDITION to RomM's own Authorization bearer (the
+	// two are orthogonal — Cloudflare consumes its headers at the edge and never
+	// touches Authorization). omitempty keeps it out of single-tier configs.
+	CFAccess *CFAccess `json:"cf_access,omitempty"`
+
+	// Socks5Proxy routes THIS endpoint's traffic through a local SOCKS5 proxy with
+	// REMOTE DNS (socks5h): the romm client dials "host:port" and connects to the
+	// proxy, which resolves the destination NAME itself. Set ONLY on a tier-1
+	// (Tailscale) host whose root_uri is a *.ts.net MagicDNS name — the userspace
+	// tailscaled started by the pak exposes a SOCKS5 server (default
+	// "localhost:1055") that both resolves the MagicDNS name and routes the
+	// connection over the tailnet, so NO system resolver / TUN / resolvconf is
+	// needed (#84). Empty on a tier-2 (public Cloudflare) host, which dials direct,
+	// so the fallback path is byte-identical to before this field existed. Like
+	// cf_access/tier/root_uri this is an ENDPOINT field: ResolveHost never inherits
+	// it from hosts[0] and no profile overlays it.
+	Socks5Proxy string `json:"socks5_proxy,omitempty"`
+}
+
+// CFAccess is a Cloudflare Access service-token pair used to authenticate a
+// browserless client (the engine) to a RomM endpoint published behind Cloudflare
+// Access (tier 2 — the public-internet fallback path). It is sent as the
+// CF-Access-Client-Id / CF-Access-Client-Secret request headers. The Client ID
+// keeps its ".access" suffix verbatim. Defense in depth: BOTH this service token
+// AND RomM's own bearer are required end to end.
+//
+// SECURITY: ClientSecret is a secret at rest exactly like a token — never
+// logged, printed, or written to any sample/wiki file (samples use placeholders).
+type CFAccess struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
 }
 
 // URL returns the base URL for the host: root_uri with ":port" inserted after the
@@ -61,6 +112,27 @@ func (h Host) URL() string {
 	return strings.TrimSuffix(u.String(), "/")
 }
 
+// cgnatNet is the Tailscale CGNAT range (100.64.0.0/10). A RomM host entered as a bare
+// 100.x IP is a tailnet peer (WireGuard already authenticates+encrypts it), so the
+// redundant TLS cert (issued for the *.ts.net name, never the IP) is skipped for it.
+var cgnatNet = func() *net.IPNet { _, n, _ := net.ParseCIDR("100.64.0.0/10"); return n }()
+
+// SkipTLSVerify reports whether HTTPS cert verification should be skipped for this host:
+// the explicit insecure_skip_verify flag, OR an automatic skip when the host is a bare
+// Tailscale CGNAT IP reached over the tunnel (a cert can never match a bare IP).
+func (h Host) SkipTLSVerify() bool {
+	if h.InsecureSkipVerify {
+		return true
+	}
+	u, err := url.Parse(h.URL())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && cgnatNet.Contains(ip)
+}
+
+
 // AuthHeader returns the Authorization header value: a bearer token when one is
 // configured, otherwise HTTP Basic from username:password.
 func (h Host) AuthHeader() string {
@@ -71,108 +143,37 @@ func (h Host) AuthHeader() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
 }
 
-// ActiveProfileName returns the name of the currently selected profile: the
-// LODOR_PROFILE env (the launcher exports it on a switch) wins over the config's
-// active_profile field. Returns "" when no profile is selected (single-user card),
-// in which case ActiveHost is hosts[0] verbatim. Trimmed; case preserved (labels are
-// user-facing). Nil-safe.
-func (c *Config) ActiveProfileName() string {
-	if env := strings.TrimSpace(os.Getenv("LODOR_PROFILE")); env != "" && !strings.EqualFold(env, "default") {
-		return env
-	}
-	if c == nil {
+// activeProfileFileName is the launcher's active-profile.txt, read CWD-relative (the
+// engine runs CWD = the pak dir, like config.json). One line = the active profile label.
+const activeProfileFileName = "active-profile.txt"
+
+// ActiveProfileLabel returns the live multi-user profile label from active-profile.txt
+// (CWD-relative), trimmed. "" when absent/empty (single-user).
+func ActiveProfileLabel() string {
+	b, err := os.ReadFile(activeProfileFileName)
+	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(c.ActiveProfile)
+	return strings.TrimSpace(string(b))
 }
 
-// ActiveProfileIndex returns the index of the active profile in Profiles, matched by
-// Label (case-insensitive, trimmed), or -1 when none is selected/found. Nil-safe.
-func (c *Config) ActiveProfileIndex() int {
-	name := c.ActiveProfileName()
-	if name == "" || c == nil {
-		return -1
+// ActiveHost returns the host for the active multi-user profile (the Host whose
+// ProfileLabel matches active-profile.txt). Falls back to Hosts[0] when there is no
+// active profile, no match, or "default" — so a single-user card behaves EXACTLY as
+// before. Returns a zero Host only when Hosts is empty (caller already gates on that).
+func (c *Config) ActiveHost() Host {
+	if len(c.Hosts) == 0 {
+		return Host{}
 	}
-	for i := range c.Profiles {
-		if strings.EqualFold(strings.TrimSpace(c.Profiles[i].Label), name) {
-			return i
+	label := ActiveProfileLabel()
+	if label != "" && !strings.EqualFold(label, "default") {
+		for _, h := range c.Hosts {
+			if h.ProfileLabel != "" && strings.EqualFold(h.ProfileLabel, label) {
+				return h
+			}
 		}
 	}
-	return -1
-}
-
-// ActiveProfile returns a pointer to the selected Profile, or nil when none is
-// selected/resolvable. Nil-safe.
-func (c *Config) ActiveProfilePtr() *Profile {
-	i := c.ActiveProfileIndex()
-	if i < 0 {
-		return nil
-	}
-	return &c.Profiles[i]
-}
-
-// ActiveHost returns the host the engine should authenticate AND sync as. It starts
-// from hosts[0] (the shared family server: root_uri/port/insecure/timeouts) and, when
-// a profile is selected and resolvable, OVERLAYS that profile's per-user identity —
-// token, device_id, device_name, username, and token metadata. The shared server
-// address is NEVER taken from the profile. When no profile is selected (single-user
-// card, the historical case) this is hosts[0] byte-identical, so existing configs are
-// unaffected. Caller must have checked len(Hosts) > 0 (same precondition as Hosts[0]).
-//
-// SECURITY: returns a value; never logs the token/device_id (callers already scrub).
-func (c *Config) ActiveHost() Host {
-	host := c.Hosts[0]
-	p := c.ActiveProfilePtr()
-	if p == nil {
-		return host
-	}
-	if p.Token != "" {
-		host.Token = p.Token
-		host.Password = "" // token-only at rest: a profile bearer never authenticates with a stale password
-	}
-	if p.DeviceID != "" {
-		host.DeviceID = p.DeviceID
-	}
-	if p.DeviceName != "" {
-		host.DeviceName = p.DeviceName
-	}
-	if p.Username != "" {
-		host.Username = p.Username
-	}
-	if p.TokenName != "" {
-		host.TokenName = p.TokenName
-	}
-	if p.TokenExpiresAt != "" {
-		host.TokenExpiresAt = p.TokenExpiresAt
-	}
-	if len(p.Scopes) > 0 {
-		host.Scopes = p.Scopes
-	}
-	return host
-}
-
-// Profile is one family member's per-user identity on the SHARED family server
-// (multi-user, approach #1). hosts[0] holds the shared server address (root_uri/
-// port/insecure); a Profile layers that user's OWN client token + server-registered
-// device_id on top so saves/states/Continue sync under THEIR account. Label is the
-// display name (its first letter drives the corner badge); Username is the RomM
-// account handle (best-effort, for display). A profile is selected by name via
-// active_profile (config) or the LODOR_PROFILE env (the launcher exports it on a
-// switch); ActiveHost() merges the selected profile onto hosts[0].
-//
-// SECURITY: Token is a secret at rest exactly like Host.Token — never logged/printed.
-type Profile struct {
-	Label      string `json:"label"`
-	Token      string `json:"token,omitempty"`
-	DeviceID   string `json:"device_id,omitempty"`
-	DeviceName string `json:"device_name,omitempty"`
-	Username   string `json:"username,omitempty"`
-
-	// Token metadata captured at pairing, same role as Host's (expiry warnings /
-	// per-device revoke). Optional; omitempty keeps older configs clean.
-	TokenName      string   `json:"token_name,omitempty"`
-	TokenExpiresAt string   `json:"token_expires_at,omitempty"`
-	Scopes         []string `json:"scopes,omitempty"`
+	return c.Hosts[0]
 }
 
 // DirMapping overrides where a RomM platform's ROMs live on the card: an optional
@@ -205,12 +206,6 @@ const (
 // whole seconds; see Seconds-typed unmarshal for the legacy nanosecond fallback.
 type Config struct {
 	Hosts             []Host                `json:"hosts,omitempty"`
-	// Profiles are the per-user identities sharing hosts[0] (multi-user). Empty/absent
-	// on a single-user card — every existing single-account config stays byte-identical
-	// (ActiveHost falls back to hosts[0] verbatim). ActiveProfile names the selected one;
-	// the LODOR_PROFILE env overrides it at runtime when the launcher switches.
-	Profiles      []Profile `json:"profiles,omitempty"`
-	ActiveProfile string    `json:"active_profile,omitempty"`
 	DirectoryMappings map[string]DirMapping `json:"directory_mappings,omitempty"`
 	ApiTimeout        Seconds               `json:"api_timeout"`
 	DownloadTimeout   Seconds               `json:"download_timeout"`

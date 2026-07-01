@@ -180,3 +180,37 @@ func TestOnionLocalRomPathBareTagFolder(t *testing.T) {
 		t.Errorf("LocalRomPath=%q want /c/Roms/GBA/Zelda (USA).gba", got)
 	}
 }
+
+// TestOnionFsSlugForTag locks the deterministic reverse of onionRomTags that catalog.go
+// (shared with !onion) depends on. The key property: every slug returned must round-trip
+// back to the SAME tag via PrimaryTag, and the result must be stable for aliased tags.
+func TestOnionFsSlugForTag(t *testing.T) {
+	clearEnv(t)
+	// Unique-tag slugs reverse exactly.
+	exact := map[string]string{"GBA": "gba", "MD": "genesis", "PS": "psx", "N64": "n64"}
+	for tag, wantSlug := range exact {
+		got, ok := FsSlugForTag(tag)
+		if !ok || got != wantSlug {
+			t.Errorf("FsSlugForTag(%q)=%q,%v want %q,true", tag, got, ok, wantSlug)
+		}
+	}
+	// Aliased tags (several slugs -> one tag) must still round-trip and be deterministic.
+	for _, tag := range []string{"SFC", "FC", "MS", "PCE", "NEOGEO"} {
+		got, ok := FsSlugForTag(tag)
+		if !ok {
+			t.Fatalf("FsSlugForTag(%q) returned ok=false", tag)
+		}
+		if back, ok2 := PrimaryTag(got); !ok2 || back != tag {
+			t.Errorf("round-trip FsSlugForTag(%q)=%q then PrimaryTag=%q,%v want %q", tag, got, back, ok2, tag)
+		}
+		if got2, _ := FsSlugForTag(tag); got2 != got {
+			t.Errorf("FsSlugForTag(%q) not deterministic: %q vs %q", tag, got, got2)
+		}
+	}
+	if _, ok := FsSlugForTag(""); ok {
+		t.Error("empty tag should not map")
+	}
+	if _, ok := FsSlugForTag("NOPE"); ok {
+		t.Error("unknown tag should not map")
+	}
+}

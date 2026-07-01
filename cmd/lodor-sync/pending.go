@@ -110,12 +110,9 @@ func pakDir() string {
 	return platform.PakDir()
 }
 
-// pendingPath returns the absolute path of pending-saves.txt. MULTI-USER: the
-// filename is profile-namespaced (pending-saves.<profile>.txt) so one user's offline
-// upload queue can never push another user's save; single-user cards keep the
-// historical un-namespaced pending-saves.txt.
+// pendingPath returns the absolute path of pending-saves.txt.
 func pendingPath() string {
-	return filepath.Join(pakDir(), platform.ProfileStateName("pending-saves", "txt"))
+	return filepath.Join(pakDir(), "pending-saves.txt")
 }
 
 // lockPath returns the advisory lock directory used to serialize queue mutations.

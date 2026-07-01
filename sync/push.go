@@ -76,18 +76,13 @@ func pushOne(client *romm.Client, cfg *config.Config, rom romm.Rom, sf localSave
 		AutocleanupLimit: 25,
 	}
 
-	uploaded, err := client.UploadSave(q, sf.path)
+	_, err := client.UploadSave(q, sf.path)
 	if err != nil && isSaveConflict(err) {
 		// Foreign-device interlock fired: another device added a save in this slot we
 		// never pulled. overwrite=true is additive (RomM inserts our datetime-tagged
 		// row, deletes theirs nowhere) — add ours alongside and flag the conflict.
 		q.Overwrite = true
-		if uploaded, err = client.UploadSave(q, sf.path); err == nil {
-			if !verifyUploadedContent(client, cfg, rom.ID, sf.path, uploaded) {
-				res.Outcome = OutcomeUploadError
-				res.Err = "upload left no retrievable content (ghost) — kept pending"
-				return res
-			}
+		if _, err = client.UploadSave(q, sf.path); err == nil {
 			res.Outcome = OutcomePushed
 			res.Conflicted = true
 			return res
@@ -106,49 +101,8 @@ func pushOne(client *romm.Client, cfg *config.Config, rom romm.Rom, sf localSave
 		return res
 	}
 
-	// Ghost PREVENTION (#63): the POST returned a record, but verify its CONTENT is
-	// actually retrievable before declaring success — otherwise we'd leave a ghost
-	// (record present, bytes missing) AND clear the pending banner on a save that can
-	// never be restored. If the content isn't there, keep it pending (UploadError) so
-	// it retries on the next sync instead of silently rotting.
-	if !verifyUploadedContent(client, cfg, rom.ID, sf.path, uploaded) {
-		res.Outcome = OutcomeUploadError
-		res.Err = "upload left no retrievable content (ghost) — kept pending"
-		return res
-	}
-
 	res.Outcome = OutcomePushed
 	return res
-}
-
-// verifyUploadedContent confirms a just-uploaded save's CONTENT is retrievable from the
-// server (ghost prevention, #63). A successful POST /api/saves returns a record, but a
-// record without retrievable bytes is a "ghost" (content GET = 404 / empty) that fails
-// every later restore. We GET the content once; on a ghost we re-upload ONCE and re-check.
-// Returns true if the content is retrievable (directly, after the retry, or because the
-// SAME bytes are already on the server under another revision — AlreadyOnServer). Failing
-// closed (false) keeps the save pending rather than falsely clearing the banner.
-func verifyUploadedContent(client *romm.Client, cfg *config.Config, romID int, localPath string, uploaded romm.Save) bool {
-	check := func(id int) bool {
-		if id == 0 {
-			return false
-		}
-		data, err := client.DownloadSaveContent(id, deviceID(cfg), false)
-		return err == nil && len(data) > 0
-	}
-	if check(uploaded.ID) {
-		return true
-	}
-	// One re-upload attempt, then re-verify (handles a transient server-side write miss).
-	q := romm.UploadSaveQuery{
-		RomID: romID, DeviceID: deviceID(cfg), Emulator: uploaded.Emulator,
-		Slot: "autosave", Overwrite: true, Autocleanup: true, AutocleanupLimit: 25,
-	}
-	if again, err := client.UploadSave(q, localPath); err == nil && check(again.ID) {
-		return true
-	}
-	// Last resort: the identical bytes may already be retrievable under another revision.
-	return AlreadyOnServer(client, romID, localPath)
 }
 
 // AlreadyOnServer reports whether the server already holds a save for romID whose
@@ -219,11 +173,11 @@ func findLocalSavesForRom(cfg *config.Config, rom romm.Rom) []localSaveFile {
 
 // deviceID returns the configured device_id of the first host, or "" if none.
 func deviceID(cfg *config.Config) string {
-	if cfg == nil || len(cfg.Hosts) == 0 {
+	// MULTI-USER: the device is the ACTIVE profile device, not Hosts[0]. Using
+	// Hosts[0] sent the admin device_id under a viewer token -> 404 on upload.
+	if cfg == nil {
 		return ""
 	}
-	// MULTI-USER: the device_id is the ACTIVE profile's, so a save pushes under the
-	// right user/device (hosts[0]'s own when no profile is selected).
 	return cfg.ActiveHost().DeviceID
 }
 

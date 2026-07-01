@@ -71,14 +71,15 @@ const (
 
 // FetchAndSave downloads romPath's cover from RomM and writes the scaled PNG to its
 // .media path. It is graceful by contract: a rom with no cover returns OutcomeNoCover
-// (nil err), an already-present cover returns OutcomeSkipped without a network call,
-// and any fetch/decode/write failure returns OutcomeError with the error so the caller
-// can count it WITHOUT aborting a 6,000-item mirror. coverPath is rom.CoverPath().
-func FetchAndSave(dl coverDownloader, coverPath, romPath string) (Outcome, error) {
+// (nil err), an already-present cover returns OutcomeSkipped without a network call
+// (UNLESS force=true — a "Full" refresh re-fetches even existing covers), and any
+// fetch/decode/write failure returns OutcomeError with the error so the caller can count
+// it WITHOUT aborting a 6,000-item mirror. coverPath is rom.CoverPath().
+func FetchAndSave(dl coverDownloader, coverPath, romPath string, force bool) (Outcome, error) {
 	if coverPath == "" {
 		return OutcomeNoCover, nil
 	}
-	if Exists(romPath) {
+	if !force && Exists(romPath) {
 		return OutcomeSkipped, nil
 	}
 	raw, err := dl.DownloadCover(coverPath)

@@ -17,18 +17,22 @@ import (
 //
 // A hard failure (couldn't list platforms / couldn't write the index) is a config/
 // reachability error: exit 3 so the launcher reports "couldn't reach RomM".
-func runMirrorCatalog(client *romm.Client, cfg *config.Config) {
+func runMirrorCatalog(client *romm.Client, cfg *config.Config, coverForce bool) {
 	// Start fresh: clear any stale bar/label from a prior mode so the launcher's overlay
 	// opens at 0% with our first real label, not a leftover "100 / Library updated".
 	writeProgress(0)
-	writePhase("Reading library…")
+	if coverForce {
+		writePhase("Rebuilding library…") // Full: re-fetch every cover
+	} else {
+		writePhase("Updating library…") // Update: only new games + missing covers
+	}
 
 	// Wire the engine's honest, real-count progress to the /tmp side-channels the
 	// launcher polls (BLUEPRINT §8/§10). These writes NEVER touch stdout — the MIRROR
 	// RESULT line below is the only thing on stdout.
 	rep := &catalog.Reporter{Phase: writePhase, Percent: writeProgress}
 
-	created, existing, skipped, multifile, covers, err := catalog.MirrorCatalog(client, cfg, rep)
+	created, existing, skipped, multifile, covers, err := catalog.MirrorCatalog(client, cfg, rep, coverForce)
 	if err != nil {
 		// Honest failure: leave a host-free error label and reset the bar so the launcher
 		// doesn't show a stuck partial bar.
@@ -42,30 +46,25 @@ func runMirrorCatalog(client *romm.Client, cfg *config.Config) {
 	os.Exit(0)
 }
 
-// runMirrorCollections writes one Collections/<name>.txt per collection — manual,
-// smart, and virtual (auto) — and prints the §8 contract:
+// runMirrorCollections writes one Collections/<name>.txt per RomM collection and
+// prints the §8 contract:
 //
-//	COLLECTIONS written=%d empty=%d total=%d manual=%d virtual=%d smart=%d
+//	COLLECTIONS written=%d empty=%d total=%d
 //
-// written/empty/total are the COMBINED counts across all three sources (the original
-// three fields keep their meaning); the trailing manual/virtual/smart fields are an
-// additive per-source breakdown for diagnostics. The manual collection list comes from
-// the network and a failure there is exit 3; the virtual/smart shelves are optional and
-// a missing endpoint (older RomM) is a silent no-op, never an error.
+// The collection list comes from the network; a failure there is exit 3.
 func runMirrorCollections(client *romm.Client, cfg *config.Config) {
 	writeProgress(0)
 	writePhase("Reading collections…")
 
 	rep := &catalog.Reporter{Phase: writePhase, Percent: writeProgress}
 
-	written, empty, total, manual, virtual, smart, err := catalog.MirrorCollections(client, cfg, rep)
+	written, empty, total, err := catalog.MirrorCollections(client, cfg, rep)
 	if err != nil {
 		writeProgress(0)
 		writePhase("Couldn't reach RomM")
 		fmt.Fprintf(os.Stderr, "FATAL collections: %s\n", safeErr(err))
 		os.Exit(3)
 	}
-	fmt.Printf("COLLECTIONS written=%d empty=%d total=%d manual=%d virtual=%d smart=%d\n",
-		written, empty, total, manual, virtual, smart)
+	fmt.Printf("COLLECTIONS written=%d empty=%d total=%d\n", written, empty, total)
 	os.Exit(0)
 }

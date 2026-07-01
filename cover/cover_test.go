@@ -101,7 +101,7 @@ func TestFetchAndSave(t *testing.T) {
 	_ = os.MkdirAll(filepath.Dir(romPath), 0o755)
 
 	// no cover path -> OutcomeNoCover, nothing written
-	if out, err := FetchAndSave(fakeDL{}, "", romPath); out != OutcomeNoCover || err != nil {
+	if out, err := FetchAndSave(fakeDL{}, "", romPath, false); out != OutcomeNoCover || err != nil {
 		t.Fatalf("no-cover: got out=%v err=%v", out, err)
 	}
 	if _, err := os.Stat(MediaPath(romPath)); err == nil {
@@ -110,7 +110,7 @@ func TestFetchAndSave(t *testing.T) {
 
 	// successful save
 	raw := makePNG(282, 280, color.NRGBA{R: 1, G: 2, B: 3, A: 255})
-	if out, err := FetchAndSave(fakeDL{data: raw}, "/assets/x/cover/small.png", romPath); out != OutcomeSaved || err != nil {
+	if out, err := FetchAndSave(fakeDL{data: raw}, "/assets/x/cover/small.png", romPath, false); out != OutcomeSaved || err != nil {
 		t.Fatalf("save: got out=%v err=%v", out, err)
 	}
 	if !Exists(romPath) {
@@ -118,13 +118,13 @@ func TestFetchAndSave(t *testing.T) {
 	}
 
 	// second call -> skip-existing
-	if out, _ := FetchAndSave(fakeDL{data: raw}, "/assets/x/cover/small.png", romPath); out != OutcomeSkipped {
+	if out, _ := FetchAndSave(fakeDL{data: raw}, "/assets/x/cover/small.png", romPath, false); out != OutcomeSkipped {
 		t.Fatalf("expected skip-existing, got %v", out)
 	}
 
 	// download error -> OutcomeError, non-nil err, no panic
 	romPath2 := filepath.Join(dir, "Roms", "GB", "Other.gb")
-	if out, err := FetchAndSave(fakeDL{err: bytes.ErrTooLarge}, "/assets/y/cover/small.png", romPath2); out != OutcomeError || err == nil {
+	if out, err := FetchAndSave(fakeDL{err: bytes.ErrTooLarge}, "/assets/y/cover/small.png", romPath2, false); out != OutcomeError || err == nil {
 		t.Fatalf("error case: got out=%v err=%v", out, err)
 	}
 }

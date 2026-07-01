@@ -1,8 +1,6 @@
 package sync
 
 import (
-	"errors"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,11 +34,6 @@ const (
 	// was overwritten — distinct from PullError so the UI can say "your current save
 	// wasn't safe to overwrite" instead of a generic failure.
 	PullSnapshotFail
-	// PullGhostSave: the server has a save RECORD for this id but its content GET returned
-	// 404 — the metadata row exists, the bytes are missing (a "ghost" save). Distinct from
-	// PullError so the UI says "this save is unavailable on the server" instead of the
-	// cryptic "download failed" / reason=download. Nothing was overwritten.
-	PullGhostSave
 )
 
 func (o PullOutcome) String() string {
@@ -57,8 +50,6 @@ func (o PullOutcome) String() string {
 		return "Error"
 	case PullSnapshotFail:
 		return "SnapshotFail"
-	case PullGhostSave:
-		return "GhostSave"
 	default:
 		return "Unknown"
 	}
@@ -198,21 +189,13 @@ func PushSaveFile(client *romm.Client, cfg *config.Config, romPath, filePath, em
 		RomID: rom.ID, DeviceID: deviceID(cfg), Emulator: emulator,
 		Slot: "autosave", Autocleanup: true, AutocleanupLimit: 25,
 	}
-	uploaded, err := client.UploadSave(q, filePath)
-	if err != nil {
+	if _, err := client.UploadSave(q, filePath); err != nil {
 		if AlreadyOnServer(client, rom.ID, filePath) {
 			res.Outcome = OutcomeAlreadyOnServer
 			return res
 		}
 		res.Outcome = OutcomeUploadError
 		res.Err = cleanErr(err)
-		return res
-	}
-	// Ghost PREVENTION (#63): verify the uploaded staged save's content is retrievable;
-	// keep it pending (UploadError) rather than declaring success on a ghost.
-	if !verifyUploadedContent(client, cfg, rom.ID, filePath, uploaded) {
-		res.Outcome = OutcomeUploadError
-		res.Err = "upload left no retrievable content (ghost) — kept pending"
 		return res
 	}
 	res.Outcome = OutcomePushed
@@ -279,19 +262,8 @@ func romBasename(cfg *config.Config, rom romm.Rom) string {
 // reason.
 func writeSave(client *romm.Client, cfg *config.Config, saveID int, localPath string) PullResult {
 	data, err := client.DownloadSaveContent(saveID, deviceID(cfg), false)
-	if err != nil {
-		// Ghost save: the record exists but its content GET = 404 (bytes missing on the
-		// server). Surface a CLEAR, distinct outcome instead of the cryptic "download
-		// failed" so the restore/list-saves UI can flag it as unavailable. (#63)
-		var se *romm.StatusError
-		if errors.As(err, &se) && se.Code == http.StatusNotFound {
-			return PullResult{Outcome: PullGhostSave, Reason: "save unavailable on server (no content)"}
-		}
+	if err != nil || len(data) == 0 {
 		return PullResult{Outcome: PullError, Reason: "download failed"}
-	}
-	if len(data) == 0 {
-		// An empty body for an existing record is also an unusable (ghost-like) save.
-		return PullResult{Outcome: PullGhostSave, Reason: "save unavailable on server (empty content)"}
 	}
 	saveDir := filepath.Dir(localPath)
 	if err := os.MkdirAll(saveDir, 0o755); err != nil {

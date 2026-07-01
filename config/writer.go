@@ -19,13 +19,79 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
+	"path/filepath"
 )
 
 // configFileName is the canonical config the engine loads CWD-relative. Kept in one
 // place so Load and the writer never drift.
 const configFileName = "config.json"
+
+// WriteProfileHost adds or updates a MULTI-USER profile in config.json's hosts array:
+// it finds the host whose profile_label matches (case-insensitive) and updates its
+// token/username/device_id/scopes, or APPENDS a new host (copying root_uri/port/
+// insecure_skip_verify from hosts[0] so the new profile points at the same server).
+// Unknown keys are preserved (map-based, like WriteHostUpdate). Password is never
+// stored (token-only at rest). label/token are required by the caller.
+func WriteProfileHost(label, username, token, deviceID string, scopes []string) error {
+	path := configFileName
+	var root map[string]any
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if uerr := json.Unmarshal(data, &root); uerr != nil {
+			return fmt.Errorf("parse config: %w", uerr)
+		}
+	case os.IsNotExist(err):
+		root = map[string]any{}
+	default:
+		return fmt.Errorf("read config: %w", err)
+	}
+	if root == nil {
+		root = map[string]any{}
+	}
+
+	hosts, _ := root["hosts"].([]any)
+	// Find an existing host map with this profile_label.
+	var target map[string]any
+	for _, h := range hosts {
+		hm, ok := h.(map[string]any)
+		if !ok {
+			continue
+		}
+		if pl, _ := hm["profile_label"].(string); strings.EqualFold(pl, label) {
+			target = hm
+			break
+		}
+	}
+	if target == nil {
+		// New profile: seed server fields from hosts[0] so it points at the same RomM.
+		target = map[string]any{}
+		if base := firstHostMap(root); base != nil {
+			for _, k := range []string{"root_uri", "port", "insecure_skip_verify"} {
+				if v, ok := base[k]; ok {
+					target[k] = v
+				}
+			}
+		}
+		target["profile_label"] = label
+		hosts = append(hosts, target)
+		root["hosts"] = hosts
+	}
+
+	setOrDelete(target, "token", token)
+	delete(target, "password") // token-only at rest
+	setOrDelete(target, "username", username)
+	setOrDelete(target, "device_id", deviceID)
+	if len(scopes) > 0 {
+		arr := make([]any, len(scopes))
+		for i, s := range scopes {
+			arr[i] = s
+		}
+		target["scopes"] = arr
+	}
+	return writeJSONAtomic(path, root)
+}
 
 // HostUpdate carries the onboarding fields to persist onto hosts[0]. Only non-empty
 // fields are written, EXCEPT the password clear, which is unconditional whenever a
@@ -198,147 +264,6 @@ func WriteRACredentials(username, token string) error {
 	return writeJSONAtomic(path, root)
 }
 
-// WriteProfileUpdate applies u to the profile named label in config.json (matched by
-// label, case-insensitive), creating the profile entry if it does not yet exist, and
-// persists atomically. Used by the multi-user onboarding modes (--add-profile pairing
-// + --register-device) so a family member's token/device_id land on THEIR profile, not
-// on hosts[0] (the shared server). hosts[] is left untouched. Same generic-tree edit as
-// WriteHostUpdate: every other key (known or not) survives byte-for-value. NEVER logs
-// the token/device_id; errors name only the failing step.
-//
-// When ALSO marking the profile active, callers follow with SetActiveProfile (or pass
-// it through the higher-level helper) — this function only writes the profile fields.
-func WriteProfileUpdate(label string, u HostUpdate) error {
-	path := configFileName
-	root, err := readConfigTree(path)
-	if err != nil {
-		return err
-	}
-	prof := profileMapByLabel(root, label)
-	applyHostUpdateFields(prof, u)
-	// A profile always carries its label (it is the selector + badge source).
-	if _, ok := prof["label"]; !ok {
-		prof["label"] = label
-	}
-	return writeJSONAtomic(path, root)
-}
-
-// SetActiveProfile writes the top-level active_profile selector. An empty name CLEARS
-// it (single-user). Atomic; preserves every other key.
-func SetActiveProfile(label string) error {
-	path := configFileName
-	root, err := readConfigTree(path)
-	if err != nil {
-		return err
-	}
-	if label == "" {
-		delete(root, "active_profile")
-	} else {
-		root["active_profile"] = label
-	}
-	return writeJSONAtomic(path, root)
-}
-
-// RemoveProfile deletes the profile named label (case-insensitive) from profiles[]
-// and clears active_profile when it pointed at that label. A no-op (still nil error)
-// when the label is absent. Atomic; preserves every other key.
-func RemoveProfile(label string) error {
-	path := configFileName
-	root, err := readConfigTree(path)
-	if err != nil {
-		return err
-	}
-	want := strings.ToLower(strings.TrimSpace(label))
-	arr, _ := root["profiles"].([]any)
-	kept := arr[:0:0]
-	for _, e := range arr {
-		if m, ok := e.(map[string]any); ok {
-			if l, _ := m["label"].(string); strings.ToLower(strings.TrimSpace(l)) == want {
-				continue // drop
-			}
-		}
-		kept = append(kept, e)
-	}
-	if len(kept) == 0 {
-		delete(root, "profiles")
-	} else {
-		root["profiles"] = kept
-	}
-	if ap, _ := root["active_profile"].(string); strings.ToLower(strings.TrimSpace(ap)) == want {
-		delete(root, "active_profile")
-	}
-	return writeJSONAtomic(path, root)
-}
-
-// readConfigTree reads config.json into a generic mutable tree, repairing a missing
-// file into an empty object so a fresh card can be written. Shared by the profile
-// writers; mirrors the read prologue of WriteHostUpdate.
-func readConfigTree(path string) (map[string]any, error) {
-	var root map[string]any
-	data, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		if uerr := json.Unmarshal(data, &root); uerr != nil {
-			return nil, fmt.Errorf("parse config: %w", uerr)
-		}
-		if root == nil {
-			root = map[string]any{}
-		}
-	case os.IsNotExist(err):
-		root = map[string]any{}
-	default:
-		return nil, fmt.Errorf("read config: %w", err)
-	}
-	return root, nil
-}
-
-// profileMapByLabel returns the profiles[] entry whose "label" matches (case-insensitive,
-// trimmed), as a mutable map, creating and appending a fresh entry when none exists.
-func profileMapByLabel(root map[string]any, label string) map[string]any {
-	want := strings.ToLower(strings.TrimSpace(label))
-	arr, _ := root["profiles"].([]any)
-	for i := range arr {
-		if m, ok := arr[i].(map[string]any); ok {
-			if l, _ := m["label"].(string); strings.ToLower(strings.TrimSpace(l)) == want {
-				return m
-			}
-		}
-	}
-	prof := map[string]any{"label": label}
-	arr = append(arr, prof)
-	root["profiles"] = arr
-	return prof
-}
-
-// applyHostUpdateFields writes the non-empty fields of u onto an arbitrary host/profile
-// map (the shared field-write logic factored out of WriteHostUpdate so profiles and
-// hosts persist identically). Server-address fields are intentionally NOT written here —
-// profiles never carry their own server.
-func applyHostUpdateFields(host map[string]any, u HostUpdate) {
-	if u.setToken || u.Token != "" {
-		setOrDelete(host, "token", u.Token)
-		delete(host, "password")
-	}
-	if u.TokenName != "" {
-		host["token_name"] = u.TokenName
-	}
-	if u.TokenExpiresAt != "" {
-		host["token_expires_at"] = u.TokenExpiresAt
-	}
-	if u.Scopes != nil {
-		host["scopes"] = u.Scopes
-	}
-	if u.Username != "" {
-		host["username"] = u.Username
-	}
-	if u.DeviceID != "" {
-		host["device_id"] = u.DeviceID
-	}
-	if u.DeviceName != "" {
-		host["device_name"] = u.DeviceName
-	}
-}
-
 // firstHostMap returns hosts[0] as a mutable map, normalizing a missing, non-array,
 // empty, or non-object first element into a fresh host object wired back into root.
 func firstHostMap(root map[string]any) map[string]any {
@@ -407,6 +332,15 @@ func writeJSONAtomic(path string, v any) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		cleanup()
 		return fmt.Errorf("rename temp config: %w", err)
+	}
+	// FAT32 SD-card durability: fsync the directory so the rename itself is persisted,
+	// not just the file data. Without this a power-loss right after rename can leave the
+	// dir entry pointing at unflushed (zeroed) blocks — the exact all-null config.json
+	// corruption observed on the RG34XX (2026-06-30). Best-effort: ignore errors so a
+	// read-only or fsync-less FS never fails an otherwise-good write.
+	if d, derr := os.Open(filepath.Dir(path)); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	// Best-effort: ensure the final file is 0600 even if it pre-existed at a looser
 	// mode (rename preserves the temp's mode on most FS, but be explicit).
