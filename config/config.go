@@ -188,14 +188,15 @@ type DirMapping struct {
 //
 // "own" is the LodorOS default: the card IS the RomM library — folders are named
 // "<Display> (<TAG>)" and stub basenames are byte-identical to the server's (the
-// historical, only behavior). "separate" is the NextUI default: RomM is mirrored into
-// distinct "<Display> RomM (<TAG>)" folders that bind the right emulator yet never
-// collide with the user's own "<Display> (<TAG>)" folders, and stub basenames are
-// disambiguated so a RomM stub never shares a save file with a user's local game — the
-// user's existing folders and games are NEVER touched. "merge" (adopt-folder-by-tag +
-// filename-normalize dedup + scoped prune + saves-off-until-opt-in) is NOT YET
-// IMPLEMENTED and is treated as "separate" (safe, non-destructive) until the #68 design
-// lands; see the TODO in catalog/generate.go.
+// historical, only behavior). "merge" is the NextUI default (C2, 2026-07-02): RomM
+// games mix into the user's OWN folders — existing same-tag folders are ADOPTED
+// (adopt-by-tag), a user's exact-named file is never stubbed (dedup-by-index-adoption:
+// the index adopts THEIR path so save-sync attaches to their file), stub basenames are
+// canonical under the ✘/✓ markers, and every destructive path is scoped to the
+// mirror-owned manifest so the user's files are structurally untouchable. "separate"
+// keeps RomM in distinct "<Display> RomM (<TAG>)" folders with " (RomM)"-suffixed
+// basenames — the quarantine/trial mode, and the home for same-name-different-content
+// collections merge's dedup would hide.
 const (
 	MirrorModeOwn      = "own"
 	MirrorModeSeparate = "separate"
@@ -211,9 +212,9 @@ type Config struct {
 	DownloadTimeout   Seconds               `json:"download_timeout"`
 
 	// MirrorMode is the coexist mode (own|separate|merge). Written by the pak's
-	// settings toggle. Absent/unrecognized => ResolvedMirrorMode() picks a host-aware
-	// default (own on LodorOS, separate elsewhere), so an older config stays own and a
-	// NextUI card defaults to the non-destructive separate layout.
+	// settings toggle (and by NextUI onboarding, which writes merge explicitly).
+	// Absent/unrecognized => ResolvedMirrorMode() picks the host default (own on
+	// LodorOS/unknown, merge on NextUI — see hostMirrorModeDefault).
 	MirrorMode string `json:"mirror_mode,omitempty"`
 
 	// FetchCovers gates ONLY the BULK box-art fetch during --mirror-catalog. It is a
@@ -257,37 +258,77 @@ func (c *Config) RALoggedIn() bool {
 
 // ResolvedMirrorMode returns the effective coexist mode. An explicit, recognized
 // mirror_mode (case/space-insensitive) always wins. When absent or unrecognized it
-// falls back to the host default: "own" on a LodorOS host (byte-identical to today),
-// "separate" on any other host so RomM games land in distinct, non-colliding folders.
-// Nil-safe.
+// falls back to the host default (hostMirrorModeDefault) — with ONE hold: a
+// DEFAULTED merge over a card whose directory_mappings still carry the separate
+// layout ("… RomM (TAG)" folders) resolves SEPARATE. Mode flips are prompt-only
+// (C2): a build upgrade changing the default must not silently re-layout an
+// existing card — the user opts into merge via the pak prompt, which writes the
+// mode explicitly and lifts the hold. Nil-safe.
 func (c *Config) ResolvedMirrorMode() string {
-	if c != nil {
-		switch strings.ToLower(strings.TrimSpace(c.MirrorMode)) {
-		case MirrorModeOwn:
-			return MirrorModeOwn
-		case MirrorModeSeparate:
-			return MirrorModeSeparate
-		case MirrorModeMerge:
-			return MirrorModeMerge
+	if mode, ok := c.ExplicitMirrorMode(); ok {
+		return mode
+	}
+	def := hostMirrorModeDefault()
+	if def == MirrorModeMerge && c != nil && hasSeparateLayoutMappings(c.DirectoryMappings) {
+		return MirrorModeSeparate
+	}
+	return def
+}
+
+// hasSeparateLayoutMappings reports whether any directory mapping still points at a
+// separate-mode "<Display> RomM (<TAG>)" folder — the signature of a card mirrored
+// under the separate layout.
+func hasSeparateLayoutMappings(m map[string]DirMapping) bool {
+	for _, dm := range m {
+		if strings.Contains(dm.RelativePath, " RomM (") {
+			return true
 		}
 	}
-	return hostMirrorModeDefault()
+	return false
+}
+
+// ExplicitMirrorMode returns the mirror mode ONLY when one was explicitly set (a
+// recognized value in config.json or the pak's settings.conf overlay) — ok=false
+// when the mode is merely the host default. Migration/mapping-regeneration keys off
+// THIS, never off a defaulted value: a build upgrade that changes the default must
+// not silently restructure an existing card (mode-flip stays prompt-only — the pak's
+// consent prompt writes the mode, which makes it explicit).
+func (c *Config) ExplicitMirrorMode() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(c.MirrorMode)) {
+	case MirrorModeOwn:
+		return MirrorModeOwn, true
+	case MirrorModeSeparate:
+		return MirrorModeSeparate, true
+	case MirrorModeMerge:
+		return MirrorModeMerge, true
+	}
+	return "", false
 }
 
 // hostMirrorModeDefault picks the mirror mode for a config that carries no explicit
 // mirror_mode. The host is identified by the LODOR_HOST_OS env the launcher exports:
-// "nextui" (or any other recognized non-LodorOS host) => separate; "lodoros"/"minui"
-// => own. When the hint is ABSENT we assume LodorOS and return "own", so existing
-// LodorOS cards — which export nothing new — stay byte-identical to today, while the
-// NextUI Lodor.pak (which writes mirror_mode explicitly AND exports LODOR_HOST_OS=
-// nextui) gets separate. An explicitly-set but unrecognized host is, by definition,
-// not LodorOS, so it defaults separate.
+//
+//	"nextui"             => MERGE (C2, the 2026-07-02 gate decision: RomM games mix
+//	                        into the user's own folders — adopt-by-tag + dedup +
+//	                        manifest-scoped mutation make it safe; the NextUI pak
+//	                        also writes mirror_mode=merge explicitly at onboarding)
+//	absent/"lodoros"/…   => OWN (LodorOS: the card IS the library; existing LodorOS
+//	                        and muOS cards export nothing and stay byte-identical)
+//	anything else        => OWN (unknown host: the historical default, unchanged)
+//
+// NOTE: merge and own share canonical basenames and the clean "<Display> (<TAG>)"
+// folder shape, so a NextUI card that previously resolved the de-facto "own" default
+// (the pre-C2 state) upgrades onto "merge" with ZERO on-disk renames — it gains the
+// dedup/adoption + manifest safety, not a re-layout. Cards with separate-layout
+// mappings are held on separate until the user explicitly opts in (see
+// ensureDirectoryMappings' layout hold).
 func hostMirrorModeDefault() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("LODOR_HOST_OS"))) {
-	case "", "lodoros", "lodor", "minui":
-		return MirrorModeOwn
 	case "nextui":
-		return MirrorModeOwn // RomM-first: merge in place, no " (RomM)" disambiguator (cut 2026-06-28)
+		return MirrorModeMerge
 	default:
 		return MirrorModeOwn
 	}

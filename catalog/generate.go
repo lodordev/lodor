@@ -11,6 +11,7 @@ package catalog
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -29,17 +30,32 @@ type platformLister interface {
 // GenerateDirectoryMappings builds a directory_mappings map from the user's RomM
 // platforms: for each platform the engine has a known MinUI emulator tag for AND a
 // launchable Emu pak installed, it emits fs_slug -> {slug: fs_slug, relative_path}
-// where relative_path is mode-aware (mirrorFolderName): "<Display> (<TAG>)" in "own"
-// mode, "<Display> RomM (<TAG>)" in "separate"/"merge" so RomM folders never collide
+// where relative_path is mode-aware (mirrorFolderName): "<Display> (<TAG>)" in
+// "own"/"merge", "<Display> RomM (<TAG>)" in "separate" so RomM folders never collide
 // with the user's own "<Display> (<TAG>)". <TAG> is platform.PrimaryTag(fs_slug) and
 // <Display> is the platform's RomM name (custom_name preferred, then name, falling back
 // to fs_slug). Platforms with NO known tag, or no installed pak, are SKIPPED (no folder
-// invented) and counted. Returns the generated map plus generated/skipped counts; never
-// logs or returns a secret.
+// invented) and counted.
+//
+// MERGE additionally ADOPTS the user's existing folder (C1 §1, adopt-by-tag): a
+// top-level Roms/ dir whose trailing "(TAG)" — or bare name — matches the platform's
+// tag becomes the mapping target, so stubs land among the user's own games. Multiple
+// candidates pick the one holding the most real (non-hidden, non-0-byte) files —
+// the user's "real" folder — tie broken lexicographically; the un-adopted siblings
+// still save-sync via slugForRomPath's tag fallback (adoption only decides where
+// stubs LAND). No candidate ⇒ the clean "<Display> (<TAG>)" is created (no
+// collision by definition). Adoptions are logged (MAPGEN adopt …, host-free).
+// Returns the generated map plus generated/skipped counts; never logs or returns a
+// secret.
 func GenerateDirectoryMappings(client platformLister, mode string) (mappings map[string]config.DirMapping, generated, skipped int, err error) {
 	platforms, perr := client.GetPlatforms()
 	if perr != nil {
 		return nil, 0, 0, perr
+	}
+
+	var romsDirs []string
+	if mode == config.MirrorModeMerge {
+		romsDirs = listRomsFolders()
 	}
 
 	mappings = map[string]config.DirMapping{}
@@ -64,22 +80,99 @@ func GenerateDirectoryMappings(client platformLister, mode string) (mappings map
 			continue
 		}
 		display := sanitizeFolderName(platformDisplayName(p))
+		rel := mirrorFolderName(display, tag, mode)
+		if mode == config.MirrorModeMerge {
+			if adopted, nFiles, nCand := adoptFolderForTag(romsDirs, tag); adopted != "" {
+				rel = adopted
+				fmt.Fprintf(os.Stderr, "MAPGEN adopt %s -> %s (%d files, %d candidates)\n",
+					p.FsSlug, adopted, nFiles, nCand)
+			}
+		}
 		mappings[p.FsSlug] = config.DirMapping{
 			Slug:         p.FsSlug,
-			RelativePath: mirrorFolderName(display, tag, mode),
+			RelativePath: rel,
 		}
 		generated++
 	}
 	return mappings, generated, skipped, nil
 }
 
+// listRomsFolders returns the visible top-level Roms/ directory names — the merge
+// adoption candidates. Skips hidden names (leading "."), ".disabled"-suffixed dirs
+// (NextUI's hide() convention) and the Lodor root-entry affordance folders.
+func listRomsFolders() []string {
+	entries, err := os.ReadDir(filepath.Join(sdcardRoot(), "Roms"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasPrefix(n, ".") || strings.HasSuffix(n, ".disabled") {
+			continue
+		}
+		if strings.HasSuffix(n, "(LODORGM)") || strings.HasSuffix(n, "(LODORCT)") {
+			continue // launcher affordances, never library folders
+		}
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// adoptFolderForTag picks the user folder a platform's stubs should land in:
+// candidates are dirs whose trailing "(TAG)" (case-insensitive) — or bare name —
+// equals the platform tag. Multiple candidates: most real (non-hidden, non-0-byte,
+// non-marked) files wins — the user's "real" folder; tie → lexicographic first
+// (candidates arrive sorted). Returns ("",0,0) when no candidate exists.
+func adoptFolderForTag(romsDirs []string, tag string) (folder string, files, candidates int) {
+	best, bestFiles := "", -1
+	for _, d := range romsDirs {
+		dirTag := tagFromFolderName(d)
+		if !strings.EqualFold(dirTag, tag) && !strings.EqualFold(d, tag) {
+			continue
+		}
+		candidates++
+		n := countRealFiles(filepath.Join(sdcardRoot(), "Roms", d))
+		if n > bestFiles { // strict: ties keep the earlier (lexicographic) candidate
+			best, bestFiles = d, n
+		}
+	}
+	if best == "" {
+		return "", 0, 0
+	}
+	return best, bestFiles, candidates
+}
+
+// countRealFiles counts a folder's top-level regular files that are non-hidden,
+// non-0-byte and not Lodor-marked — the "user's real games" signal the adoption
+// tiebreak uses.
+func countRealFiles(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") || platform.HasLeadingMarker(e.Name()) {
+			continue
+		}
+		if fi, ferr := e.Info(); ferr == nil && fi.Size() > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // mirrorFolderName builds the Roms/ folder a platform's RomM games are mirrored into.
-// In "own" mode (LodorOS — the card IS the library) it is the historical "<Display>
-// (<TAG>)". In "separate"/"merge" it is "<Display> RomM (<TAG>)": NextUI's getEmuName
-// binds off the LAST paren so this still launches <TAG>.pak, getDisplayName strips the
-// trailing paren so it reads "<Display> RomM", and it can never collide with the user's
-// own "<Display> (<TAG>)" folder (verified naming, issue #68). "merge" reuses the
-// separate layout until the adopt-by-tag design lands (see ensureDirectoryMappings).
+// "own"/"merge": the clean "<Display> (<TAG>)" (merge only CREATES it when adoption
+// found no user folder — no collision by definition). "separate": "<Display> RomM
+// (<TAG>)" — NextUI's getEmuName binds off the LAST paren so this still launches
+// <TAG>.pak, getDisplayName strips the trailing paren so it reads "<Display> RomM",
+// and it can never collide with the user's own "<Display> (<TAG>)" folder (issue #68).
 func mirrorFolderName(display, tag, mode string) string {
 	// CFW-variant: MinUI builds "<Display> (<TAG>)"; OnionOS builds the bare <TAG>.
 	return platform.MirrorFolderName(display, tag, mode)
@@ -136,16 +229,6 @@ func ensureDirectoryMappings(client romClient, cfg *config.Config) error {
 	}
 
 	mode := cfg.ResolvedMirrorMode()
-	if mode == config.MirrorModeMerge {
-		// TODO(#68): merge mode (adopt user folder by tag + filename-normalize dedup +
-		// scoped prune + saves-off-until-opt-in) is not implemented yet. Fall back to the
-		// SEPARATE layout, which is the safe subset: RomM lands in its own "… RomM (TAG)"
-		// folders and the user's library is never touched. Logged (host-free) so the run
-		// is honest about what it did.
-		fmt.Fprintf(os.Stderr, "MAPGEN mirror_mode=merge not yet implemented — using separate layout (user library untouched)\n")
-		mode = config.MirrorModeSeparate
-	}
-
 	mappings, generated, skipped, gerr := GenerateDirectoryMappings(lister, mode)
 	if gerr != nil {
 		return gerr

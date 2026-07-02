@@ -130,7 +130,7 @@ func runDownloadQueue(client *romm.Client, cfg *config.Config) {
 	writeProgress(100)
 	fmt.Printf("RESULT downloaded=%d failed=%d remaining=%d\n", downloaded, failed, remaining)
 	if failed > 0 {
-		os.Exit(4) // ran but one or more items errored (matches the documented exit map)
+		exitMode(4) // ran but one or more items errored (matches the documented exit map)
 	}
-	os.Exit(0)
+	exitMode(0)
 }

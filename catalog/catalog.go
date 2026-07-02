@@ -138,9 +138,29 @@ func IndexPath(cfg *config.Config) string {
 // counted and skipped (v1). A ROM whose local path resolves to a save extension is
 // skipped; an already-present file is counted as existing; otherwise a 0-byte stub
 // is created.
-func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverForce bool) (created, existing, skipped, multifile, covers int, err error) {
+//
+// MERGE (C1 §2 — dedup-by-index-adoption): a user's real file whose (marker-
+// stripped, case-insensitive) filename exactly matches the ROM's canonical on-disk
+// name or raw fs_name — in the adopted folder OR any same-tag sibling — is ADOPTED:
+// NO stub is created (no duplicate row), the index by_id takes THEIR path (so
+// Collections/Continue list their real file and save-sync attaches to it — the
+// adoption magic moment), and the file itself is never renamed, marked, evicted or
+// pruned (the manifest never claims it). A user's 0-byte file at a canonical name
+// is skipped entirely (never adopted, never stubbed, never downloaded-over).
+// Adopted files are returned in the adopted count (also counted as existing —
+// the game IS on the card).
+func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverForce bool) (created, existing, skipped, multifile, covers, adopted int, err error) {
 	idx := index{Version: 1, Platforms: map[string]platformIndex{}}
 	coversOn := cfg.CoversEnabled()
+
+	// Mirror-owned manifest (C2): every path this run CREATES is recorded so the
+	// destructive paths (prune/evict/download-fill/uninstall) can gate on real
+	// ownership instead of inference. One atomic save at the end of the run.
+	man := platform.LoadManifest()
+	// resolves is the catalog leg of the ReclaimableStub triple gate: does this
+	// on-disk path reverse to a rom_id against the LOCAL index (the previous run's
+	// — the new one isn't written yet)?
+	resolves := func(p string) bool { _, ok := ResolveRomID(cfg, p); return ok }
 
 	rep.percent(0)
 	rep.phase("Reading library…")
@@ -152,7 +172,7 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 	// mappings are left untouched. A generation/persist failure is a config/reachability
 	// error (same class as the platforms fetch) -- surface it.
 	if merr := ensureDirectoryMappings(client, cfg); merr != nil {
-		return 0, 0, 0, 0, 0, merr
+		return 0, 0, 0, 0, 0, 0, merr
 	}
 
 	// Mirror only platforms the user has mapped a Roms folder for; others have
@@ -162,7 +182,7 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 	// without the platforms list, so fetch platforms once.
 	platforms, perr := getMappedPlatforms(client, cfg)
 	if perr != nil {
-		return 0, 0, 0, 0, 0, perr
+		return 0, 0, 0, 0, 0, 0, perr
 	}
 
 	// Weight the overall percent by each platform's rom_count so the bar advances in
@@ -192,7 +212,7 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 		// can't play). Skip it BEFORE the network fetch, and self-heal a stale mapping by
 		// pruning any 0-byte stubs already on the card. A real download is left untouched.
 		if tag, ok := platform.PrimaryTag(p.FsSlug); !ok || !platform.HasEmuPak(tag) {
-			pruneUnplayableStubs(cfg, p)
+			pruneUnplayableStubs(cfg, p, man, resolves)
 			doneWork += p.RomCount
 			rep.percent(mirrorPct(pi2+1, nPlat, doneWork, totalWork))
 			continue
@@ -212,6 +232,33 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 			pi.ByBasename = map[string]int{}
 			pi.ByFsname = map[string]int{}
 			pi.ByID = map[int]string{}
+		}
+
+		// Manifest: record FOLDER-creation intent BEFORE any stub write (record-
+		// intent-then-act: a crash leaves an over-complete manifest, the safe
+		// direction — we may "own" a folder we failed to create; removing a
+		// nonexistent path later is a no-op). Only a folder that does not exist yet
+		// is ours to claim; an existing folder is the user's (or a prior run's own,
+		// already recorded).
+		if m, ok := cfg.DirectoryMappings[p.FsSlug]; ok && m.RelativePath != "" {
+			dir := filepath.Join(sdcardRoot(), "Roms", m.RelativePath)
+			if _, serr := os.Stat(dir); os.IsNotExist(serr) {
+				man.Record(dir, platform.ManifestFolder, 0)
+			}
+		}
+
+		// MERGE dedup scan (once per platform): the user's own files — unmarked, so
+		// never Lodor's — across the adopted folder and every same-tag sibling,
+		// keyed by lower-cased filename for the Tier-1 exact match.
+		var userFiles map[string]adoptCandidate
+		if !platform.HostShowsStateNatively() && cfg.ResolvedMirrorMode() == config.MirrorModeMerge {
+			if tag, ok := platform.PrimaryTag(p.FsSlug); ok {
+				adoptedDir := ""
+				if m, mok := cfg.DirectoryMappings[p.FsSlug]; mok {
+					adoptedDir = m.RelativePath
+				}
+				userFiles = scanUserFilesForTag(tag, adoptedDir)
+			}
 		}
 		for i := range page.Items {
 			rom := page.Items[i]
@@ -244,6 +291,57 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 				multifile++
 			}
 
+			// MERGE Tier-1 dedup: the user's exact-named file wins — adopt, don't stub.
+			if userFiles != nil {
+				canonName := filepath.Base(path)
+				uf, hit := userFiles[strings.ToLower(canonName)]
+				if !hit && rom.FsName != "" {
+					uf, hit = userFiles[strings.ToLower(rom.FsName)]
+				}
+				if hit {
+					// Heal: a mirror-owned stub for this game (left by an earlier
+					// layout/flip) is a redundant duplicate row now that the user's
+					// file owns the name — remove it (owned + re-verified 0-byte only).
+					for _, mk := range []string{platform.MarkerCloud, platform.MarkerOnDevice} {
+						sp := filepath.Join(filepath.Dir(path), mk+canonName)
+						if man.OwnsKind(sp, platform.ManifestStub) {
+							if fi, serr := os.Stat(sp); serr == nil && !fi.IsDir() && fi.Size() == 0 {
+								if os.Remove(sp) == nil {
+									man.Forget(sp)
+								}
+							}
+						}
+					}
+					if uf.size == 0 {
+						// The user's own 0-byte file occupies the canonical name: never
+						// adopt (nothing to attach to), never stub beside it, never
+						// download over it (the V5 gate refuses it too). Skip + log.
+						fmt.Fprintf(os.Stderr, "MIRROR skip %s: user 0-byte file occupies canonical name\n", canonName)
+						skipped++
+						continue
+					}
+					// Index-adopt: by_id -> THEIR path (Collections/Continue/GM list
+					// their real file); by_basename/by_fsname already carry the
+					// canonical keys above, so ResolveRomID on their path is free.
+					pi.ByID[rom.ID] = strings.TrimPrefix(uf.abs, sdcardRoot())
+					adopted++
+					existing++
+					// Box art for their file: additive-only (force NEVER applies here —
+					// a --full refresh must not overwrite the user's own art; FetchAndSave
+					// without force skips any existing cover).
+					if coversOn {
+						if cp := rom.CoverPath(); cp != "" {
+							coverDone++
+							if out, _ := cover.FetchAndSave(client, cp, uf.abs, false); out == cover.OutcomeSaved {
+								covers++
+								man.Record(cover.MediaPath(uf.abs), platform.ManifestCover, rom.ID)
+							}
+						}
+					}
+					continue
+				}
+			}
+
 			// Reconcile to exactly one on-disk presence under the correct state marker:
 			// a 0-byte stub becomes "[^] " (in the cloud), a real downloaded file becomes
 			// "[v] " (on device), migrating saves + cover in lockstep if the marker flips.
@@ -254,12 +352,34 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 			if platform.HostShowsStateNatively() {
 				// LodorOS forked launcher dims by file size -> keep canonical names, no markers.
 				finalPath, didCreate = platform.ReconcileCanonicalPresence(cfg, rom, path)
+			} else if cfg.ResolvedMirrorMode() == config.MirrorModeMerge {
+				// MERGE: the V4 belt — a file at the bare canonical name that the
+				// manifest doesn't own is the USER's; reconcile leaves it (and its
+				// saves) untouched and creates nothing (dedup above should have
+				// adopted it; a case-drift miss lands here and is skipped+logged).
+				finalPath, didCreate = platform.ReconcileMarkedPresenceGuarded(cfg, rom, path, man.Owns)
+				if finalPath == "" {
+					fmt.Fprintf(os.Stderr, "MIRROR skip %s: user file occupies canonical name (not adopted — name/case drift)\n", filepath.Base(path))
+				}
 			} else {
 				finalPath, didCreate = platform.ReconcileMarkedPresence(cfg, rom, path)
 			}
 			if finalPath == "" {
 				skipped++
 				continue
+			}
+			// Manifest: the reconciled presence is mirror-owned — a 0-byte stub as
+			// "stub", real bytes as "download" (in own/separate modes the mirror
+			// folders are the engine's by construction, so a real file at a mirror
+			// name is a download/library file either way; in merge mode only files
+			// at MARKED names ever reach here, and a ✓-named real file that
+			// resolves is a Lodor download — user files never carry markers).
+			if fi, serr := os.Stat(finalPath); serr == nil {
+				kind := platform.ManifestStub
+				if fi.Size() > 0 {
+					kind = platform.ManifestDownload
+				}
+				man.Record(finalPath, kind, rom.ID)
 			}
 			// rom_id -> SDCARD-relative MARKED path so --mirror-collections lists the real
 			// on-disk name the launcher can open.
@@ -283,6 +403,8 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 					}
 					if out, _ := cover.FetchAndSave(client, cp, finalPath, coverForce); out == cover.OutcomeSaved {
 						covers++
+						// Manifest: our box art is removable at uninstall (kind=cover).
+						man.Record(cover.MediaPath(finalPath), platform.ManifestCover, rom.ID)
 					}
 				}
 			}
@@ -298,7 +420,15 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 
 	rep.phase("Writing index…")
 	if werr := writeIndexAtomic(IndexPath(cfg), idx); werr != nil {
-		return created, existing, skipped, multifile, covers, werr
+		return created, existing, skipped, multifile, covers, adopted, werr
+	}
+	// Persist the manifest (one atomic, fsync'd write per run). Recorded under the
+	// mode this pass mirrored in, so a later mode flip is detectable. A failed
+	// manifest write is non-fatal for the mirror itself but degrades the NEXT run's
+	// pruning toward "delete nothing" — the safe direction — so log it honestly.
+	man.SetMode(cfg.ResolvedMirrorMode())
+	if merr := man.Save(); merr != nil {
+		fmt.Fprintf(os.Stderr, "MANIFEST save failed: %v (pruning degrades to no-op next run)\n", merr)
 	}
 	rep.percent(100)
 	if coversOn {
@@ -306,7 +436,7 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 	} else {
 		rep.phase(fmt.Sprintf("Library updated — %d new", created))
 	}
-	return created, existing, skipped, multifile, covers, nil
+	return created, existing, skipped, multifile, covers, adopted, nil
 }
 
 // mirrorPct maps mirror progress to an integer 0..100. When per-platform rom_count is
@@ -336,14 +466,16 @@ func mirrorPct(platformsDone, platformsTotal, doneWork, totalWork int) int {
 // MirrorCollections writes one Collections/<sanitized>.txt per RomM collection,
 // listing the SDCARD-relative path of each member ROM that is actually present on
 // the card. Empty collections are skipped. Returns written, empty, and total counts
-// (total = number of collections fetched). BLUEPRINT §4.
-func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total int, err error) {
+// (total = number of collections fetched), plus cont — the entry count of the
+// cross-device "0) Continue" collection written in the same pass (see continue.go;
+// 0 = empty feed, no Continue file). BLUEPRINT §4 + task #37.
+func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total, cont int, err error) {
 	rep.percent(0)
 	rep.phase("Reading collections…")
 
 	collections, cerr := client.GetCollections()
 	if cerr != nil {
-		return 0, 0, 0, cerr
+		return 0, 0, 0, 0, cerr
 	}
 	total = len(collections)
 
@@ -351,21 +483,14 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 	// --mirror-catalog already wrote to the index. This avoids re-fetching the WHOLE
 	// library here (35 platforms / thousands of roms + an os.Stat each) — that refetch was
 	// the multi-minute "Updating collections" hang. The index is local: near-instant.
-	idPath := map[int]string{}
-	if idx, lerr := loadIndex(IndexPath(cfg)); lerr == nil {
-		for _, pidx := range idx.Platforms {
-			for id, rel := range pidx.ByID {
-				idPath[id] = rel
-			}
-		}
-	}
+	idPath := LoadIndexIDPath(cfg)
 	// FALLBACK (rare): no usable index yet (collections run before any catalog mirror).
 	// Do the live per-platform walk so collections still work — just slowly, this once.
 	if len(idPath) == 0 {
 		sdRoot := sdcardRoot()
 		platforms, perr := getMappedPlatforms(client, cfg)
 		if perr != nil {
-			return 0, 0, total, perr
+			return 0, 0, total, 0, perr
 		}
 		nPlat := len(platforms)
 		for pi2, p := range platforms {
@@ -390,9 +515,28 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 		}
 	}
 
-	colDir := filepath.Join(platform.RomsDir(), "..", "Collections")
+	colDir := ContinueDir()
 	if mkErr := os.MkdirAll(colDir, 0o755); mkErr != nil {
-		return 0, 0, total, mkErr
+		return 0, 0, total, 0, mkErr
+	}
+
+	// Ownership: the mirror-owned manifest (C2 — formalizes the STEP 0b
+	// collections ledger into the ONE mechanism). A legacy card whose ownership
+	// still lives in collections-owned.txt has those names imported once, so its
+	// prune continuity survives the upgrade; the ledger file is retired after the
+	// first successful manifest save.
+	man := platform.LoadManifest()
+	hasCollectionEntries := false
+	for _, e := range man.Entries {
+		if e.Kind == platform.ManifestCollection || e.Kind == platform.ManifestContinue {
+			hasCollectionEntries = true
+			break
+		}
+	}
+	if !hasCollectionEntries {
+		for name := range readOwnedCollections() {
+			man.Record(filepath.Join(colDir, name), platform.ManifestCollection, 0)
+		}
 	}
 
 	kept := map[string]bool{}
@@ -417,26 +561,66 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 		}
 		if werr := os.WriteFile(filepath.Join(colDir, name+".txt"),
 			[]byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
-			return written, empty, total, werr
+			return written, empty, total, 0, werr
 		}
 		kept[name+".txt"] = true
+		man.Record(filepath.Join(colDir, name+".txt"), platform.ManifestCollection, 0)
 		written++
 	}
-	// Prune stale collection files: any Collections/*.txt we did NOT just write is no
-	// longer a current RomM collection (or is now empty on this device) — remove it so a
-	// previous engine's auto/virtual collections cannot linger across refreshes.
+
+	// Cross-device "Continue" collection (task #37): written in the SAME pass, BEFORE
+	// the prune, and marked kept — otherwise the prune below (correctly) removes any
+	// collection file the server didn't produce. An empty feed writes nothing, so the
+	// prune clears a stale Continue from a previous run. Runs after the collection
+	// loop so a RomM collection that happens to share the name is overwritten.
+	rep.phase("Updating Continue…")
+	preContinue := map[string]bool{}
+	for n := range kept {
+		preContinue[n] = true
+	}
+	cont = mirrorContinue(client, cfg, idPath, colDir, kept)
+	for n := range kept {
+		if !preContinue[n] { // the Continue file mirrorContinue added this pass
+			man.Record(filepath.Join(colDir, n), platform.ManifestContinue, 0)
+		}
+	}
+
+	// Prune stale collection files — MANIFEST-SCOPED (C1 design audit V2; formalizes
+	// STEP 0b). Collections/ belongs to the USER on NextUI: their curated .txt lists
+	// plus map.txt, NextUI's native display-alias file. The pre-0b prune removed ANY
+	// *.txt not written this pass — deleting user collections and map.txt on every
+	// refresh. A file is only removable when the mirror-owned manifest claims it
+	// (kind=collection/continue). No manifest = prune nothing (fail-safe: stale Lodor
+	// collections may linger one refresh; user data is never at risk). map.txt is
+	// hard-excluded regardless of what the manifest says.
 	if entries, derr := os.ReadDir(colDir); derr == nil {
 		for _, e := range entries {
 			n := e.Name()
 			if e.IsDir() || !strings.HasSuffix(n, ".txt") || kept[n] {
 				continue
 			}
-			_ = os.Remove(filepath.Join(colDir, n))
+			fp := filepath.Join(colDir, n)
+			if strings.EqualFold(n, "map.txt") ||
+				(!man.OwnsKind(fp, platform.ManifestCollection) && !man.OwnsKind(fp, platform.ManifestContinue)) {
+				continue // user data (or unknowable ownership) — never ours to delete
+			}
+			if os.Remove(fp) == nil {
+				man.Forget(fp)
+			}
 		}
+	}
+	// Persist ownership = exactly what exists after this pass. Best-effort: a failed
+	// manifest write leaves the OLD manifest (or none) — pruning degrades toward
+	// "nothing", never toward "user files". The legacy STEP 0b ledger file is retired
+	// only after its content is safely inside a saved manifest.
+	if merr := man.Save(); merr == nil {
+		_ = os.Remove(collectionsLedgerPath())
+	} else {
+		fmt.Fprintf(os.Stderr, "MANIFEST save failed: %v (collections pruning degrades to no-op next run)\n", merr)
 	}
 	rep.percent(100)
 	rep.phase(fmt.Sprintf("Collections updated — %d", written))
-	return written, empty, total, nil
+	return written, empty, total, cont, nil
 }
 
 // ResolveRomID reverses a local ROM path back to its rom_id using the catalog
@@ -465,12 +649,48 @@ func ResolveRomID(cfg *config.Config, romPath string) (romID int, ok bool) {
 	// rom_id as the bare "Game (USA)" key (BLUEPRINT §A). The local save path keeps the
 	// marked name; only resolution-to-RomM strips it.
 	base := platform.StripLeadingMarker(filepath.Base(romPath))
-	nameNoExt := strings.TrimSuffix(base, filepath.Ext(base))
+	ext := filepath.Ext(base)
+	nameNoExt := strings.TrimSuffix(base, ext)
+
+	// Primary lookups: the mode-aware index keys as the mirror wrote them.
 	if id, found := pi.ByBasename[nameNoExt]; found && id != 0 {
 		return id, true
 	}
 	if id, found := pi.ByFsname[base]; found && id != 0 {
 		return id, true
+	}
+	// Multi-disc: the on-disk file is "<name>.m3u" but a multi-file ROM's fs_name is
+	// the extension-less game FOLDER name, so the full-base ByFsname lookup above can
+	// never hit — try the stem.
+	if id, found := pi.ByFsname[nameNoExt]; found && id != 0 {
+		return id, true
+	}
+
+	// CROSS-MODE DECORATION FALLBACKS (workstream A1). A coexist-mode flip re-keys the
+	// index (own keys "Game"; separate/merge keys "Game (RomM)") but does NOT rename
+	// files already on the card, so a legacy on-disk name must still resolve against
+	// the re-keyed index in BOTH directions — otherwise every pre-flip download loses
+	// its downloads/saves/evict resolution (observed on the Smart Pro card 2026-07-02:
+	// a merge-mode re-mirror left "✓ Game.gba" on disk with only "Game (RomM)" keys
+	// fresh in by_basename; single-file names survived via by_fsname, multi-disc and
+	// own-flip names did not).
+	if platform.HasRomMTag(nameNoExt) {
+		// on-disk "(RomM)"-tagged, index keyed canonical (own mode now).
+		stem := platform.StripRomMTag(nameNoExt)
+		if id, found := pi.ByBasename[stem]; found && id != 0 {
+			return id, true
+		}
+		if id, found := pi.ByFsname[stem+ext]; found && id != 0 {
+			return id, true
+		}
+		if id, found := pi.ByFsname[stem]; found && id != 0 {
+			return id, true
+		}
+	} else {
+		// on-disk canonical, index keyed "(RomM)"-tagged (separate/merge mode now).
+		if id, found := pi.ByBasename[nameNoExt+platform.RomMTag()]; found && id != 0 {
+			return id, true
+		}
 	}
 	return 0, false
 }
@@ -548,12 +768,76 @@ func sdcardRoot() string {
 	return sd
 }
 
-// pruneUnplayableStubs removes 0-byte stub files from a mapped platform's Roms folder
-// when that platform has no installed emulator pak — self-healing a config that still
-// maps a system the device can't launch (DS/3DS/PSP on a Mini Flip). Real (non-zero)
-// downloads are LEFT ALONE (never delete a game the user pulled); if nothing but cover
-// art remains afterward, the now-pointless folder is removed.
-func pruneUnplayableStubs(cfg *config.Config, p romm.Platform) {
+// adoptCandidate is one user file the merge dedup may adopt: its absolute path and
+// size (0-byte user files are skipped, never adopted or stubbed over).
+type adoptCandidate struct {
+	abs  string
+	size int64
+}
+
+// scanUserFilesForTag maps lower-cased filename -> the user's file for every
+// UNMARKED top-level file in the adopted folder and every same-tag sibling folder
+// (C1 §2: dedup checks the adopted folder AND siblings). Marked (✘/✓/legacy) names
+// are Lodor's own artifacts and flow to Reconcile instead. On a duplicate filename
+// the ADOPTED folder wins (it is scanned first); siblings keep first-seen order
+// (deterministic: listRomsFolders sorts).
+func scanUserFilesForTag(tag, adoptedDir string) map[string]adoptCandidate {
+	out := map[string]adoptCandidate{}
+	dirs := []string{}
+	if adoptedDir != "" {
+		dirs = append(dirs, adoptedDir)
+	}
+	for _, d := range listRomsFolders() {
+		if d == adoptedDir {
+			continue
+		}
+		if strings.EqualFold(tagFromFolderName(d), tag) || strings.EqualFold(d, tag) {
+			dirs = append(dirs, d)
+		}
+	}
+	for _, d := range dirs {
+		entries, err := os.ReadDir(filepath.Join(sdcardRoot(), "Roms", d))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			n := e.Name()
+			if e.IsDir() || strings.HasPrefix(n, ".") || platform.HasLeadingMarker(n) {
+				continue
+			}
+			key := strings.ToLower(n)
+			if _, dup := out[key]; dup {
+				continue // first-seen (adopted-folder-first) wins
+			}
+			fi, ferr := e.Info()
+			if ferr != nil {
+				continue
+			}
+			out[key] = adoptCandidate{
+				abs:  filepath.Join(sdcardRoot(), "Roms", d, n),
+				size: fi.Size(),
+			}
+		}
+	}
+	return out
+}
+
+// pruneUnplayableStubs removes MIRROR-OWNED 0-byte stub files from a mapped
+// platform's Roms folder when that platform has no installed emulator pak —
+// self-healing a config that still maps a system the device can't launch (DS/3DS/
+// PSP on a Mini Flip).
+//
+// MANIFEST-SCOPED (C1 design audit V1): the old prune deleted EVERY 0-byte file in
+// the mapped folder and RemoveAll'd the folder when only .media remained — in
+// merge mode the mapped folder is the USER's adopted folder, so that deleted their
+// placeholder files and could remove their folder including their own box art. Now
+// a file goes only when the manifest owns it as a stub (or the conservative
+// triple-gate re-claims it on a manifest-less legacy card), the folder goes only
+// when the manifest owns the FOLDER and our own covers are all that's left, and
+// os.RemoveAll is gone entirely (os.Remove fails on non-empty — structurally
+// incapable of taking user files with it). Real (non-zero) files are never
+// touched, manifest-owned or not.
+func pruneUnplayableStubs(cfg *config.Config, p romm.Platform, man *platform.Manifest, resolves func(string) bool) {
 	m, ok := cfg.DirectoryMappings[p.FsSlug]
 	if !ok || m.RelativePath == "" {
 		return
@@ -563,31 +847,53 @@ func pruneUnplayableStubs(cfg *config.Config, p romm.Platform) {
 	if err != nil {
 		return
 	}
-	removed := 0
+	removed, kept := 0, 0
 	for _, e := range entries {
 		if e.IsDir() {
-			continue // leave .media and any subfolders
+			continue // .media handled below; other subfolders never touched
 		}
-		if info, ierr := e.Info(); ierr == nil && info.Size() == 0 {
-			if os.Remove(filepath.Join(dir, e.Name())) == nil {
-				removed++
-			}
+		info, ierr := e.Info()
+		if ierr != nil || info.Size() != 0 {
+			continue // real bytes: never prunable, whoever owns them
 		}
-	}
-	// If only cover art (or nothing) is left — i.e. no real downloads — drop the folder.
-	rest, _ := os.ReadDir(dir)
-	onlyMedia := true
-	for _, e := range rest {
-		if e.Name() != ".media" {
-			onlyMedia = false
-			break
+		fp := filepath.Join(dir, e.Name())
+		if !man.OwnsKind(fp, platform.ManifestStub) && !platform.ReclaimableStub(fp, resolves) {
+			kept++ // not ours to delete (user placeholder / unknowable) — leave it
+			continue
 		}
-	}
-	if onlyMedia {
-		_ = os.RemoveAll(dir)
+		if os.Remove(fp) == nil {
+			man.Forget(fp)
+			removed++
+		}
 	}
 	if removed > 0 {
 		fmt.Fprintf(os.Stderr, "MIRROR prune %s: removed %d un-launchable stub(s) (no Emus pak)\n", p.FsSlug, removed)
+	}
+	if kept > 0 {
+		fmt.Fprintf(os.Stderr, "MIRROR prune %s: kept %d 0-byte file(s) not owned by the mirror\n", p.FsSlug, kept)
+	}
+
+	// Folder teardown — only when the MIRROR created the folder. Our own covers in
+	// .media are deleted (they're manifest-owned), then .media and the folder are
+	// removed with plain os.Remove: if the user put ANYTHING here, the remove
+	// fails silently and everything stays.
+	if !man.OwnsKind(dir, platform.ManifestFolder) {
+		return
+	}
+	media := filepath.Join(dir, ".media")
+	if mediaEntries, merr := os.ReadDir(media); merr == nil {
+		for _, e := range mediaEntries {
+			cp := filepath.Join(media, e.Name())
+			if !e.IsDir() && man.OwnsKind(cp, platform.ManifestCover) {
+				if os.Remove(cp) == nil {
+					man.Forget(cp)
+				}
+			}
+		}
+		_ = os.Remove(media) // only falls if empty
+	}
+	if os.Remove(dir) == nil { // only falls if empty
+		man.Forget(dir)
 	}
 }
 

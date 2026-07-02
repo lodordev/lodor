@@ -172,6 +172,9 @@ func (c *Client) doJSON(method, path string, body, out any) error {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
+		if aerr := authErrorFromStatus(resp.StatusCode, raw); aerr != nil {
+			return aerr
+		}
 		return fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(raw))
 	}
 
@@ -209,6 +212,9 @@ func (c *Client) doRaw(method, path string) ([]byte, error) {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if aerr := authErrorFromStatus(resp.StatusCode, raw); aerr != nil {
+			return nil, aerr
+		}
 		return nil, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(raw))
 	}
 	return raw, nil
@@ -242,6 +248,9 @@ func (c *Client) doRawStreamTo(path string, dst io.Writer, onProgress func(done,
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if aerr := authErrorFromStatus(resp.StatusCode, snippet); aerr != nil {
+			return 0, aerr
+		}
 		return 0, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(snippet))
 	}
 	w := dst
@@ -323,6 +332,9 @@ func (c *Client) doMultipart(path string, query url.Values, fileField, fileName 
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
+		if aerr := authErrorFromStatus(resp.StatusCode, raw); aerr != nil {
+			return aerr
+		}
 		return fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(raw))
 	}
 

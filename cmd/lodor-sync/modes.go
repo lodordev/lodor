@@ -45,7 +45,7 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 	} else {
 		fmt.Println("RESULT downloaded=0")
 	}
-	os.Exit(0)
+	exitMode(0)
 }
 
 // downloadRomCore does the actual single-ROM download work and returns true iff a
@@ -63,6 +63,7 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	}
 	rom, err := client.GetRom(id)
 	if err != nil || rom.ID == 0 {
+		noteAuthErr(err)
 		fmt.Fprintf(os.Stderr, "DLFAIL getrom id=%d\n", id)
 		return false
 	}
@@ -79,6 +80,19 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 		return false
 	}
 
+	// V5 gate (C1 design audit): a download FILL removes/overwrites whatever sits
+	// at dest, so dest must be OURS — manifest-owned, or an unmanifested stub the
+	// triple gate re-claims (legacy card). A USER's 0-byte file that happens to
+	// carry a canonical name (the merge dedup edge) is neither, and their REAL file
+	// is never replaced with the server's copy. Honest refusal, nothing touched.
+	man := platform.LoadManifest()
+	if !downloadDestAllowed(cfg, man, dest) {
+		fmt.Fprintf(os.Stderr, "DLFAIL not-lodor-managed: %s\n", filepath.Base(dest))
+		writePhase("This file isn't managed by Lodor")
+		writeProgress(0)
+		return false
+	}
+
 	romName := rom.Name
 	if romName == "" {
 		romName = filepath.Base(rom.FsName)
@@ -88,7 +102,7 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	// mod_zip, OR each disc individually via a single file_ids selector. We download
 	// disc-by-disc (streamed, no OOM; per-disc hash-verified) and write the .m3u.
 	if rom.HasMultipleFiles {
-		return downloadMultiDiscCore(client, cfg, rom, romName)
+		return downloadMultiDiscCore(client, cfg, rom, romName, man)
 	}
 
 	// BROKEN IMPORT GUARD: a single-file rom whose only file is a bare `.m3u` is a
@@ -107,7 +121,7 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	// onDiskExt), so dest is e.g. ".../Advance Wars.nds"; download the .7z, verify it, and
 	// extract the inner ROM into dest. Paid once — the raw file persists.
 	if _, ok := platform.ArchiveExtractTargetForRom(rom); ok {
-		return downloadAndExtractArchive(client, cfg, rom, dest, romName)
+		return downloadAndExtractArchive(client, cfg, rom, dest, romName, man)
 	}
 
 	writePhase(fmt.Sprintf("Downloading %s…", romName))
@@ -138,6 +152,7 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out, onProg)
 	cErr := out.Close()
 	if derr != nil || cErr != nil || n == 0 {
+		noteAuthErr(derr)
 		_ = os.Remove(tmp)
 		fmt.Fprintf(os.Stderr, "DLFAIL download rom=%d\n", rom.ID)
 		writeProgress(0)
@@ -149,6 +164,7 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	if rErr := os.Rename(tmp, dest); rErr != nil {
 		fmt.Fprintf(os.Stderr, "DLFAIL rename rom=%d\n", rom.ID)
 		_ = os.Remove(tmp)
+		restoreStub(dest)
 		return false
 	}
 
@@ -156,21 +172,82 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	if vErr := verifyRomHash(rom, dest); vErr != nil {
 		fmt.Fprintf(os.Stderr, "DLFAIL verify rom=%d: %s\n", rom.ID, vErr)
 		_ = os.Remove(dest)
+		restoreStub(dest)
 		writeProgress(0)
 		return false
 	}
 	writeProgress(100)
 
-	fetchRomCover(client, rom, dest)
+	fetchRomCover(client, rom, dest, man)
+	recordDownload(man, dest, rom.ID)
 
 	return true
+}
+
+// downloadDestAllowed is the V5 choke-point check: may the download path
+// remove/replace what currently sits at dest?
+//
+//   - nothing at dest            -> yes (purely additive write)
+//   - manifest-owned             -> yes (our stub being filled, or our own
+//     download being re-pulled)
+//   - unmanifested 0-byte STUB   -> only via the ReclaimableStub triple gate
+//     (0-byte + cloud-marker on marker-baking hosts + catalog-resolves) — the
+//     legacy-card heal; a user's 0-byte file has no marker and is refused
+//   - unmanifested REAL file     -> never (the user's game is not ours to replace)
+func downloadDestAllowed(cfg *config.Config, man *platform.Manifest, dest string) bool {
+	fi, err := os.Stat(dest)
+	if err != nil {
+		return true // nothing there — additive
+	}
+	if fi.IsDir() {
+		return false
+	}
+	if man.Owns(dest) {
+		return true
+	}
+	if fi.Size() != 0 {
+		return false // real, unmanifested bytes: not ours
+	}
+	return platform.ReclaimableStub(dest, func(p string) bool {
+		_, ok := catalog.ResolveRomID(cfg, p)
+		return ok
+	})
+}
+
+// recordDownload marks a landed download in the mirror-owned manifest (one atomic
+// save per download). Failure is non-fatal: an unrecorded download is merely
+// demoted to user-like until the next mirror pass re-records it — it can't be
+// evicted in the window, never the unsafe direction.
+func recordDownload(man *platform.Manifest, dest string, romID int) {
+	man.Record(dest, platform.ManifestDownload, romID)
+	if err := man.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "MANIFEST save failed after download: %v\n", err)
+	}
+}
+
+// restoreStub re-creates the 0-byte cloud stub at dest after a failed download that
+// had already removed it (rename/extract/hash-verify failures — the early transfer
+// failures never touch the stub). A launch-time failure must leave the SAME honest
+// on-card state it found: a 0-byte stub the emulator fails fast on and the library
+// still lists — never a deleted entry, never a corrupt partial file (task #120).
+// No-op if something already exists at dest.
+func restoreStub(dest string) {
+	if dest == "" {
+		return
+	}
+	if _, err := os.Stat(dest); err == nil {
+		return
+	}
+	if f, err := os.Create(dest); err == nil {
+		_ = f.Close()
+	}
 }
 
 // downloadAndExtractArchive handles a ROM stored in a .7z the standalone emulator can't
 // open (NDS/DraStic): download the .7z, hash-verify it (RomM's hash is of the stored .7z),
 // then extract the single inner ROM into dest (which is already named with the raw .nds
 // extension, via onDiskExt). Logs the real on-device extract time (EXTRACT line).
-func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm.Rom, dest, romName string) bool {
+func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm.Rom, dest, romName string, man *platform.Manifest) bool {
 	writePhase(fmt.Sprintf("Downloading %s…", romName))
 	_ = os.MkdirAll(filepath.Dir(dest), 0o755)
 	arc := dest + ".7z.dl"
@@ -194,6 +271,7 @@ func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm
 	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out, onProg)
 	cErr := out.Close()
 	if derr != nil || cErr != nil || n == 0 {
+		noteAuthErr(derr)
 		_ = os.Remove(arc)
 		fmt.Fprintf(os.Stderr, "DLFAIL download rom=%d\n", rom.ID)
 		writeProgress(0)
@@ -209,6 +287,7 @@ func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm
 		fmt.Fprintf(os.Stderr, "DLFAIL extract rom=%d: %s\n", rom.ID, eErr)
 		_ = os.Remove(arc)
 		_ = os.Remove(dest)
+		restoreStub(dest)
 		writeProgress(0)
 		return false
 	}
@@ -219,6 +298,7 @@ func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm
 	if vErr := verifyRomHash(rom, dest); vErr != nil {
 		fmt.Fprintf(os.Stderr, "DLFAIL verify rom=%d: %s\n", rom.ID, vErr)
 		_ = os.Remove(dest)
+		restoreStub(dest)
 		writeProgress(0)
 		return false
 	}
@@ -226,7 +306,8 @@ func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm
 		fmt.Fprintf(os.Stderr, "EXTRACT 7z rom=%d raw=%dB %dms\n", rom.ID, st.Size(), ms)
 	}
 	writeProgress(100)
-	fetchRomCover(client, rom, dest)
+	fetchRomCover(client, rom, dest, man)
+	recordDownload(man, dest, rom.ID)
 	return true
 }
 
@@ -326,10 +407,16 @@ func isBareM3U(rom romm.Rom) bool {
 // Best-effort, never gating the RESULT; honors pkg cover's skip-existing / no-cover /
 // graceful-error contract. coverAnchor is the path cover.MediaPath() keys off — the
 // .m3u for a multi-disc game, the rom file for a single-file game.
-func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string) {
+// man records a SAVED cover as mirror-owned (kind=cover) so uninstall can remove
+// it; the caller persists the manifest (recordDownload's save covers it).
+func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string, man *platform.Manifest) {
 	if cp := rom.CoverPath(); cp != "" {
-		if out, cerr := cover.FetchAndSave(client, cp, coverAnchor, false); out == cover.OutcomeError && cerr != nil {
+		out, cerr := cover.FetchAndSave(client, cp, coverAnchor, false)
+		if out == cover.OutcomeError && cerr != nil {
 			fmt.Fprintf(os.Stderr, "COVERWARN rom=%d: %s\n", rom.ID, safeErr(cerr))
+		}
+		if out == cover.OutcomeSaved {
+			man.Record(cover.MediaPath(coverAnchor), platform.ManifestCover, rom.ID)
 		}
 	}
 }
@@ -349,7 +436,7 @@ func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string) {
 // Discs land in <Roms>/<system>/<FsNameNoExt>/<disc>.chd; the .m3u (at <FsNameNoExt>.m3u
 // beside that folder) lists "<FsNameNoExt>/<disc>" lines, resolved relative to the m3u
 // dir by both the launcher (getFirstDisc) and the emulator's m3u loader.
-func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom, romName string) bool {
+func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom, romName string, man *platform.Manifest) bool {
 	if len(rom.Files) == 0 {
 		fmt.Fprintf(os.Stderr, "DLFAIL multidisc rom=%d: no files[]\n", rom.ID)
 		writePhase("This game needs re-importing on the server")
@@ -362,6 +449,36 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 	if m3uPath == "" || discDir == "" {
 		fmt.Fprintf(os.Stderr, "DLFAIL multidisc dest-empty rom=%d\n", rom.ID)
 		return false
+	}
+
+	// V5 gate, m3u leg: the canonical m3uPath may differ from the launcher-passed
+	// (marked) romPath the caller already gated — e.g. an ADOPTED user .m3u in
+	// merge mode. It is removed before the playlist rename below, so it must pass
+	// the same ownership check.
+	if !downloadDestAllowed(cfg, man, m3uPath) {
+		fmt.Fprintf(os.Stderr, "DLFAIL not-lodor-managed m3u rom=%d\n", rom.ID)
+		writePhase("This file isn't managed by Lodor")
+		writeProgress(0)
+		return false
+	}
+
+	// V5 gate, disc-folder leg: the per-game disc folder is written into (and
+	// RemoveAll'd on failure by cleanupMultiDisc), so a PRE-EXISTING folder there
+	// that the manifest doesn't own — the user's own same-named game folder — must
+	// refuse the download rather than risk their files. A folder we're about to
+	// create is recorded as ours FIRST (record-intent-then-act).
+	if fi, serr := os.Stat(discDir); serr == nil {
+		if !fi.IsDir() || !man.Owns(discDir) {
+			fmt.Fprintf(os.Stderr, "DLFAIL not-lodor-managed discdir rom=%d\n", rom.ID)
+			writePhase("This file isn't managed by Lodor")
+			writeProgress(0)
+			return false
+		}
+	} else {
+		man.Record(discDir, platform.ManifestFolder, rom.ID)
+		if err := man.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "MANIFEST save failed before multidisc: %v\n", err)
+		}
 	}
 
 	if mkErr := os.MkdirAll(discDir, 0o755); mkErr != nil {
@@ -417,6 +534,7 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		n, dErr := client.DownloadRomFileTo(rom.ID, rom.FsName, f.ID, out, onProg)
 		cerr2 := out.Close()
 		if dErr != nil || cerr2 != nil || n == 0 {
+			noteAuthErr(dErr)
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc download rom=%d disc=%d: %s\n", rom.ID, i+1, safeErr(dErr))
 			_ = os.Remove(tmp)
 			cleanupMultiDisc(discDir)
@@ -461,7 +579,8 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 	}
 	writeProgress(100)
 
-	fetchRomCover(client, rom, m3uPath)
+	fetchRomCover(client, rom, m3uPath, man)
+	recordDownload(man, m3uPath, rom.ID) // the .m3u is the evictable download anchor
 
 	return true
 }
@@ -588,9 +707,10 @@ func runDownloadBios(client *romm.Client, cfg *config.Config) {
 	if err != nil {
 		// Couldn't list platforms — treat as reachable-but-nothing-done rather than a
 		// hard error so the launcher still gets a parseable RESULT.
+		noteAuthErr(err)
 		fmt.Fprintf(os.Stderr, "BIOSFAIL platforms: %s\n", safeErr(err))
 		fmt.Println("RESULT bios=0")
-		os.Exit(0)
+		exitMode(0)
 	}
 
 	count := 0
@@ -618,6 +738,7 @@ func runDownloadBios(client *romm.Client, cfg *config.Config) {
 
 			data, derr := client.DownloadFirmwareContent(f.ID, f.FileName)
 			if derr != nil || len(data) == 0 {
+				noteAuthErr(derr)
 				continue
 			}
 			wrote := false
@@ -638,7 +759,7 @@ func runDownloadBios(client *romm.Client, cfg *config.Config) {
 		}
 	}
 	fmt.Printf("RESULT bios=%d\n", count)
-	os.Exit(0)
+	exitMode(0)
 }
 
 // runPushPending uploads every save in pending-saves.txt via sync.PushSaveDirect and
@@ -724,11 +845,12 @@ func runPushPending(client *romm.Client, cfg *config.Config) {
 		fmt.Fprintf(os.Stderr, "QUEUEWARN rewrite failed: %s\n", safeErr(err))
 	}
 
+	notePushResults(allResults)
 	fmt.Printf("RESULT pushed=%d total=%d stuck=%d\n", pushed, len(allResults), stuck)
 	for _, s := range stuckLines {
 		fmt.Println(s)
 	}
-	os.Exit(0)
+	exitMode(0)
 }
 
 // stuckReason maps a non-landed push outcome to a short, human, host-free reason the
@@ -742,6 +864,10 @@ func stuckReason(r sync.PushResult) string {
 		return "no save file found on the card"
 	case sync.OutcomeUploadError:
 		return "upload failed — check Wi-Fi and retry"
+	case sync.OutcomeHashMismatch:
+		return "server copy couldn't be verified — will retry"
+	case sync.OutcomeEmptyLocalSave:
+		return "save file on the card is empty — not uploaded"
 	default:
 		return ""
 	}
@@ -762,21 +888,70 @@ func entryLanded(results []sync.PushResult) bool {
 	return true
 }
 
-// runSyncSave pulls any newer server save then pushes the local save for ONE ROM
-// (the per-game two-way sync). Contract: RESULT pulled=<0|1> pushed=<0|1>.
+// runSyncSave pulls per the content-hash lineage decision then pushes the local
+// save for ONE ROM (the per-game two-way sync). Contract:
+//
+//	RESULT pulled=<0|1> pushed=<0|1> ghosts=<N> reason=<token>
+//
+// ghosts counts the server-side save records for this ROM whose bytes are
+// missing/zero (#63). reason (APPENDED field, A2 — earlier fields unchanged for
+// existing parsers) is the machine token for WHY the pull leg decided what it did:
+//
+//	in-sync         local content == newest server revision (nothing moved)
+//	older-lineage   local matched an OLDER revision → newest pulled (.bak kept)
+//	no-local        no local save existed → newest pulled
+//	unpushed-local  local matched NO revision → never overwritten; push leg uploads it
+//	no-server-save  server has no (non-ghost) save for this ROM
+//	offline         the server couldn't be reached — NOT "in sync" (the pre-A2
+//	                0/0 line let the pak claim "already in sync" while offline)
+//	resolve         the ROM didn't match a RomM game / has no save directory
+//	snapshot        flashback lose-proof abort
+//
+// pushed=1 now means a REAL verified upload traveled (sync.Uploaded) — a
+// content-identical save already on the server reports pushed=0 + reason=in-sync
+// instead of stacking a duplicate revision (pre-upload dedup, A2).
 func runSyncSave(client *romm.Client, cfg *config.Config, romPath string) {
 	writeProgress(0)
-	writePhase("Pulling latest…")
+	writePhase("Checking your save…")
 	pull := sync.PullSaveDirect(client, cfg, romPath)
+	notePullResult(pull)
 
 	writeProgress(50)
 	writePhase("Backing up your save…")
 	pushResults := sync.PushSaveDirect(client, cfg, romPath)
-	pushed, _, _ := sync.Counts(pushResults)
+	notePushResults(pushResults)
+	uploaded := sync.Uploaded(pushResults)
 
 	writeProgress(100)
-	fmt.Printf("RESULT pulled=%d pushed=%d\n", b2i(pull.Pulled()), b2i(pushed >= 1))
-	os.Exit(0)
+	fmt.Printf("RESULT pulled=%d pushed=%d ghosts=%d reason=%s\n",
+		b2i(pull.Pulled()), b2i(uploaded >= 1), pull.Ghosts, pullReasonToken(pull))
+	exitMode(0)
+}
+
+// pullReasonToken maps a PullResult to the stable machine token the RESULT
+// reason= field carries (see runSyncSave). Host-free, no spaces.
+func pullReasonToken(r sync.PullResult) string {
+	switch r.Outcome {
+	case sync.PullWritten:
+		if r.Reason != "" {
+			return r.Reason // "no-local" | "older-lineage"
+		}
+		return "pulled"
+	case sync.PullInSync:
+		return "in-sync"
+	case sync.PullLocalUnpushed:
+		return "unpushed-local"
+	case sync.PullNoServerSave:
+		return "no-server-save"
+	case sync.PullError:
+		return "offline"
+	case sync.PullResolveFail:
+		return "resolve"
+	case sync.PullSnapshotFail:
+		return "snapshot"
+	default:
+		return "unknown"
+	}
 }
 
 // runPushSave is the HYBRID post-game save sync for ONE ROM (the minarch shim's
@@ -794,15 +969,18 @@ func runSyncSave(client *romm.Client, cfg *config.Config, romPath string) {
 // number of pending entries recorded for later upload (>=1 whenever a save existed).
 func runPushSave(client *romm.Client, cfg *config.Config, romPath string) {
 	results := sync.PushSaveDirect(client, cfg, romPath)
+	notePushResults(results)
 	if entryLanded(results) {
 		pushed, _, _ := sync.Counts(results)
-		// Landed → write the launcher's synced-✓ signal. Best-effort: a failed signal
-		// write must not turn a real, verified upload into a reported failure.
+		// Landed (server-VERIFIED — entryLanded only accepts Pushed/AlreadyOnServer,
+		// both now hash-confirmed) → write the launcher's synced-✓ signal.
+		// Best-effort: a failed signal write must not turn a real, verified upload
+		// into a reported failure.
 		if err := writeLastSynced(romPath, pushed); err != nil {
 			fmt.Fprintf(os.Stderr, "push-save: WARN couldn't write synced signal: %s\n", safeErr(err))
 		}
 		fmt.Printf("RESULT pushed=1 staged=0\n")
-		os.Exit(0)
+		exitMode(0)
 	}
 
 	// Not landed → stage the current save bytes and queue them for a later upload
@@ -833,7 +1011,7 @@ func runPushSave(client *romm.Client, cfg *config.Config, romPath string) {
 		}
 	}
 	fmt.Printf("RESULT pushed=0 staged=%d\n", staged)
-	os.Exit(0)
+	exitMode(0)
 }
 
 // writeLastSynced records a just-LANDED push as the launcher's synced-✓ signal at
@@ -872,30 +1050,79 @@ func runReconcile(cfg *config.Config, romPath string) {
 	os.Exit(0)
 }
 
+// runEvict is --reconcile's mirror image (task #125 — the Game Manager's "Delete
+// from card"): remove ONE downloaded ROM's bytes and leave its 0-byte cloud stub
+// (✓→✘), the save + cover riding the rename so nothing is deleted or orphaned. A
+// multi-disc .m3u's referenced disc files are deleted too. Contract:
+// RESULT evicted=<0|1> [reason=missing|stub|resolve|truncate]. Offline; exit 0
+// either way — the reason token is the honest failure signal.
+func runEvict(cfg *config.Config, romPath string) {
+	evicted, reason := catalog.EvictToStub(cfg, romPath)
+	if evicted {
+		fmt.Println("RESULT evicted=1")
+	} else {
+		fmt.Printf("RESULT evicted=0 reason=%s\n", reason)
+	}
+	os.Exit(0)
+}
+
 // runListSaves prints every server save for one ROM, NEWEST FIRST, one tab-separated
-// line per save and nothing else:
+// line per save:
 //
-//	<save_id>\t<YYYY-MM-DD HH:MM>\t<device-or-emulator>\t<size_kb>KB
+//	<save_id>\t<YYYY-MM-DD HH:MM>\t<device-or-emulator>\t<size_kb>KB[\tCURRENT]
+//
+// plus, AFTER the rows, one single-field trailer line (A3 — no tab, so every
+// existing `awk -F'\t' NF>=2` row filter drops it):
+//
+//	LOCAL=<none|current|older|unpushed>
+//
+// summarizing how the save THIS LAUNCH WILL LOAD relates to the listed set. STRICT
+// semantics (task #135): the trailer is judged against the launched basename's OWN
+// save file (sync.PrimaryLocalSaveFilesForRomPath), never a coexist twin's, and
+// "current" requires a match with the NEWEST non-ghost revision (none = the launched
+// name has no local save; current = it matches the newest revision; older = it
+// matches an older revision only; unpushed = it matches no revision — unpushed local
+// progress). The pre-launch hook keys its prompt/pull/silent decision off this
+// trailer. The row-level CURRENT tag keeps the AGGREGATE any-local-file semantics —
+// "these bytes are on this device" is the Game Manager's display truth, possibly via
+// the twin's save file. Different jobs; do not conflate (Smart Pro 2026-07-03: the
+// twin's save matched the newest revision, the aggregate signal read "current", and
+// the clean twin silently launched into its OLDER save).
 //
 // "who" is the first device sync's DeviceName when present, else the emulator. Zero
-// saves (or an unmanaged ROM) → print nothing, exit 0.
+// saves (or an unmanaged ROM) → print nothing, exit 0. GHOST records (#63 — bytes
+// missing/zero on the server) are SKIPPED entirely: an unrestorable revision must
+// never be offered in the rollback menu. Pairing-expired → exit 6, stdout stays a
+// pure list (see authgate.go). A GetSaves failure now exits 3 (reachability, like
+// every other net mode) — pre-A3 it exited 0 with empty output, making "your server
+// is unreachable" indistinguishable from "no saves exist" (the Smart Pro
+// 2026-07-02 "No server saves for ✓ Pokemon Emerald" field lie).
 func runListSaves(client *romm.Client, cfg *config.Config, romPath string) {
 	id, ok := catalog.ResolveRomID(cfg, romPath)
 	if !ok || id == 0 {
 		os.Exit(0) // unmanaged ROM — nothing to list
 	}
-	saves, err := client.GetSaves(romm.SaveQuery{RomID: id})
-	if err != nil || len(saves) == 0 {
+	allSaves, err := client.GetSaves(romm.SaveQuery{RomID: id})
+	if err != nil {
+		noteAuthErr(err)
+		fmt.Fprintf(os.Stderr, "FATAL list-saves: %s\n", safeErr(err))
+		exitModeQuiet(3)
+	}
+	saves, _ := sync.SplitGhosts(allSaves)
+	if len(saves) == 0 {
 		os.Exit(0)
 	}
 	sort.Slice(saves, func(i, j int) bool { return saves[i].UpdatedAt.After(saves[j].UpdatedAt) })
 
-	// Determine which server revision matches the bytes CURRENTLY on the device, so the
-	// launcher can mark it. The signal is RomM's per-save content_hash (the MD5 of the save
-	// bytes) compared against the MD5 of the on-device save file(s) — the exact same signal
-	// AlreadyOnServer trusts for dedup. Mark only the NEWEST matching revision (saves are
-	// sorted newest-first), and only when the server actually exposes a content_hash AND a
-	// local save exists; otherwise emit NO marker rather than guess (honest by omission).
+	// ROW-LEVEL CURRENT tag — the Game Manager's "(on this device)" display: which server
+	// revision's bytes exist in ANY of this ROM's local save files (both coexist twins).
+	// The signal is RomM's per-save content_hash (the MD5 of the save bytes) compared
+	// against the MD5 of the on-device save file(s) — the exact same signal AlreadyOnServer
+	// trusts for dedup. Mark only the NEWEST matching revision (saves are sorted
+	// newest-first), and only when the server actually exposes a content_hash AND a local
+	// save exists; otherwise emit NO marker rather than guess (honest by omission).
+	// NOTE (task #135): this aggregate mark is display truth ONLY — the launch decision
+	// lives in the LOCAL= trailer below, which is per-launched-file strict.
 	localHashes := sync.LocalSaveHashesForRom(client, cfg, romPath)
 	matchesDevice := func(s romm.Save) bool {
 		if s.ContentHash == nil {
@@ -909,7 +1136,7 @@ func runListSaves(client *romm.Client, cfg *config.Config, romPath string) {
 		return false
 	}
 
-	markedCurrent := false
+	markedCurrent := false // the NEWEST matching row got the CURRENT tag
 	for _, s := range saves {
 		who := s.Emulator
 		if len(s.DeviceSyncs) > 0 && s.DeviceSyncs[0].DeviceName != "" {
@@ -925,7 +1152,12 @@ func runListSaves(client *romm.Client, cfg *config.Config, romPath string) {
 		fmt.Printf("%d\t%s\t%s\t%dKB%s\n",
 			s.ID, s.UpdatedAt.Format("2006-01-02 15:04"), who, s.FileSizeBytes/1024, mark)
 	}
-	os.Exit(0)
+	// LOCAL= trailer (single field — row parsers drop it; see contract above). STRICT
+	// (task #135): judged against the save file the LAUNCH will load, not any twin's,
+	// and "current" only against the NEWEST revision — see ListSavesLocalState.
+	fmt.Printf("LOCAL=%s\n",
+		sync.ListSavesLocalState(saves, sync.PrimaryLocalSaveFilesForRomPath(client, cfg, romPath)))
+	exitModeQuiet(0)
 }
 
 // runRestoreSave flashes one specific server save (by id) onto the local save file.
@@ -951,8 +1183,9 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 	}
 	saves, err := client.GetSaves(romm.SaveQuery{RomID: id})
 	if err != nil {
+		noteAuthErr(err)
 		fmt.Println("RESULT restored=0 reason=download")
-		os.Exit(0)
+		exitMode(0)
 	}
 	var chosen romm.Save
 	found := false
@@ -967,12 +1200,20 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 		fmt.Println("RESULT restored=0 reason=notfound")
 		os.Exit(0)
 	}
+	// GHOST GUARD (#63): the chosen record has no stored bytes — it cannot be
+	// restored (the listing already hides ghosts; this covers a direct call).
+	if sync.IsGhostSave(chosen) {
+		fmt.Println("RESULT restored=0 reason=ghost")
+		os.Exit(0)
+	}
 
 	// Preserve the current save before the overwrite. Push it to the timeline now; if
 	// that doesn't land (offline), stage each current save file and queue it for later.
 	staged := 0
 	if current := sync.LocalSaveFilesForRom(client, cfg, romPath); len(current) > 0 {
-		if !entryLanded(sync.PushSaveDirect(client, cfg, romPath)) {
+		preserve := sync.PushSaveDirect(client, cfg, romPath)
+		notePushResults(preserve)
+		if !entryLanded(preserve) {
 			for _, f := range current {
 				sp, serr := stageSaveFile(f)
 				if serr != nil {
@@ -990,6 +1231,7 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 	}
 
 	res := sync.RestoreSave(client, cfg, romPath, chosen)
+	notePullResult(res)
 	if res.Pulled() {
 		fmt.Printf("RESULT restored=1 staged=%d\n", staged)
 	} else {
@@ -999,7 +1241,7 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 		}
 		fmt.Printf("RESULT restored=0 reason=%s\n", reason)
 	}
-	os.Exit(0)
+	exitMode(0)
 }
 
 // runSyncFeed lists recent server saves across the MAPPED platforms, deduped by save
@@ -1012,7 +1254,8 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 func runSyncFeed(client *romm.Client, cfg *config.Config) {
 	platforms, err := mappedPlatforms(client, cfg)
 	if err != nil {
-		os.Exit(0) // unreachable / no platforms — an empty feed, not a hard error
+		noteAuthErr(err)
+		exitModeQuiet(0) // unreachable / no platforms — an empty feed, not a hard error
 	}
 
 	var saves []romm.Save
@@ -1020,9 +1263,13 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 	for _, p := range platforms {
 		ps, gerr := client.GetSaves(romm.SaveQuery{PlatformID: p.ID})
 		if gerr != nil {
+			noteAuthErr(gerr)
 			continue
 		}
 		for _, s := range ps {
+			if sync.IsGhostSave(s) {
+				continue // a byte-less record isn't a playable session — keep it out of the feed
+			}
 			if !seen[s.ID] {
 				seen[s.ID] = true
 				saves = append(saves, s)
@@ -1030,14 +1277,16 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 		}
 	}
 	if len(saves) == 0 {
-		os.Exit(0)
+		exitModeQuiet(0)
 	}
 	sort.Slice(saves, func(i, j int) bool { return saves[i].UpdatedAt.After(saves[j].UpdatedAt) })
 	if len(saves) > 20 {
 		saves = saves[:20]
 	}
 	for _, s := range saves {
-		game := s.FileNameNoExt
+		// Historical marker-named records (pre-#126 uploads) still display clean:
+		// the leading ✘/✓ is a device-local artifact, never part of the game name.
+		game := platform.StripLeadingMarker(s.FileNameNoExt)
 		if e := filepath.Ext(game); len(e) >= 2 && len(e) <= 5 {
 			game = strings.TrimSuffix(game, e)
 		}
@@ -1047,7 +1296,7 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 		}
 		fmt.Printf("%s\t%s\t%s\n", game, s.UpdatedAt.Format("2006-01-02 15:04"), device)
 	}
-	os.Exit(0)
+	exitModeQuiet(0)
 }
 
 // runRecent prints the single most-recently-played game across mapped platforms — the
@@ -1059,16 +1308,21 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 func runRecent(client *romm.Client, cfg *config.Config) {
 	platforms, err := mappedPlatforms(client, cfg)
 	if err != nil {
-		os.Exit(0)
+		noteAuthErr(err)
+		exitModeQuiet(0)
 	}
 	var newest romm.Save
 	found := false
 	for _, p := range platforms {
 		ps, gerr := client.GetSaves(romm.SaveQuery{PlatformID: p.ID})
 		if gerr != nil {
+			noteAuthErr(gerr)
 			continue
 		}
 		for _, s := range ps {
+			if sync.IsGhostSave(s) {
+				continue // a ghost (#63) must never drive the Continue tile
+			}
 			if !found || s.UpdatedAt.After(newest.UpdatedAt) {
 				newest = s
 				found = true
@@ -1076,11 +1330,12 @@ func runRecent(client *romm.Client, cfg *config.Config) {
 		}
 	}
 	if !found {
-		os.Exit(0)
+		exitModeQuiet(0)
 	}
 	rom, rerr := client.GetRom(newest.RomID)
 	if rerr != nil || rom.ID == 0 {
-		os.Exit(0)
+		noteAuthErr(rerr)
+		exitModeQuiet(0)
 	}
 	path := platform.LocalRomPath(cfg, rom)
 	if path == "" {
@@ -1095,7 +1350,7 @@ func runRecent(client *romm.Client, cfg *config.Config) {
 		device = newest.DeviceSyncs[0].DeviceName
 	}
 	fmt.Printf("%s\t%s\t%s\t%s\n", path, game, newest.UpdatedAt.Format("2006-01-02 15:04"), device)
-	os.Exit(0)
+	exitModeQuiet(0)
 }
 
 // mappedPlatforms returns the RomM platforms the user has a directory mapping for,
@@ -1116,4 +1371,156 @@ func mappedPlatforms(client *romm.Client, cfg *config.Config) ([]romm.Platform, 
 		}
 	}
 	return out, nil
+}
+
+// sdRoot mirrors catalog's card-root resolution for the modes that turn the index's
+// SDCARD-relative paths back into absolute on-card paths.
+func sdRoot() string {
+	sd := os.Getenv("SDCARD_PATH")
+	if sd == "" {
+		sd = "/mnt/SDCARD"
+	}
+	return sd
+}
+
+// runPullSaves is the TARGETED bulk save pull (task #133, the fast half of "Sync now"):
+// one GetSaves per mapped platform finds every game with a real (non-ghost) server
+// save; each of those that is mirrored on THIS card gets the same per-ROM
+// PullSaveDirect the pre-launch hook uses (newest-wins, .bak before overwrite, ghosts
+// filtered) — so after it runs, every on-card game carries its latest cross-device
+// save. Games with no server save are never touched; no catalog mirror is involved.
+// Contract:
+//
+//	RESULT pulled=<N> checked=<M> ghosts=<G>
+//
+// checked = candidates on this card that had a server save; pulled = local files
+// actually written (LocalNewer/NoServerSave count as checked, not pulled). No local
+// index yet (fresh device before any Refresh) => pulled=0 checked=0, exit 0 — honest
+// no-op, the seed/Refresh path owns first population. Total platform-list failure is
+// a reachability error: exit 3 like the other net modes.
+func runPullSaves(client *romm.Client, cfg *config.Config) {
+	writeProgress(0)
+	writePhase("Checking saves…")
+
+	idPath := catalog.LoadIndexIDPath(cfg)
+	if len(idPath) == 0 {
+		writeProgress(100)
+		fmt.Println("RESULT pulled=0 checked=0 ghosts=0")
+		exitMode(0)
+	}
+
+	platforms, err := mappedPlatforms(client, cfg)
+	if err != nil {
+		writeProgress(0)
+		noteAuthErr(err)
+		if pairingExpired {
+			writePhase("Pairing expired — re-pair this device")
+		} else {
+			writePhase("Couldn't reach RomM")
+		}
+		fmt.Fprintf(os.Stderr, "FATAL pull-saves: %s\n", safeErr(err))
+		exitMode(3)
+	}
+
+	// Newest real save per ROM across mapped platforms (same walk the Continue list
+	// does — a handful of list calls, not one per game).
+	type cand struct {
+		romID int
+		t     time.Time
+	}
+	newest := map[int]time.Time{}
+	ghosts := 0
+	for _, p := range platforms {
+		saves, gerr := client.GetSaves(romm.SaveQuery{PlatformID: p.ID})
+		if gerr != nil {
+			noteAuthErr(gerr)
+			continue
+		}
+		for _, s := range saves {
+			if sync.IsGhostSave(s) {
+				ghosts++
+				continue
+			}
+			if s.RomID == 0 {
+				continue
+			}
+			if t, seen := newest[s.RomID]; !seen || s.UpdatedAt.After(t) {
+				newest[s.RomID] = s.UpdatedAt
+			}
+		}
+	}
+
+	// Only games mirrored on THIS card are targets; newest-first so the saves the
+	// user most likely wants next land first.
+	sd := sdRoot()
+	var cands []cand
+	for id, t := range newest {
+		rel, found := idPath[id]
+		if !found || rel == "" {
+			continue
+		}
+		if _, statErr := os.Stat(filepath.Join(sd, rel)); statErr != nil {
+			continue
+		}
+		cands = append(cands, cand{id, t})
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if !cands[i].t.Equal(cands[j].t) {
+			return cands[i].t.After(cands[j].t)
+		}
+		return cands[i].romID < cands[j].romID
+	})
+
+	pulled, checked, pushed := 0, 0, 0
+	for i, c := range cands {
+		rel := idPath[c.romID]
+		writePhase(fmt.Sprintf("Pulling saves (%d/%d)…", i+1, len(cands)))
+		if len(cands) > 0 {
+			writeProgress((i + 1) * 100 / len(cands))
+		}
+		p := filepath.Join(sd, rel)
+		res := sync.PullSaveDirect(client, cfg, p)
+		notePullResult(res)
+		ghosts += res.Ghosts
+		checked++
+		if res.Pulled() {
+			pulled++
+		}
+		// UNPUSHED LOCAL PROGRESS (A2): the local save matches no server revision —
+		// never overwritten. Push it through the verified-upload funnel NOW so the
+		// bulk sync leaves it the newest revision instead of a silent skip.
+		if res.Outcome == sync.PullLocalUnpushed {
+			pres := sync.PushSaveDirect(client, cfg, p)
+			notePushResults(pres)
+			pushed += sync.Uploaded(pres)
+		}
+	}
+
+	writeProgress(100)
+	// pushed= is APPENDED (A2) — existing parsers key on pulled=/checked=/ghosts=.
+	fmt.Printf("RESULT pulled=%d checked=%d ghosts=%d pushed=%d\n", pulled, checked, ghosts, pushed)
+	exitMode(0)
+}
+
+// runSyncContinue is the LIGHT Continue/recents refresh (task #133): rebuild the
+// cross-device "0) Continue" collection and merge its entries into the host's native
+// Recently Played (task #132) from the LOCAL index + per-platform save listings —
+// no catalog mirror, no collections listing, so it belongs in the fast "Sync now"
+// (the full derivation still rides --mirror-collections unchanged). Contract:
+//
+//	CONTINUE entries=<N>
+//	RECENTS merged=<M> total=<T>
+//
+// entries=0 = empty/unreachable feed (the existing Continue file is left alone —
+// only the full mirror's prune retires it); merged=0 = nothing new for Recently
+// Played (or no MinUI-family recents on this card). Always exit 0: this is a
+// convenience layer — the other Sync-now legs own the honest failure codes.
+func runSyncContinue(client *romm.Client, cfg *config.Config) {
+	writeProgress(0)
+	writePhase("Updating Continue…")
+	entries, merged, total := catalog.SyncContinue(client, cfg)
+	writeProgress(100)
+	fmt.Printf("CONTINUE entries=%d\n", entries)
+	fmt.Printf("RECENTS merged=%d total=%d\n", merged, total)
+	exitMode(0)
 }

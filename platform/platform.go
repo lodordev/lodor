@@ -268,15 +268,20 @@ func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string
 const romMDisambiguator = " (RomM)"
 
 // LocalBasename returns the extension-less on-disk basename a ROM occupies under the
-// active mirror mode. In "own" mode it is rom.CanonicalLocalBasename() — byte-identical
-// to the server's name. In "separate"/"merge" modes it appends romMDisambiguator so a
-// RomM stub's save (and on-disk file) can never collide with a user's own same-named
-// game in a different folder that binds the same TAG. This is the single source of
-// truth shared by LocalRomPath and the catalog index keys, so a stub written here
-// resolves back to its rom_id by the same name.
+// active mirror mode. In "own" AND "merge" modes it is rom.CanonicalLocalBasename() —
+// byte-identical to the server's name. Merge is canonical BY DESIGN (C1 §2, the
+// "RomM-first" 2026-06-28 cut): the canonical name is what makes dedup-by-index-
+// adoption free (the user's exact-named file resolves against the same key), while
+// the leading ✘/✓ state markers keep a Lodor stub/download from ever being byte-equal
+// to — or shadowing — the user's own filename, and give it its own save namespace.
+// In "separate" mode it appends romMDisambiguator so a RomM stub's save (and on-disk
+// file) can never collide with a user's own same-named game in a different folder
+// that binds the same TAG. This is the single source of truth shared by LocalRomPath
+// and the catalog index keys, so a stub written here resolves back to its rom_id by
+// the same name.
 func LocalBasename(cfg *config.Config, rom romm.Rom) string {
 	base := rom.CanonicalLocalBasename()
-	if base == "" || cfg.ResolvedMirrorMode() == config.MirrorModeOwn {
+	if base == "" || cfg.ResolvedMirrorMode() != config.MirrorModeSeparate {
 		return base
 	}
 	return base + romMDisambiguator

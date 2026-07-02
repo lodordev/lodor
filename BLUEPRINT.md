@@ -60,14 +60,16 @@ CFW=`MINUI`. Base = `BASE_PATH` else first of `/mnt/SDCARD`,`/mnt/sdcard`,`/mnt/
 `hosts[0]: {root_uri(req), port, username, password, token(bearer,preferred), insecure_skip_verify, device_id(REQUIRED for net modes), device_name}`; `directory_mappings: {fs_slug:{slug,relative_path}}`; `api_timeout`(sec,def 30,clamp>300→30); `download_timeout`(sec,def 3600). Loaded CWD-relative. device_id read-only (minted via POST /api/devices).
 
 ## §8 CLI contracts (PARITY-CRITICAL — native launcher parses these)
-Exit: 0 ok, 2 config, 3 unreachable/resolve, 4 ran-but-errored. Modes print ONLY their lines.
+Exit: 0 ok, 2 config, 3 unreachable/resolve, 4 ran-but-errored, 5 profile-write-failed, 6 PAIRING EXPIRED (server rejected the client-token — 401 / 403-blaming-the-token → re-pair this device; RESULT modes also print a final `PAIRING_EXPIRED` stdout line after their normal RESULT line, data-list modes signal by exit code only; config.json is NEVER touched on this path). Modes print ONLY their lines.
+Upload-verify (task #123): every save upload is confirmed server-side before Pushed/AlreadyOnServer is reported — POST /api/saves response `content_hash`+`file_size_bytes>0`, else GET /api/saves/{id}/content byte re-hash, else non-ghost list-hash match; one full retry then the save stays PENDING (HashMismatch). Ghost saves (#63, record with `file_size_bytes<=0`) never win newest-wins pulls, never list for restore, never satisfy dedup, never drive `--recent`/`--sync-feed`; a 0-byte local save never uploads (EmptyLocalSave).
 - `--mirror-catalog` → `MIRROR created=%d existing=%d skipped=%d multifile=%d`
 - `--mirror-collections` → `COLLECTIONS written=%d empty=%d total=%d`
 - `--download <p>` → `RESULT downloaded=<0|1>` (+ /tmp/dl-progress 0→90→100, /tmp/romm-phase)
 - `--download-bios` → `RESULT bios=<n>`
 - `--push-pending` → `RESULT pushed=<N> total=<M> stuck=<K>` (reads `<LODOR_PAK_DIR>/pending-saves.txt` — the pak working dir, exported by the launch scripts; falls back to CWD — removes landed; mkdir .queue.lock)
-- `--sync-save <p>` → `RESULT pulled=<0|1> pushed=<0|1>`
-- `--list-saves <p>` → per save newest-first `<id>\t<YYYY-MM-DD HH:MM>\t<device|emulator>\t<kb>KB`; zero→nothing
+- `--sync-save <p>` → `RESULT pulled=<0|1> pushed=<0|1> ghosts=<N>` (ghosts APPENDED — broken byte-less server records for this ROM)
+- `--list-saves <p>` → per save newest-first `<id>\t<YYYY-MM-DD HH:MM>\t<device|emulator>\t<kb>KB`; zero→nothing; ghost records skipped
+- `--validate` → `RESULT reachable=<0|1> auth=<0|1> pairing_expired=<0|1>` (pairing_expired APPENDED; 1 → exit 6 + `PAIRING_EXPIRED` line)
 - `--restore-save <p> <saveID positional>` → `RESULT restored=<0|1>`
 - `--sync-feed` → ≤20 deduped newest-first `<game>\t<YYYY-MM-DD HH:MM>\t<device>` (game=file_name_no_ext, trailing 2-5 ext trimmed)
 - side-channels: `/tmp/dl-progress` int 0..100; `/tmp/romm-phase` one-line label.

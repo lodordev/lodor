@@ -61,7 +61,9 @@ func TestLocalBasenameModes(t *testing.T) {
 	}{
 		{config.MirrorModeOwn, "Zelda (USA)", "Final Fantasy VII (USA)"},
 		{config.MirrorModeSeparate, "Zelda (USA) (RomM)", "Final Fantasy VII (USA) (RomM)"},
-		{config.MirrorModeMerge, "Zelda (USA) (RomM)", "Final Fantasy VII (USA) (RomM)"},
+		// merge is CANONICAL by design (C1 §2): dedup/adoption needs the byte-identical
+		// name; the ✘/✓ markers are what keep Lodor files distinct from the user's.
+		{config.MirrorModeMerge, "Zelda (USA)", "Final Fantasy VII (USA)"},
 	}
 	for _, c := range cases {
 		cfg := &config.Config{MirrorMode: c.mode}

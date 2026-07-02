@@ -10,6 +10,13 @@
 //	2  config / flag error
 //	3  unreachable / could not resolve
 //	4  ran but one or more items errored
+//	5  (profile modes) profile write failed
+//	6  PAIRING EXPIRED — the server rejected our client-token (401, or 403 blaming
+//	   the token): the pairing is expired or revoked and the fix is re-pairing this
+//	   device. RESULT-printing modes also emit a final stdout line `PAIRING_EXPIRED`
+//	   (after their normal RESULT line); data-list modes signal via exit code only
+//	   (their stdout is a byte-parsed list). config.json is NEVER modified on this
+//	   path — a transient server misconfig must not wipe a valid pairing.
 //
 // The orchestration shell (romm-run / romm-sync-lib.sh) runs this binary with
 // cwd = Grout.pak (so config.json loads CWD-relative), CFW=MinUI, and the
@@ -44,6 +51,8 @@ func main() {
 		mirrorFull        bool
 		mirrorCollections bool
 		pushPending       bool
+		pullSaves         bool
+		syncContinue      bool
 		downloadBios      bool
 		downloadQueue     bool
 		syncFeed          bool
@@ -54,6 +63,9 @@ func main() {
 		restoreSave       string
 		downloadRom       string
 		reconcile         string
+		evict             string
+		uninstallMirror   bool
+		removeDownloads   bool
 		pair              string
 		pairProfile       string
 		registerDevice    string
@@ -72,28 +84,33 @@ func main() {
 	)
 	flag.BoolVar(&mirrorCatalog, "mirror-catalog", false, "stub every not-downloaded RomM game into Roms/ and write catalog-index.json; prints MIRROR created=.. existing=.. skipped=.. multifile=.. covers=..  (UPDATE: only new games + missing covers)")
 	flag.BoolVar(&mirrorFull, "full", false, "with --mirror-catalog: FULL refresh — re-fetch every cover even if already present (default is the fast incremental update)")
-	flag.BoolVar(&mirrorCollections, "mirror-collections", false, "write Collections/<name>.txt per RomM collection; prints COLLECTIONS written=.. empty=.. total=..")
+	flag.BoolVar(&mirrorCollections, "mirror-collections", false, "write Collections/<name>.txt per RomM collection, plus the cross-device '0) Continue' collection from recent server saves; prints COLLECTIONS written=.. empty=.. total=.. then CONTINUE entries=..")
 	flag.BoolVar(&listProfiles, "list-profiles", false, "MULTI-USER: print the profile list the Switch-Profile menu parses: one line per host '<active>\\t<label>\\t<hastoken>\\t<hasdevice>'")
 	flag.BoolVar(&listUsers, "list-users", false, "MULTI-USER: list the RomM server's users for the Switch-User picker: '<active>\\t<username>\\t<role>\\t<signedin>' per line (admin token; falls back to stored profiles offline)")
 	flag.StringVar(&loginProfile, "login-profile", "", "MULTI-USER: sign in as an existing RomM user under this profile LABEL (OAuth password grant; password on STDIN, never argv); needs --login-user; prints RESULT logged_in=<0|1>")
 	flag.StringVar(&loginUser, "login-user", "", "with --login-profile: the existing RomM username to sign in as")
 	flag.StringVar(&loginDevice, "login-device", "", "with --login-profile: optional device id to attach to the profile")
 	flag.BoolVar(&pushPending, "push-pending", false, "upload every save in pending-saves.txt; prints RESULT pushed=<N> total=<M> stuck=<K>")
+	flag.BoolVar(&pullSaves, "pull-saves", false, "TARGETED bulk pull (fast 'Sync now' leg): for every on-card game with a real server save, decide by CONTENT-HASH LINEAGE (local==newest: no-op; local==older revision: pull newest, .bak kept; local unknown to server: push it instead — never overwrite; ghosts filtered) — no catalog mirror; prints RESULT pulled=<N> checked=<M> ghosts=<G> pushed=<K>")
+	flag.BoolVar(&syncContinue, "sync-continue", false, "LIGHT Continue refresh (fast 'Sync now' leg): rebuild the cross-device '0) Continue' collection and merge it into the host's native Recently Played from the local index + server saves — no catalog mirror; prints CONTINUE entries=<N> then RECENTS merged=<M> total=<T>")
 	flag.BoolVar(&downloadBios, "download-bios", false, "download BIOS/firmware for every mapped platform; prints RESULT bios=<count>")
 	flag.BoolVar(&downloadQueue, "download-queue", false, "download every ROM queued in download-queue.txt (resolve, fetch, hash-verify each, reusing the --download path), dropping landed entries and keeping failures for retry; prints RESULT downloaded=<N> failed=<M> remaining=<K>")
 	flag.BoolVar(&syncFeed, "sync-feed", false, "list recent server saves across mapped platforms, newest first, tab-separated")
 	flag.BoolVar(&recent, "recent", false, "print the single most-recently-played game across devices as <localRomPath>\\t<game>\\t<when>\\t<device> (drives the Continue tile); empty if unreachable/none")
-	flag.StringVar(&syncSave, "sync-save", "", "pull-then-push the save for one ROM; prints RESULT pulled=<0|1> pushed=<0|1>")
+	flag.StringVar(&syncSave, "sync-save", "", "pull-then-push the save for one ROM (content-hash lineage, never clock-based); prints RESULT pulled=<0|1> pushed=<0|1> ghosts=<N> reason=<token> (pushed=1 only after a verified REAL upload; an unchanged save dedups server-side and reports reason=in-sync)")
 	flag.StringVar(&pushSave, "push-save", "", "HYBRID post-game push for one ROM: push the changed save directly; on a LANDED push write last-synced.txt (the launcher's synced-✓ signal); if it does NOT land, stage the save into pending-saves.txt for later; prints RESULT pushed=<0|1> staged=<N>")
-	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated")
+	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated, then a LOCAL=<none|current|older|unpushed> trailer (single field — row parsers drop it); exit 3 when the server is unreachable (empty list + exit 0 always means zero saves)")
 	flag.StringVar(&restoreSave, "restore-save", "", "restore a specific server save by id for one ROM (save id is the positional arg); prints RESULT restored=<0|1>")
 	flag.StringVar(&downloadRom, "download", "", "download one ROM's real file (resolve, fetch, hash-verify); prints RESULT downloaded=<0|1>")
 	flag.StringVar(&reconcile, "reconcile", "", "post-launch: flip ONE downloaded ROM's on-disk state marker (✘→✓) to match the bytes now present, carrying its save+cover with the rename; offline, no device; prints RESULT reconciled=<0|1>")
+	flag.StringVar(&evict, "evict", "", "delete ONE downloaded ROM's bytes from the card and re-create its 0-byte cloud stub (✓→✘), carrying its save+cover with the rename — saves are NEVER deleted; multi-disc .m3u deletes its disc files too; offline, no device; prints RESULT evicted=<0|1> [reason=…]")
+	flag.BoolVar(&uninstallMirror, "uninstall-mirror", false, "remove every MIRROR-OWNED artifact from the card (manifest walk: stubs, our covers/collections/folders; downloads KEPT unless --remove-downloads; saves NEVER touched; user files byte-identical); offline; prints RESULT uninstalled=<0|1> removed=<N> kept_downloads=<K> skipped=<S>")
+	flag.BoolVar(&removeDownloads, "remove-downloads", false, "with --uninstall-mirror: also delete Lodor-downloaded games (the explicit second confirmation)")
 	flag.StringVar(&pair, "pair", "", "exchange a RomM pairing code for a client-token, validate it, write config.json (clearing any password); prints RESULT paired=<0|1> scopes_ok=<0|1>")
 	flag.StringVar(&pairProfile, "pair-profile", "", "MULTI-USER: sign a profile in with a RomM PAIRING CODE (client-token exchange, not a password); stores the token owner as a profile; prints RESULT paired=<0|1> username=<name>")
 	flag.StringVar(&registerDevice, "register-device", "", "register this device by name, store device_id+device_name in config.json; prints RESULT registered=<0|1>")
 	flag.StringVar(&renameDevice, "rename-device", "", "rename the registered device, update config.json; prints RESULT renamed=<0|1>")
-	flag.BoolVar(&validate, "validate", false, "check host reachability (heartbeat) + auth (token); prints RESULT reachable=<0|1> auth=<0|1>")
+	flag.BoolVar(&validate, "validate", false, "check host reachability (heartbeat) + auth (token); prints RESULT reachable=<0|1> auth=<0|1> pairing_expired=<0|1> (pairing_expired=1 = token expired/revoked -> re-pair; exit 6 + PAIRING_EXPIRED line)")
 	flag.StringVar(&setServer, "set-server", "", "persist the server URL (scheme+host) to config.json BEFORE pairing, creating config.json if absent; with --port/--insecure; prints RESULT server_set=<0|1>")
 	flag.IntVar(&setServerPort, "port", 0, "optional numeric port for --set-server (0 = none)")
 	flag.BoolVar(&setServerInsecure, "insecure", false, "for --set-server: skip TLS verification (HTTPS only)")
@@ -122,6 +139,21 @@ func main() {
 	if reconcile != "" {
 		runReconcile(cfg, reconcile)
 		return // runReconcile always exits; defensive
+	}
+	// --evict is the mirror image of --reconcile and equally OFFLINE: it removes a
+	// downloaded ROM's bytes and re-creates the cloud stub (✓→✘), carrying the save +
+	// cover with the rename. Filesystem + local index only — run before the hosts gate
+	// so "Delete from card" works with Wi-Fi off / server unreachable.
+	if evict != "" {
+		runEvict(cfg, evict)
+		return // runEvict always exits; defensive
+	}
+	// --uninstall-mirror is manifest-walk-only and OFFLINE (like --evict): remove
+	// everything the mirror created, keep the user's tree byte-identical. Runs
+	// before the hosts gate so "Remove Lodor" works with Wi-Fi off.
+	if uninstallMirror {
+		runUninstallMirror(cfg, removeDownloads)
+		return // always exits; defensive
 	}
 	// RetroAchievements credential-spine modes (task #46): account-global, they need
 	// config.json (to read/write the RA creds) but NOT a RomM host, so they run before
@@ -220,8 +252,15 @@ func main() {
 		// Save uploads can be large; use the download timeout for the transfer path.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
 		runPushPending(dlClient, cfg)
+	case pullSaves:
+		requireDevice(host)
+		// Save downloads are file transfers too — the long timeout, like --push-pending.
+		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		runPullSaves(dlClient, cfg)
+	case syncContinue:
+		runSyncContinue(client, cfg)
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --push-pending --sync-save --push-save --list-saves --restore-save --sync-feed --ra-login --ra-status)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --sync-feed --ra-login --ra-status)")
 		os.Exit(2)
 	}
 }

@@ -136,23 +136,35 @@ func (c *Client) GetSaves(query SaveQuery) ([]Save, error) {
 
 // UploadSaveQuery holds the query parameters for POST /api/saves. The file itself
 // travels as the multipart saveFile field, not here.
+//
+// FileName, when non-empty, OVERRIDES the multipart filename (default: the basename
+// of savePath). The server derives the stored save's file_name from it, so the sync
+// layer uses it to send the CANONICAL device-independent name — the on-card name
+// carries state markers ("✘ "/"✓ ") and the coexist disambiguator, which must never
+// leak into the server's data model (task #126: leaked markers split one game's
+// save timeline into per-device-state name families).
 type UploadSaveQuery struct {
 	RomID            int
 	DeviceID         string
 	Slot             string
 	Emulator         string
+	FileName         string
 	Overwrite        bool
 	Autocleanup      bool
 	AutocleanupLimit int
 }
 
 // UploadSave uploads savePath to POST /api/saves as multipart (one field saveFile,
-// filename = basename of savePath). All other parameters travel as query string.
-// A 409 returns a *ConflictError. The returned Save reflects the created record.
+// filename = query.FileName, else basename of savePath). All other parameters travel
+// as query string. A 409 returns a *ConflictError. The returned Save reflects the
+// created record.
 func (c *Client) UploadSave(query UploadSaveQuery, savePath string) (Save, error) {
 	fileBytes, fileName, err := readFile(savePath)
 	if err != nil {
 		return Save{}, err
+	}
+	if query.FileName != "" {
+		fileName = query.FileName
 	}
 
 	v := url.Values{}
@@ -181,6 +193,19 @@ func (c *Client) UploadSave(query UploadSaveQuery, savePath string) (Save, error
 	var out Save
 	err = c.doMultipart("/api/saves", v, "saveFile", fileName, fileBytes, &out)
 	return out, err
+}
+
+// DeleteSaves deletes save records by id (POST /api/saves/delete, body
+// {"saves":[ids]} — RomM's bulk-delete shape; there is no DELETE verb). Used ONLY
+// by the marker-twin heal (task #126), which deletes a marker-named record after
+// verifying a clean-named record with the SAME content hash exists — bytes are
+// never removed from the server without a verified surviving copy.
+func (c *Client) DeleteSaves(ids []int) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	body := map[string][]int{"saves": ids}
+	return c.doJSON("POST", "/api/saves/delete", body, nil)
 }
 
 // GetFirmware returns the firmware/BIOS records for a platform

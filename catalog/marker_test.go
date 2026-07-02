@@ -19,6 +19,9 @@ func markerTestCfg(t *testing.T) (*config.Config, romm.Rom, string) {
 	t.Setenv("BASE_PATH", base)
 	t.Setenv("SDCARD_PATH", base)
 	t.Setenv("PLATFORM", "tg5040")
+	// Hermetic pak dir: without this, IndexPath/ManifestPath fall back to the test
+	// CWD (the package dir) — a run used to leave catalog-index.json tracked litter.
+	t.Setenv("LODOR_PAK_DIR", filepath.Join(base, "pak"))
 
 	cfg := &config.Config{
 		MirrorMode:        config.MirrorModeOwn, // unmarked canonical basename

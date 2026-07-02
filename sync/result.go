@@ -69,11 +69,17 @@ const (
 	// server. Err carries the underlying error string. This is a genuinely stuck
 	// save — the reason the --push-pending log can finally name.
 	OutcomeUploadError
-	// OutcomeHashMismatch is reserved for a future explicit local-vs-server content
-	// verification step. It is defined so the cmd layer's switch is total and stable;
-	// the current push path does not emit it (an unverifiable upload becomes
-	// OutcomeUploadError instead).
+	// OutcomeHashMismatch: the upload's HTTP call SUCCEEDED but the server-side copy
+	// could not be verified to match the local bytes (see verify.go — response
+	// content_hash, byte re-download, then list fallback), even after one full
+	// re-upload retry. The save is NOT safe: it stays pending and is never marked
+	// synced. This is the explicit local-vs-server verification outcome (task #123).
 	OutcomeHashMismatch
+	// OutcomeEmptyLocalSave: the local save file is zero bytes (or unreadable) — the
+	// ghost-proof upload guard (#63) refused to upload it. The entry stays pending:
+	// if a later session writes real bytes it uploads then; if it stays empty the
+	// stuck reason names it instead of minting a server-side ghost.
+	OutcomeEmptyLocalSave
 )
 
 // String renders a PushOutcome as a short stable token for logs/CLI lines.
@@ -91,6 +97,8 @@ func (o PushOutcome) String() string {
 		return "UploadError"
 	case OutcomeHashMismatch:
 		return "HashMismatch"
+	case OutcomeEmptyLocalSave:
+		return "EmptyLocalSave"
 	default:
 		return "Unknown"
 	}
@@ -108,15 +116,36 @@ func (o PushOutcome) String() string {
 //   - Conflicted  — true when OutcomePushed was reached via the additive
 //     overwrite=true retry (a foreign-device save existed; ours was added alongside,
 //     theirs preserved). Signals the caller may want to offer a pull.
-//   - Err         — the underlying error string for OutcomeUploadError; empty
-//     otherwise. Never contains the host (errors from the romm client are already
-//     host-stripped at the call sites that matter; see cleanErr).
+//   - Err         — the underlying error string for OutcomeUploadError /
+//     OutcomeHashMismatch; empty otherwise. Never contains the host (errors from
+//     the romm client are already host-stripped at the call sites that matter;
+//     see cleanErr).
+//   - AuthExpired — true when the failure was the server REJECTING OUR TOKEN
+//     (401 / 403-invalid-token — see romm.AuthError): the pairing is expired or
+//     revoked and the fix is re-pairing, not retrying. The cmd layer maps any
+//     true flag to the PAIRING_EXPIRED contract (stdout line + exit 6).
 type PushResult struct {
-	Outcome    PushOutcome
-	SaveFile   string
-	Emulator   string
-	Conflicted bool
-	Err        string
+	Outcome     PushOutcome
+	SaveFile    string
+	Emulator    string
+	Conflicted  bool
+	Err         string
+	AuthExpired bool
+}
+
+// Uploaded counts the results that performed a REAL verified upload
+// (OutcomePushed strictly — AlreadyOnServer moved no bytes). --sync-save's RESULT
+// pushed=<n> uses this so pushed=1 always means "your save traveled", while
+// Counts' pushed keeps meaning "safely on the server" for the pending-queue
+// contract (A2 honesty split).
+func Uploaded(results []PushResult) int {
+	n := 0
+	for _, r := range results {
+		if r.Outcome == OutcomePushed {
+			n++
+		}
+	}
+	return n
 }
 
 // Counts summarizes a slice of PushResults the way the --push-pending RESULT line

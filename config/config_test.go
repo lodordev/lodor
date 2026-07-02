@@ -83,9 +83,11 @@ func TestHostURL(t *testing.T) {
 }
 
 // TestResolvedMirrorMode locks the coexist-mode resolution: an explicit, recognized
-// mirror_mode wins (case/space-insensitive); an absent/unknown value falls back to the
-// host default, which is "own" on a LodorOS host (or no host hint — byte-identical to
-// today) and "separate" on NextUI / any other host.
+// mirror_mode wins (case/space-insensitive); an absent/unknown value falls back to
+// the host default — MERGE on NextUI (C2 gate decision), OWN on LodorOS / no hint /
+// unknown hosts (byte-identical to before) — with the separate-layout HOLD: a
+// defaulted merge over mappings still carrying "… RomM (TAG)" folders resolves
+// separate until the user explicitly opts in (mode flips are prompt-only).
 func TestResolvedMirrorMode(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -100,9 +102,9 @@ func TestResolvedMirrorMode(t *testing.T) {
 		{"unset, no host hint -> own", "", "", MirrorModeOwn},
 		{"unset, lodoros -> own", "", "lodoros", MirrorModeOwn},
 		{"unset, minui -> own", "", "minui", MirrorModeOwn},
-		{"unset, nextui -> own", "", "nextui", MirrorModeOwn},
+		{"unset, nextui -> merge (C2 default)", "", "nextui", MirrorModeMerge},
 		{"unset, unknown host -> own", "", "weirdos", MirrorModeOwn},
-		{"unknown value falls back to host default", "garbage", "nextui", MirrorModeOwn},
+		{"unknown value falls back to host default", "garbage", "nextui", MirrorModeMerge},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -117,7 +119,28 @@ func TestResolvedMirrorMode(t *testing.T) {
 	// Nil receiver must not panic and must use the host default.
 	t.Setenv("LODOR_HOST_OS", "nextui")
 	var nilCfg *Config
-	if got := nilCfg.ResolvedMirrorMode(); got != MirrorModeOwn {
-		t.Errorf("nil Config ResolvedMirrorMode() = %q, want %q", got, MirrorModeOwn)
+	if got := nilCfg.ResolvedMirrorMode(); got != MirrorModeMerge {
+		t.Errorf("nil Config ResolvedMirrorMode() = %q, want %q", got, MirrorModeMerge)
+	}
+
+	// The separate-layout hold: defaulted merge + "… RomM (TAG)" mappings => the
+	// card keeps its separate behavior until an EXPLICIT merge lifts the hold.
+	sepCard := &Config{DirectoryMappings: map[string]DirMapping{
+		"gba": {Slug: "gba", RelativePath: "Game Boy Advance RomM (GBA)"},
+	}}
+	if got := sepCard.ResolvedMirrorMode(); got != MirrorModeSeparate {
+		t.Errorf("separate-layout hold: got %q, want %q", got, MirrorModeSeparate)
+	}
+	sepCard.MirrorMode = "merge" // the pak prompt wrote consent
+	if got := sepCard.ResolvedMirrorMode(); got != MirrorModeMerge {
+		t.Errorf("explicit merge must lift the hold: got %q", got)
+	}
+	// A clean-layout card (de-facto own, the pre-C2 NextUI default) upgrades onto
+	// merge with zero renames — no hold.
+	ownCard := &Config{DirectoryMappings: map[string]DirMapping{
+		"gba": {Slug: "gba", RelativePath: "Game Boy Advance (GBA)"},
+	}}
+	if got := ownCard.ResolvedMirrorMode(); got != MirrorModeMerge {
+		t.Errorf("clean-layout card: got %q, want merge", got)
 	}
 }

@@ -67,6 +67,9 @@ func runListUsers(cfg *config.Config) {
 	if err != nil {
 		// Offline or no users.read: fall back to the locally stored signed-in profiles
 		// so the picker still lists who is signed in (active flag honored, role blank).
+		// An expired/revoked token still emits the fallback list but exits 6 (see
+		// authgate.go) so the picker can also surface "re-pair".
+		noteAuthErr(err)
 		fmt.Fprintf(os.Stderr, "list-users: %s (falling back to stored profiles)\n", safeErr(err))
 		seen := map[string]bool{}
 		for _, h := range cfg.Hosts {
@@ -83,7 +86,7 @@ func runListUsers(cfg *config.Config) {
 			seen[strings.ToLower(u)] = true
 			fmt.Printf("%d\t%s\t%s\t%d\n", isActive(u), u, "", 1)
 		}
-		os.Exit(0)
+		exitModeQuiet(0)
 	}
 	for _, u := range users {
 		if u.Username == "" {

@@ -56,7 +56,7 @@ Configuration lives in `config.json` next to the binary (see `config.json.exampl
 | `--set-server <url>` `[--port N] [--insecure]` | Persist the server URL before pairing. |
 | `--pair <code>` | Exchange a RomM pairing code for a client token; write `config.json`. |
 | `--register-device <name>` / `--rename-device <name>` | Register/rename this device. |
-| `--validate` | Check reachability + auth. Prints `reachable=<0\|1> auth=<0\|1>`. |
+| `--validate` | Check reachability + auth. Prints `reachable=<0\|1> auth=<0\|1> pairing_expired=<0\|1>`. |
 | `--mirror-catalog` | Stub every not-downloaded ROM into `Roms/` (only platforms with an installed emulator pak — never games the device can't launch); write the resolution index. |
 | `--mirror-collections` | Write `Collections/<name>.txt` per RomM collection. |
 | `--download <rom>` | Fetch one ROM's real file (resolve → stream → verify). Multi-disc aware. |
@@ -68,6 +68,20 @@ Configuration lives in `config.json` next to the binary (see `config.json.exampl
 | `--sync-feed` | List recent server saves, newest first. |
 
 Each prints a `RESULT …` summary line.
+
+**Exit codes:** `0` ok · `2` config/flag error · `3` unreachable / could not resolve · `4` ran but
+one or more items errored · `6` **pairing expired** — the server rejected this device's client token
+(expired or revoked); re-pair the device. On exit 6, modes that print a `RESULT` line also print a
+final `PAIRING_EXPIRED` line on stdout; list-output modes signal via the exit code alone. The engine
+never deletes or rewrites its config on an auth failure, so a transient server misconfig can't wipe
+a valid pairing.
+
+**Save-sync integrity:** an upload is reported pushed only after the server-side copy is *verified*
+(the create response's content hash and stored size, else a byte-for-byte re-download); an
+unverifiable upload is retried once and then left pending — never silently marked synced. Server
+save records with missing/zero-length bytes ("ghost saves") are never pulled over a real local save,
+never offered for restore, and are counted (`ghosts=<N>` in `--sync-save`) so a UI can surface them.
+A zero-byte local save file is never uploaded.
 
 ## Status
 

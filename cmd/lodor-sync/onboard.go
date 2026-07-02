@@ -192,12 +192,13 @@ func runRegisterDevice(cfg *config.Config, name string) {
 	dev, err := client.RegisterDevice(name)
 	if err != nil {
 		msg := safeErr(err)
+		noteAuthErr(err)
 		fmt.Fprintf(os.Stderr, "REGFAIL register: %s\n", msg)
 		fmt.Println("RESULT registered=0")
 		if msg == "network error" {
 			os.Exit(3)
 		}
-		os.Exit(4)
+		exitMode(4)
 	}
 	if dev.ID == "" {
 		fmt.Fprintln(os.Stderr, "REGFAIL register: server returned no device id")
@@ -237,12 +238,13 @@ func runRenameDevice(cfg *config.Config, name string) {
 
 	if _, err := client.UpdateDevice(host.DeviceID, name); err != nil {
 		msg := safeErr(err)
+		noteAuthErr(err)
 		fmt.Fprintf(os.Stderr, "RENAMEFAIL update: %s\n", msg)
 		fmt.Println("RESULT renamed=0")
 		if msg == "network error" {
 			os.Exit(3)
 		}
-		os.Exit(4)
+		exitMode(4)
 	}
 
 	if werr := config.WriteHostUpdate(config.HostUpdate{DeviceName: name}); werr != nil {
@@ -258,11 +260,19 @@ func runRenameDevice(cfg *config.Config, name string) {
 // runValidate checks the host's reachability (heartbeat) and auth (token validity)
 // — the validate-on-save loop the wizard runs before committing the form. Contract:
 //
-//	RESULT reachable=<0|1> auth=<0|1>
+//	RESULT reachable=<0|1> auth=<0|1> pairing_expired=<0|1>
+//
+// pairing_expired is an APPENDED field (fields 1-2 unchanged for existing parsers):
+// 1 means the server EXPLICITLY rejected our token (401 / 403-invalid-token — the
+// client-token is expired or revoked) — the fix is re-pairing, and the run follows
+// the PAIRING_EXPIRED contract (extra final stdout line + exit 6). auth=0 with
+// pairing_expired=0 is any OTHER auth failure (e.g. scopes) — still exit 4.
 //
 // Exit reflects the worst failure: 3 unreachable (heartbeat failed — auth can't be
-// judged, reported 0), 4 reachable-but-auth-failed, 0 both ok. auth is only trusted
-// when reachable=1, so an unreachable host always prints auth=0.
+// judged, reported 0), 6 pairing expired/revoked, 4 reachable-but-auth-failed,
+// 0 all ok. auth is only trusted when reachable=1, so an unreachable host always
+// prints auth=0. config.json is NEVER touched here — a transient server misconfig
+// must not wipe a valid pairing; this mode only reports.
 func runValidate(cfg *config.Config) {
 	host := cfg.Hosts[0]
 	apiTimeout := time.Duration(cfg.ApiTimeout.Int()) * time.Second
@@ -273,18 +283,24 @@ func runValidate(cfg *config.Config) {
 	// alone cannot cleanly separate "host down" from "token bad". We therefore also
 	// run ValidateToken: a successful auth check PROVES the host is reachable even if
 	// the heartbeat errored, so reachable is true whenever EITHER probe lands.
+	// An AuthError from EITHER probe also proves reachability (the server answered
+	// with a definitive token verdict).
 	hbErr := client.Heartbeat()
 	authErr := client.ValidateToken()
 
 	auth := authErr == nil
-	reachable := hbErr == nil || auth
+	expired := romm.IsAuthError(authErr) || romm.IsAuthError(hbErr)
+	reachable := hbErr == nil || auth || expired
 
-	fmt.Printf("RESULT reachable=%d auth=%d\n", b2i(reachable), b2i(auth))
+	fmt.Printf("RESULT reachable=%d auth=%d pairing_expired=%d\n", b2i(reachable), b2i(auth), b2i(expired))
 	switch {
 	case !reachable:
 		os.Exit(3) // nothing answered — host is down/unresolvable
+	case expired:
+		fmt.Println(pairingExpiredLine)
+		os.Exit(pairingExpiredExit) // token expired/revoked — re-pair this device
 	case !auth:
-		os.Exit(4) // reachable but the token is bad/expired/forbidden
+		os.Exit(4) // reachable but auth failed for a non-token reason (e.g. scopes)
 	default:
 		os.Exit(0)
 	}
