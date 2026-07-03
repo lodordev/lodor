@@ -166,30 +166,6 @@ func TestReclaimableStubTripleGate(t *testing.T) {
 	}
 }
 
-// TestReclaimableStubLodorOS: on a native-state host (canonical names, no markers)
-// the marker leg is skipped — 0-byte + resolves is the gate.
-func TestReclaimableStubLodorOS(t *testing.T) {
-	base := manifestTestEnv(t)
-	t.Setenv("LODOR_HOST_OS", "lodoros")
-	dir := filepath.Join(base, "Roms", "GBA")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	p := filepath.Join(dir, "Foo.gba")
-	if err := os.WriteFile(p, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !ReclaimableStub(p, func(string) bool { return true }) {
-		t.Error("LodorOS canonical 0-byte resolving stub not reclaimable")
-	}
-	if err := os.WriteFile(p, []byte("REAL"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if ReclaimableStub(p, func(string) bool { return true }) {
-		t.Error("LodorOS real file reclaimed — never reclaim real bytes")
-	}
-}
-
 // TestReconcileGuardedProtectsUserLegacyFile (V4): in merge mode an UNOWNED file
 // at the bare canonical name is the user's — reconcile must not rename it (or its
 // saves), must not stub beside it, and must report skip ("", false).

@@ -68,8 +68,8 @@ func verifyUploadedSave(client *romm.Client, romID int, uploaded romm.Save, loca
 		}
 		var hs []string
 		for _, s := range saves {
-			if IsGhostSave(s) {
-				continue // a ghost's hash must never verify an upload
+			if IsGhostSave(s) || IsMetaSave(s) {
+				continue // a ghost's (or meta record's, #146) hash must never verify a save upload
 			}
 			if s.ContentHash != nil && *s.ContentHash != "" {
 				hs = append(hs, *s.ContentHash)

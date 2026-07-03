@@ -117,6 +117,10 @@ func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) Pul
 	if err != nil {
 		return PullResult{Outcome: PullError, Reason: "couldn't reach server", AuthExpired: romm.IsAuthError(err)}
 	}
+	// CROSS-DEVICE PREVIEW (#149): the raw list is already in hand — land the
+	// newest .lodorshot.png at the local .minui convention. Best-effort/cosmetic;
+	// zero extra requests when none exists or the local copy already matches.
+	pullPreviewBestEffort(client, romPath, saves)
 	// GHOST FILTER (#63): drop records whose bytes are missing/zero BEFORE the
 	// lineage decision runs — a ghost, however new its timestamp, has no bytes and
 	// can neither be "newest" nor vouch for local content. All-ghosts == no usable
@@ -180,6 +184,12 @@ func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) Pul
 // save carries the chosen record (its FileExtension picks the local filename and its
 // ID names the content endpoint). romPath identifies the ROM for the save directory.
 func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save romm.Save) PullResult {
+	// META GUARD (#146): a .lodortime/.lodorshot.png sidecar record is not a
+	// save — flashing one over a real local save file would destroy it. The
+	// listing already hides meta records; this covers a direct CLI call.
+	if IsMetaSave(save) {
+		return PullResult{Outcome: PullError, Reason: "not a game save (meta record)"}
+	}
 	// GHOST GUARD (#63): a record with no stored bytes can't be restored — refuse
 	// up front (the listing already hides ghosts; this covers a direct CLI call)
 	// rather than overwrite a real local save with nothing.

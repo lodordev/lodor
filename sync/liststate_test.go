@@ -1,3 +1,5 @@
+//go:build !onion && !muos
+
 package sync
 
 import (

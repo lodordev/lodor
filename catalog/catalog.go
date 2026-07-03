@@ -77,6 +77,12 @@ type platformIndex struct {
 	// --mirror-collections can resolve collection members WITHOUT re-fetching the whole
 	// library (that per-platform refetch was the multi-minute "collections hang").
 	ByID map[int]string `json:"by_id,omitempty"`
+	// ByIDHash maps rom_id -> the server's md5_hash for the ROM's content, where
+	// RomM knows it (task #146: playtime sessions key on the content hash so the
+	// same game merges across devices regardless of on-disk naming). Optional and
+	// additive: absent in pre-#146 indexes (omitempty keeps them byte-stable when
+	// no hashes are known) and simply means the TAG/basename fallback key is used.
+	ByIDHash map[int]string `json:"by_id_hash,omitempty"`
 }
 
 // index is the on-disk catalog-index.json shape (BLUEPRINT §5).
@@ -233,6 +239,9 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 			pi.ByFsname = map[string]int{}
 			pi.ByID = map[int]string{}
 		}
+		if pi.ByIDHash == nil {
+			pi.ByIDHash = map[int]string{}
+		}
 
 		// Manifest: record FOLDER-creation intent BEFORE any stub write (record-
 		// intent-then-act: a crash leaves an over-complete manifest, the safe
@@ -273,6 +282,9 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 			}
 			if rom.FsName != "" {
 				pi.ByFsname[rom.FsName] = rom.ID
+			}
+			if rom.Md5Hash != "" {
+				pi.ByIDHash[rom.ID] = rom.Md5Hash // playtime session key (#146)
 			}
 
 			// Canonical (unmarked) on-disk path, then drop anything that isn't a

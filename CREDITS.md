@@ -10,6 +10,13 @@ Lodor stands on the work of others in the RomM and retro-handheld communities.
 - **[MinUI](https://github.com/shauninman/MinUI)** by Shaun Inman — the minimalist frontend whose
   on-card layout and save-directory conventions Lodor targets. Used as integration reference; MinUI is
   not redistributed here.
+- **[Allium](https://github.com/goweiwen/Allium)** — MIT, Copyright (c) 2025 Wei Wen Goh. Two 0.9.4
+  engine designs follow Allium's patterns (code here is original, CGO-free stdlib Go):
+  the RetroArch Network Control Interface client (`engine/ranet` — fire-and-forget UDP commands +
+  250ms send-recv for the commands that answer, per `common/src/retroarch.rs`), and the playtime
+  tracker's schema/merge semantics (`engine/playtime` — per-session rows + rolled-up per-game totals
+  with merge-on-conflict, per Allium's games/game_sessions model, re-expressed as JSONL/TSV instead
+  of SQLite and extended with cross-device merge over the RomM saves transport).
 
 Trademarks and product names belong to their respective owners. Lodor ships **no** BIOS, firmware, or
 copyrighted game content — you supply your own, on your own server.

@@ -1,4 +1,4 @@
-//go:build !onion
+//go:build !onion && !muos
 
 // Package platform re-expresses the miyoomini/MinUI save-directory data (BLUEPRINT
 // §6) as our own and provides the path helpers the engine needs: where ROMs, BIOS,
@@ -224,6 +224,17 @@ func BIOSFilePaths(fileName, slug string) []string {
 		return paths
 	}
 	return []string{filepath.Join(BiosDir(), fileName)}
+}
+
+// saveArtifactAnchors returns the filename prefixes (anchored with a trailing ".")
+// that identify THIS game's save/state artifacts in a save folder. MinUI/minarch
+// derives every save/state name from the FULL on-disk ROM filename ("Game (USA).gba"
+// → "Game (USA).gba.sav"), so the anchor is the full basename — never the stem, which
+// on MinUI could catch a different game that shares the extension-less name
+// ("Game.gba" vs "Game.zip"). RetroArch-backed variants (onion/muos) override this
+// with the stem-anchored rule their hosts actually use.
+func saveArtifactAnchors(romBase string) []string {
+	return []string{romBase}
 }
 
 // platformRomDirectory returns the directory under RomsDir where a ROM with the

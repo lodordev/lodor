@@ -1,3 +1,5 @@
+//go:build !onion && !muos
+
 package main
 
 // Mode-flip migration tests (C2 §6): the Smart Pro field-mess cleanup — the

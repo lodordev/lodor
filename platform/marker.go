@@ -205,13 +205,15 @@ func migrateMarkedGame(rom romm.Rom, src, dst string) {
 	if srcBase == dstBase {
 		return
 	}
-	// 1. Saves: every save artifact named "<srcBase>.<...>" in the slug's save folders.
-	//    The MinUI/minarch save name is "<full ROM filename>.sav" (and save states share
-	//    the same "<full ROM filename>." prefix), so anchoring on srcBase+"." migrates
-	//    battery saves AND states while never touching a different game.
+	// 1. Saves: every save artifact this HOST derives from the on-disk ROM name, in the
+	//    slug's save folders. The anchor set is per-variant (saveArtifactAnchors): MinUI/
+	//    minarch names saves "<full ROM filename>.sav" so the anchor is the full basename;
+	//    RetroArch-backed hosts (onion/muos) name them "<stem>.srm"/"<stem>.state*" so the
+	//    anchor there is the extension-less stem. Anchoring on "<prefix>." migrates battery
+	//    saves AND states while never touching a different game under the host's own rule.
 	if rom.PlatformFsSlug != "" {
 		for _, folder := range EmulatorFoldersForFSSlug(rom.PlatformFsSlug) {
-			renameSiblings(filepath.Join(SavesDir(), folder), srcBase, dstBase)
+			renameSaveSiblings(filepath.Join(SavesDir(), folder), srcBase, dstBase)
 		}
 	}
 	// 2. Cover: NextUI keeps box art at "<rom dir>/.media/<stem>.<img ext>". Rename the
@@ -232,15 +234,33 @@ func migrateMarkedGame(rom romm.Rom, src, dst string) {
 
 // RenameSaveArtifacts renames every save/state artifact for a game whose on-disk
 // basename changes from oldBase to newBase (battery saves AND states — everything
-// prefixed "<base>."), across ALL of the slug's save folders. Exported for the
-// coexist-layout migration (cmd/lodor-sync), which moves mirror-owned games between
-// folder layouts and must carry their saves exactly like migrateMarkedGame does.
+// prefixed with a host-derived anchor + "."), across ALL of the slug's save folders.
+// Exported for the coexist-layout migration (cmd/lodor-sync), which moves mirror-owned
+// games between folder layouts and must carry their saves exactly like
+// migrateMarkedGame does.
 func RenameSaveArtifacts(slug, oldBase, newBase string) {
 	if slug == "" {
 		return
 	}
 	for _, folder := range EmulatorFoldersForFSSlug(slug) {
-		renameSiblings(filepath.Join(SavesDir(), folder), oldBase, newBase)
+		renameSaveSiblings(filepath.Join(SavesDir(), folder), oldBase, newBase)
+	}
+}
+
+// renameSaveSiblings renames a game's save/state artifacts in dir when its on-disk ROM
+// basename changes from oldBase to newBase, using the per-variant anchor set
+// (saveArtifactAnchors — full basename on MinUI, extension-less stem on RetroArch
+// hosts). The anchor lists are positionally paired: they are derived from the same
+// basename shapes, so index i of the old list renames to index i of the new list.
+func renameSaveSiblings(dir, oldBase, newBase string) {
+	oldAnchors := saveArtifactAnchors(oldBase)
+	newAnchors := saveArtifactAnchors(newBase)
+	n := len(oldAnchors)
+	if len(newAnchors) < n {
+		n = len(newAnchors)
+	}
+	for i := 0; i < n; i++ {
+		renameSiblings(dir, oldAnchors[i], newAnchors[i])
 	}
 }
 

@@ -85,6 +85,12 @@ func ContinueList(client romClient, cfg *config.Config, idPath map[int]string) [
 			if s.FileSizeBytes <= 0 || s.RomID == 0 {
 				continue
 			}
+			// Meta-save (#146): .lodortime/.lodorshot.png sidecars ride the saves
+			// transport but aren't play sessions. Mirrors sync.IsMetaSaveName —
+			// inlined for the same no-cycle reason as the ghost check above.
+			if n := strings.ToLower(s.FileName); strings.HasSuffix(n, ".lodortime") || strings.HasSuffix(n, ".lodorshot.png") {
+				continue
+			}
 			if t, seen := newest[s.RomID]; !seen || s.UpdatedAt.After(t) {
 				newest[s.RomID] = s.UpdatedAt
 			}

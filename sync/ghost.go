@@ -23,8 +23,16 @@ func IsGhostSave(s romm.Save) bool {
 // order preserved, and a count of ghosts. Every save-list consumer (pull,
 // restore listing, feed, dedup) filters through this so a ghost can never be
 // chosen as "newest" or offered for restore.
+//
+// META-SAVES (#146): Lodor's .lodortime/.lodorshot.png sidecar records ride the
+// same transport but are NOT saves — they are dropped here silently (not
+// counted as ghosts: they aren't broken, just not playable). The playtime and
+// preview sync paths list them explicitly and never come through this funnel.
 func SplitGhosts(saves []romm.Save) (real []romm.Save, ghosts int) {
 	for _, s := range saves {
+		if IsMetaSave(s) {
+			continue
+		}
 		if IsGhostSave(s) {
 			ghosts++
 			continue

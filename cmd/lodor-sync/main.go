@@ -76,6 +76,11 @@ func main() {
 		setServerInsecure bool
 		raLogin           string
 		raStatus          bool
+		raCmd             string
+		raRecv            bool
+		sessionStart      string
+		sessionEnd        string
+		syncPlaytime      bool
 		listProfiles      bool
 		listUsers         bool
 		loginProfile      string
@@ -112,11 +117,42 @@ func main() {
 	flag.StringVar(&renameDevice, "rename-device", "", "rename the registered device, update config.json; prints RESULT renamed=<0|1>")
 	flag.BoolVar(&validate, "validate", false, "check host reachability (heartbeat) + auth (token); prints RESULT reachable=<0|1> auth=<0|1> pairing_expired=<0|1> (pairing_expired=1 = token expired/revoked -> re-pair; exit 6 + PAIRING_EXPIRED line)")
 	flag.StringVar(&setServer, "set-server", "", "persist the server URL (scheme+host) to config.json BEFORE pairing, creating config.json if absent; with --port/--insecure; prints RESULT server_set=<0|1>")
-	flag.IntVar(&setServerPort, "port", 0, "optional numeric port for --set-server (0 = none)")
+	flag.IntVar(&setServerPort, "port", 0, "optional numeric port: for --set-server the server port (0 = none); for --ra-cmd the RetroArch network_cmd_port (0 = default 55355)")
 	flag.BoolVar(&setServerInsecure, "insecure", false, "for --set-server: skip TLS verification (HTTPS only)")
 	flag.StringVar(&raLogin, "ra-login", "", "log in to RetroAchievements as <user>; reads the password from STDIN (never argv), exchanges it for the long-lived RA token, stores {ra_username, ra_token} in config.json (never the password); prints RESULT ra_login=<0|1>")
 	flag.BoolVar(&raStatus, "ra-status", false, "report RetroAchievements login state; prints RESULT ra_logged_in=<0|1> ra_user=<username>")
+	flag.StringVar(&raCmd, "ra-cmd", "", "send one RetroArch Network Control Interface command (QUIT, SCREENSHOT, GET_STATUS, ...) over loopback UDP; fire-and-forget by default (exit 0 once the datagram is sent); with --recv, wait for the reply (250ms x3), print it, exit 0 — a silent peer exits 3 (the wrapper's ra-net UNSUPPORTED probe signal). Local-only: no config, no RomM host.")
+	flag.BoolVar(&raRecv, "recv", false, "with --ra-cmd: wait for and print the command's reply (for commands that answer, e.g. GET_STATUS); exit 3 when no reply arrives")
+	flag.StringVar(&sessionStart, "session-start", "", "PLAYTIME (#146): stage a play session for this ROM path (/tmp marker: wall clock + /proc/uptime anchor). Offline, sub-second, config optional — never blocks a launch.")
+	flag.StringVar(&sessionEnd, "session-end", "", "PLAYTIME (#146): finish the staged session for this ROM path — duration from the UPTIME DELTA (clock-jump immune), start_utc back-computed, appended to sessions.jsonl, totals.json/totals.tsv rebuilt. Offline. Prints RESULT recorded=<0|1> [secs=<N>]")
+	flag.BoolVar(&syncPlaytime, "sync-playtime", false, "PLAYTIME (#146): pull peers' .lodortime meta-saves across mapped platforms and dedup-merge them into totals (newest record per device+key; own device skipped); prints RESULT playtime_fetched=<N> merged=<M>")
 	flag.Parse()
+
+	// --ra-cmd is PURELY LOCAL (a loopback UDP datagram to a running RetroArch —
+	// task #145 session bracketing): no config.json, no host, no device. It runs
+	// before everything else so the heavy-pak wrappers can call it from any cwd on
+	// a card in any pairing state — the exit bracket must work offline.
+	if raCmd != "" {
+		runRACmd(raCmd, raRecv, setServerPort)
+		return // runRACmd always exits; defensive
+	}
+
+	// --session-start / --session-end are OFFLINE and must work in ANY pairing
+	// state (an unpaired card still tracks playtime locally under the fallback
+	// key), so config is loaded best-effort — a missing/broken config.json means
+	// nil cfg, never a fatal (#146).
+	if sessionStart != "" || sessionEnd != "" {
+		scfg, serr := config.Load()
+		if serr != nil {
+			scfg = nil
+		}
+		if sessionStart != "" {
+			runSessionStart(sessionStart)
+		} else {
+			runSessionEnd(scfg, sessionEnd)
+		}
+		return // both always exit; defensive
+	}
 
 	// --set-server runs BEFORE config.Load(): the fresh-device case has no config.json
 	// at all (Load would fail) and no hosts (the gate below would exit). This mode is
@@ -259,8 +295,10 @@ func main() {
 		runPullSaves(dlClient, cfg)
 	case syncContinue:
 		runSyncContinue(client, cfg)
+	case syncPlaytime:
+		runSyncPlaytime(client, cfg)
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --sync-feed --ra-login --ra-status)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime)")
 		os.Exit(2)
 	}
 }

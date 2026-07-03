@@ -1,3 +1,5 @@
+//go:build !onion && !muos
+
 package main
 
 // THE SYNTHETIC USER-CARD FIXTURE (C1 design §8 / C2 scope item 5) — the

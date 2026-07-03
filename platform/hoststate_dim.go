@@ -1,4 +1,4 @@
-//go:build !onion
+//go:build !onion && !muos
 
 package platform
 
@@ -18,7 +18,8 @@ import (
 // gate is an EXPLICIT POSITIVE: only a host that announces LODOR_HOST_OS=lodoros (the
 // LodorOS Lodor.pak exports it) is treated as native-state. Empty or any other value
 // keeps markers, preserving every non-LodorOS host's current behavior with zero risk.
-// (The OnionOS build supplies its own HostShowsStateNatively -> false via build tag.)
+// (The OnionOS and muOS builds supply their own HostShowsStateNatively -> false via
+// build tag: their stock launchers can never dim, so the gate is hard-false there.)
 func HostShowsStateNatively() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("LODOR_HOST_OS"))) {
 	case "lodoros", "lodor", "minui":

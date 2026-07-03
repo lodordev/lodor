@@ -24,6 +24,7 @@ import (
 	"lodor/config"
 	"lodor/cover"
 	"lodor/platform"
+	"lodor/ranet"
 	"lodor/romm"
 	"lodor/sync"
 )
@@ -979,6 +980,11 @@ func runPushSave(client *romm.Client, cfg *config.Config, romPath string) {
 		if err := writeLastSynced(romPath, pushed); err != nil {
 			fmt.Fprintf(os.Stderr, "push-save: WARN couldn't write synced signal: %s\n", safeErr(err))
 		}
+		// Cross-device sidecars (#146/#149): with the save landed (radio warm,
+		// server reachable), push this ROM's compact .lodortime record and its
+		// newest preview alongside it. BEST-EFFORT: never changes this mode's
+		// outcome or stdout contract.
+		pushSessionMetas(client, cfg, romPath)
 		fmt.Printf("RESULT pushed=1 staged=0\n")
 		exitMode(0)
 	}
@@ -1200,6 +1206,12 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 		fmt.Println("RESULT restored=0 reason=notfound")
 		os.Exit(0)
 	}
+	// META GUARD (#146): a .lodortime/.lodorshot.png sidecar record is not a
+	// save — restoring one over a real local save would destroy it.
+	if sync.IsMetaSave(chosen) {
+		fmt.Println("RESULT restored=0 reason=meta")
+		os.Exit(0)
+	}
 	// GHOST GUARD (#63): the chosen record has no stored bytes — it cannot be
 	// restored (the listing already hides ghosts; this covers a direct call).
 	if sync.IsGhostSave(chosen) {
@@ -1267,8 +1279,8 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 			continue
 		}
 		for _, s := range ps {
-			if sync.IsGhostSave(s) {
-				continue // a byte-less record isn't a playable session — keep it out of the feed
+			if sync.IsGhostSave(s) || sync.IsMetaSave(s) {
+				continue // a byte-less record (#63) or meta sidecar (#146) isn't a playable session — keep it out of the feed
 			}
 			if !seen[s.ID] {
 				seen[s.ID] = true
@@ -1320,8 +1332,8 @@ func runRecent(client *romm.Client, cfg *config.Config) {
 			continue
 		}
 		for _, s := range ps {
-			if sync.IsGhostSave(s) {
-				continue // a ghost (#63) must never drive the Continue tile
+			if sync.IsGhostSave(s) || sync.IsMetaSave(s) {
+				continue // a ghost (#63) or meta sidecar (#146) must never drive the Continue tile
 			}
 			if !found || s.UpdatedAt.After(newest.UpdatedAt) {
 				newest = s
@@ -1437,6 +1449,9 @@ func runPullSaves(client *romm.Client, cfg *config.Config) {
 			continue
 		}
 		for _, s := range saves {
+			if sync.IsMetaSave(s) {
+				continue // meta sidecar (#146): not a save — never counted, never pulled here
+			}
 			if sync.IsGhostSave(s) {
 				ghosts++
 				continue
@@ -1523,4 +1538,32 @@ func runSyncContinue(client *romm.Client, cfg *config.Config) {
 	fmt.Printf("CONTINUE entries=%d\n", entries)
 	fmt.Printf("RECENTS merged=%d total=%d\n", merged, total)
 	exitMode(0)
+}
+
+// runRACmd sends one RetroArch Network Control Interface command over loopback
+// UDP (task #145 — heavy-pak session bracketing; see engine/ranet). Contract:
+//
+//	fire-and-forget (default): exit 0 once the datagram left, 4 on a local
+//	  send failure. No stdout.
+//	--recv: send, wait 250ms, retry x3; print the reply line to stdout and
+//	  exit 0. A silent peer exits 3 — the wrapper reads that as "this vendor
+//	  RetroArch has no network interface" (ra-net UNSUPPORTED) and degrades.
+//
+// Purely local: no config, no host, no device — callable in any pairing state.
+func runRACmd(cmd string, recv bool, port int) {
+	addr := ranet.Addr(port)
+	if recv {
+		reply, err := ranet.SendRecv(addr, cmd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ra-cmd: %v\n", err)
+			os.Exit(3)
+		}
+		fmt.Println(reply)
+		os.Exit(0)
+	}
+	if err := ranet.Send(addr, cmd); err != nil {
+		fmt.Fprintf(os.Stderr, "ra-cmd: %v\n", err)
+		os.Exit(4)
+	}
+	os.Exit(0)
 }

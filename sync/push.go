@@ -205,8 +205,8 @@ func AlreadyOnServer(client *romm.Client, romID int, localPath string) bool {
 		return false
 	}
 	for _, s := range saves {
-		if IsGhostSave(s) {
-			continue
+		if IsGhostSave(s) || IsMetaSave(s) {
+			continue // neither a ghost's nor a meta record's hash can vouch for save bytes (#63/#146)
 		}
 		if s.ContentHash != nil && strings.EqualFold(*s.ContentHash, local) {
 			return true

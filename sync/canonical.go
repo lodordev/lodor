@@ -91,8 +91,8 @@ func markerTwinIDs(saves []romm.Save) []int {
 	// hashes verifiably held under a clean (unmarked) name
 	clean := map[string]bool{}
 	for _, s := range saves {
-		if IsGhostSave(s) || platform.HasLeadingMarker(s.FileName) {
-			continue
+		if IsGhostSave(s) || IsMetaSave(s) || platform.HasLeadingMarker(s.FileName) {
+			continue // a meta record (#146) never vouches for save bytes
 		}
 		if s.ContentHash != nil && *s.ContentHash != "" {
 			clean[strings.ToLower(*s.ContentHash)] = true
@@ -100,8 +100,8 @@ func markerTwinIDs(saves []romm.Save) []int {
 	}
 	var ids []int
 	for _, s := range saves {
-		if !platform.HasLeadingMarker(s.FileName) {
-			continue
+		if IsMetaSave(s) || !platform.HasLeadingMarker(s.FileName) {
+			continue // meta records (#146) are never heal candidates
 		}
 		if s.ContentHash == nil || *s.ContentHash == "" {
 			continue // no hash — cannot prove a surviving copy; keep

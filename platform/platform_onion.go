@@ -300,6 +300,22 @@ func PakDir() string {
 	return "."
 }
 
+// saveArtifactAnchors returns the filename prefixes (anchored with a trailing ".")
+// that identify THIS game's save/state artifacts in a save folder. OnionOS runs stock
+// RetroArch, which derives save/state names from the ROM basename with its extension
+// STRIPPED ("Game (USA).srm", "Game (USA).state1") — so the anchor is the stem, not
+// MinUI's full-filename form (anchoring on the full basename missed every RetroArch
+// save during a ✘/✓ marker flip, orphaning it under the old marker name). The
+// full-filename anchor is kept too (harmless when no such file exists) so an artifact
+// staged under the MinUI rule still migrates.
+func saveArtifactAnchors(romBase string) []string {
+	stem := strings.TrimSuffix(romBase, filepath.Ext(romBase))
+	if stem == "" || stem == romBase {
+		return []string{romBase}
+	}
+	return []string{stem, romBase}
+}
+
 // MirrorFolderName builds the Roms/ folder a platform's RomM games are mirrored into.
 // On OnionOS this is the bare system TAG (e.g. "GBA") regardless of mirror mode —
 // OnionOS binds a Roms/ subfolder to an emulator purely by that fixed folder code, so
