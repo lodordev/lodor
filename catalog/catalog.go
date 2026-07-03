@@ -19,6 +19,7 @@ import (
 
 	"lodor/config"
 	"lodor/cover"
+	"lodor/fsutil"
 	"lodor/platform"
 	"lodor/romm"
 )
@@ -952,18 +953,12 @@ func (e errPlatforms) Error() string { return string(e) }
 // writeIndexAtomic marshals idx and writes it to path via a temp file + rename so a
 // reader never sees a partial index. The parent directory is created if missing.
 func writeIndexAtomic(path string, idx index) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(idx, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
+	return fsutil.WriteFileAtomic(path, data, 0o644)
 }
 
 // loadIndex reads and parses catalog-index.json.

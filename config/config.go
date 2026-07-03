@@ -203,6 +203,12 @@ const (
 	MirrorModeMerge    = "merge"
 )
 
+// maxDownloadTimeout is the upper bound clamp for DownloadTimeout (seconds). Even a
+// large multi-disc download finishes well inside 24h; a value above this is a typo or
+// a stray nanosecond legacy value that slipped the Seconds fallback, and an unbounded
+// timeout would let a wedged transfer hang the sync forever.
+const maxDownloadTimeout Seconds = 86400 // 24h
+
 // Config is the parsed config.json. ApiTimeout and DownloadTimeout are stored in
 // whole seconds; see Seconds-typed unmarshal for the legacy nanosecond fallback.
 type Config struct {
@@ -382,10 +388,13 @@ func Load() (*Config, error) {
 		c.ApiTimeout = 30
 	}
 	if c.ApiTimeout > 300 {
-		c.ApiTimeout = 30
+		c.ApiTimeout = 300 // clamp to the 300s ceiling, don't reset to the default
 	}
 	if c.DownloadTimeout == 0 {
 		c.DownloadTimeout = 3600
+	}
+	if c.DownloadTimeout > maxDownloadTimeout {
+		c.DownloadTimeout = maxDownloadTimeout // clamp a runaway/typo'd value
 	}
 
 	// Overlay the pak's UI-owned toggles from settings.conf (same CWD as config.json).

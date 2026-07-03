@@ -23,6 +23,7 @@ import (
 	"lodor/catalog"
 	"lodor/config"
 	"lodor/cover"
+	"lodor/fsutil"
 	"lodor/platform"
 	"lodor/ranet"
 	"lodor/romm"
@@ -151,8 +152,11 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 		}
 	}
 	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out, onProg)
+	// FAT32-durable: fsync streamed ROM bytes before rename (streaming path — too
+	// large to buffer through fsutil). A Sync failure folds into the download gate.
+	syncErr := out.Sync()
 	cErr := out.Close()
-	if derr != nil || cErr != nil || n == 0 {
+	if derr != nil || syncErr != nil || cErr != nil || n == 0 {
 		noteAuthErr(derr)
 		_ = os.Remove(tmp)
 		fmt.Fprintf(os.Stderr, "DLFAIL download rom=%d\n", rom.ID)
@@ -168,6 +172,7 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 		restoreStub(dest)
 		return false
 	}
+	fsutil.SyncDir(filepath.Dir(dest)) // FAT32: persist the ROM rename into the folder
 
 	writePhase("Verifying…")
 	if vErr := verifyRomHash(rom, dest); vErr != nil {
@@ -488,11 +493,22 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 	}
 
 	folderName := filepath.Base(discDir) // == rom.FsNameNoExt; the m3u-relative prefix
-	total := len(rom.Files)
+
+	// Defensive disc ordering: RomM is expected to return Files in disc order, but
+	// don't trust it — a wrong order would boot "Disc 2" first and desync saves.
+	// Stable natural sort by FileName so "Disc 1" < "Disc 2" < "Disc 10" (plain
+	// lexical order puts "10" before "2"). Sort a copy; never mutate rom.Files.
+	discFiles := make([]romm.RomFile, len(rom.Files))
+	copy(discFiles, rom.Files)
+	sort.SliceStable(discFiles, func(a, b int) bool {
+		return naturalLess(discFiles[a].FileName, discFiles[b].FileName)
+	})
+
+	total := len(discFiles)
 	var m3uLines []string
 
 	writeProgress(0)
-	for i, f := range rom.Files {
+	for i, f := range discFiles {
 		if f.ID == 0 || f.FileName == "" {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc rom=%d: disc %d missing id/name\n", rom.ID, i+1)
 			cleanupMultiDisc(discDir)
@@ -533,8 +549,12 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 			}
 		}
 		n, dErr := client.DownloadRomFileTo(rom.ID, rom.FsName, f.ID, out, onProg)
+		// FAT32-durable: fsync the streamed disc bytes before rename so a power-yank
+		// can't zero a "renamed-in" .chd (streaming path — too large to buffer through
+		// fsutil, so we fsync in place). A Sync error folds into the download-failed gate.
+		syncErr := out.Sync()
 		cerr2 := out.Close()
-		if dErr != nil || cerr2 != nil || n == 0 {
+		if dErr != nil || syncErr != nil || cerr2 != nil || n == 0 {
 			noteAuthErr(dErr)
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc download rom=%d disc=%d: %s\n", rom.ID, i+1, safeErr(dErr))
 			_ = os.Remove(tmp)
@@ -548,6 +568,7 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 			cleanupMultiDisc(discDir)
 			return false
 		}
+		fsutil.SyncDir(discDir) // FAT32: persist the disc rename into the folder
 
 		// Per-disc hash verify (same gate as single-file). A .chd or a disc with no
 		// recorded hash is accepted (parity with verifyRomHash); a real mismatch fails
@@ -563,18 +584,11 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		writeProgress((i + 1) * 100 / total)
 	}
 
-	// Write the .m3u atomically (.tmp → rename), clearing any 0-byte stub at that path.
+	// Write the .m3u FAT32-atomically (temp + fsync + rename + dir fsync); the rename
+	// overwrites any 0-byte stub at that path.
 	writePhase("Writing playlist…")
-	m3uTmp := m3uPath + ".tmp"
-	if wErr := os.WriteFile(m3uTmp, []byte(strings.Join(m3uLines, "\n")+"\n"), 0o644); wErr != nil {
+	if wErr := fsutil.WriteFileAtomicString(m3uPath, strings.Join(m3uLines, "\n")+"\n", 0o644); wErr != nil {
 		fmt.Fprintf(os.Stderr, "DLFAIL multidisc m3u-write rom=%d\n", rom.ID)
-		cleanupMultiDisc(discDir)
-		return false
-	}
-	_ = os.Remove(m3uPath) // remove the stub before rename
-	if rErr := os.Rename(m3uTmp, m3uPath); rErr != nil {
-		fmt.Fprintf(os.Stderr, "DLFAIL multidisc m3u-rename rom=%d\n", rom.ID)
-		_ = os.Remove(m3uTmp)
 		cleanupMultiDisc(discDir)
 		return false
 	}
@@ -584,6 +598,78 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 	recordDownload(man, m3uPath, rom.ID) // the .m3u is the evictable download anchor
 
 	return true
+}
+
+// naturalLess reports whether a < b under a natural (human) ordering, where runs of
+// ASCII digits compare by numeric value rather than lexically — so "Disc 2" sorts
+// before "Disc 10". Non-digit runs compare byte-wise, case-insensitively for ASCII
+// letters so casing never reorders discs. Deterministic and allocation-light; used to
+// order multi-disc playlist entries defensively (see runMultiDisc).
+func naturalLess(a, b string) bool {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		ai, bi := a[i], b[j]
+		aDig, bDig := ai >= '0' && ai <= '9', bi >= '0' && bi <= '9'
+		if aDig && bDig {
+			// Compare two digit runs numerically: skip leading zeros, then longer run
+			// (more significant digits) wins; equal length breaks on first difference.
+			si, sj := i, j
+			for i < len(a) && a[i] == '0' {
+				i++
+			}
+			for j < len(b) && b[j] == '0' {
+				j++
+			}
+			ns, ms := i, j
+			for i < len(a) && a[i] >= '0' && a[i] <= '9' {
+				i++
+			}
+			for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+				j++
+			}
+			la, lb := i-ns, j-ms
+			if la != lb {
+				return la < lb
+			}
+			if d := compareASCII(a[ns:i], b[ms:j]); d != 0 {
+				return d < 0
+			}
+			// Numerically equal: the run WITH more leading zeros ("03" vs "3") sorts
+			// first — deterministic tiebreak so ordering is stable.
+			if (ns-si) != (ms-sj) {
+				return (ns - si) > (ms - sj)
+			}
+			continue
+		}
+		la, lb := lowerASCII(ai), lowerASCII(bi)
+		if la != lb {
+			return la < lb
+		}
+		i++
+		j++
+	}
+	return len(a)-i < len(b)-j
+}
+
+// compareASCII returns -1/0/1 comparing two equal-length digit strings lexically.
+func compareASCII(a, b string) int {
+	for k := 0; k < len(a) && k < len(b); k++ {
+		if a[k] != b[k] {
+			if a[k] < b[k] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// lowerASCII lowercases a single ASCII byte so disc ordering ignores letter case.
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
 }
 
 // cleanupMultiDisc removes the per-game disc folder after a failed multi-disc
@@ -747,10 +833,10 @@ func runDownloadBios(client *romm.Client, cfg *config.Config) {
 				if fi, sErr := os.Stat(dest); sErr == nil && fi.Size() > 0 {
 					continue // keep the copy already there
 				}
-				if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
-					continue
-				}
-				if wErr := os.WriteFile(dest, data, 0o644); wErr == nil {
+				// FAT32-atomic firmware write (temp + fsync + rename + dir fsync); a
+				// torn BIOS file would fail the emulator until re-fetched. fsutil also
+				// MkdirAll's the parent.
+				if wErr := fsutil.WriteFileAtomic(dest, data, 0o644); wErr == nil {
 					wrote = true
 				}
 			}
@@ -1032,15 +1118,9 @@ func runPushSave(client *romm.Client, cfg *config.Config, romPath string) {
 // way). Written ONLY on a verified landed push.
 func writeLastSynced(romPath string, count int) error {
 	p := filepath.Join(pakDir(), "last-synced.txt")
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
 	line := fmt.Sprintf("%d %d %s\n", time.Now().Unix(), count, filepath.Base(romPath))
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, []byte(line), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p)
+	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
+	return fsutil.WriteFileAtomicString(p, line, 0o644)
 }
 
 // runReconcile flips ONE ROM's on-disk state marker (✘→✓) to match the bytes now on the

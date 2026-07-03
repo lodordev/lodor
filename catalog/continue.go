@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"lodor/config"
+	"lodor/fsutil"
 	"lodor/platform"
 	"lodor/romm"
 )
@@ -191,12 +192,8 @@ func writeContinueFile(colDir string, lines []string) int {
 	}
 	name := sanitizeCollectionName(continueCollectionName) + ".txt"
 	final := filepath.Join(colDir, name)
-	tmp := final + ".tmp"
-	if werr := os.WriteFile(tmp, []byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
-		return 0
-	}
-	if rerr := os.Rename(tmp, final); rerr != nil {
-		_ = os.Remove(tmp)
+	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
+	if werr := fsutil.WriteFileAtomicString(final, strings.Join(lines, "\n")+"\n", 0o644); werr != nil {
 		return 0
 	}
 	return len(lines)

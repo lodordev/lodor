@@ -23,6 +23,8 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+
+	"lodor/fsutil"
 )
 
 // MaxEdge is the maximum length (px) of a saved cover's long edge. A cover whose long
@@ -229,12 +231,6 @@ func boxReduce(src image.Image, dw, dh int) *image.NRGBA {
 // writeAtomic writes data to path via a temp file + rename so a reader (the launcher)
 // never sees a partial PNG. Creates the .media parent dir as needed.
 func writeAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
+	return fsutil.WriteFileAtomic(path, data, 0o644)
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"lodor/fsutil"
 	"lodor/platform"
 )
 
@@ -168,16 +169,10 @@ func pendingRead() []string {
 // "X Saves Pending" banner reads zero.
 func pendingWrite(paths []string) error {
 	p := pendingPath()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
 	var body string
 	if len(paths) > 0 {
 		body = strings.Join(paths, "\n") + "\n"
 	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p)
+	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
+	return fsutil.WriteFileAtomicString(p, body, 0o644)
 }

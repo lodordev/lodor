@@ -7,6 +7,7 @@ import (
 
 	"lodor/catalog"
 	"lodor/config"
+	"lodor/fsutil"
 	"lodor/platform"
 	"lodor/romm"
 )
@@ -424,12 +425,10 @@ func writeSave(client *romm.Client, cfg *config.Config, saveID int, localPath st
 	if _, statErr := os.Stat(localPath); statErr == nil {
 		_ = os.Rename(localPath, localPath+".bak")
 	}
-	tmp := localPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return PullResult{Outcome: PullError, Reason: "write failed"}
-	}
-	if err := os.Rename(tmp, localPath); err != nil {
-		_ = os.Remove(tmp)
+	// FAT32-atomic: temp + fsync + rename + dir fsync. Critical here — the live
+	// save was just moved to .bak, so a non-durable write that a power-yank zeroes
+	// would leave the live file empty with the good copy hidden in .bak.
+	if err := fsutil.WriteFileAtomic(localPath, data, 0o644); err != nil {
 		return PullResult{Outcome: PullError, Reason: "write failed"}
 	}
 	return PullResult{Outcome: PullWritten, LocalPath: localPath}

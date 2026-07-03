@@ -16,6 +16,7 @@ import (
 
 	"lodor/catalog"
 	"lodor/config"
+	"lodor/fsutil"
 	"lodor/playtime"
 	"lodor/romm"
 	"lodor/sync"
@@ -126,13 +127,8 @@ func sessionEndPersistClock() {
 		}
 		p = filepath.Join(sd, ".userdata", "shared", "datetime.txt")
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return
-	}
-	tmp := p + ".tmp"
-	if os.WriteFile(tmp, []byte(now.Format("2006-01-02 15:04:05")+"\n"), 0o644) == nil {
-		_ = os.Rename(tmp, p)
-	}
+	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
+	_ = fsutil.WriteFileAtomicString(p, now.Format("2006-01-02 15:04:05")+"\n", 0o644)
 }
 
 // pushSessionMetas pushes this device's cross-device sidecars for one ROM
@@ -212,12 +208,7 @@ func runSyncPlaytime(client *romm.Client, cfg *config.Config) {
 				continue
 			}
 			fetched++
-			memo[s.ID] = s.UpdatedAt.Unix()
-			var rec playtime.Record
-			if json.Unmarshal(data, &rec) != nil {
-				continue
-			}
-			if changed, merr := playtime.MergePeer(rec, self); merr == nil && changed {
+			if mergePeerRecord(memo, s.ID, s.UpdatedAt.Unix(), data, self, playtime.MergePeer) {
 				merged++
 			}
 		}
@@ -230,6 +221,37 @@ func runSyncPlaytime(client *romm.Client, cfg *config.Config) {
 	}
 	fmt.Printf("RESULT playtime_fetched=%d merged=%d\n", fetched, merged)
 	exitMode(0)
+}
+
+// mergePeerRecord decodes one peer .lodortime body and merges it, recording the memo
+// (save_id -> updated_at) ONLY when the outcome is durable. It returns whether the
+// merge actually changed local totals.
+//
+// The memo ordering is the fix for bug #166: on a TRANSIENT merge error the record is
+// deliberately NOT memoized, so the next --sync-playtime run re-fetches and re-merges
+// it instead of permanently dropping that peer's playtime. A merge success (or clean
+// no-op) memoizes; an undecodable body memoizes too (re-fetching it is pointless — it
+// can only change when updatedAt bumps, which busts the memo anyway). mergeFn is
+// injected so the decision can be unit-tested without a live merge.
+func mergePeerRecord(
+	memo map[int]int64,
+	saveID int,
+	updatedAt int64,
+	data []byte,
+	self string,
+	mergeFn func(playtime.Record, string) (bool, error),
+) bool {
+	var rec playtime.Record
+	if json.Unmarshal(data, &rec) != nil {
+		memo[saveID] = updatedAt // undecodable — memo so we don't re-fetch a dead body
+		return false
+	}
+	changed, merr := mergeFn(rec, self)
+	if merr != nil {
+		return false // transient failure: leave unmemoized so next run retries
+	}
+	memo[saveID] = updatedAt // durable: safe to memo now
+	return changed
 }
 
 // playtimeMemoPath stores save_id -> updated_at for fetched .lodortime records.
@@ -248,11 +270,6 @@ func savePlaytimeMemo(m map[int]int64) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(playtime.Dir(), 0o755); err != nil {
-		return
-	}
-	tmp := playtimeMemoPath() + ".tmp"
-	if os.WriteFile(tmp, data, 0o644) == nil {
-		_ = os.Rename(tmp, playtimeMemoPath())
-	}
+	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
+	_ = fsutil.WriteFileAtomic(playtimeMemoPath(), data, 0o644)
 }
