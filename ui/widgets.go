@@ -1,5 +1,7 @@
 package ui
 
+import "strings"
+
 // Higher-level widgets for the onboarding wizard: a Theme, a Menu (list select), an
 // on-screen Keyboard (text entry - Wi-Fi password stays muOS's job, but server URL,
 // pairing code, and device name are entered here), and chrome (header/footer/message/
@@ -96,13 +98,139 @@ func (m *Menu) Draw(c *Canvas, t Theme, x, y, w, h int) {
 	}
 }
 
+// ScrollMenu is a vertical single-select list that SCROLLS. Menu.Draw clips any row past
+// its box (widgets.go), which is fine for a fixed 2-3 item choice but loses rows on a long
+// list (Game Manager systems/games, the profile picker, the recent-activity feed). ScrollMenu
+// keeps the selected row in view by sliding a fixed-height window over Items and draws honest
+// up/down "more" markers so the user knows rows exist off-screen. Same immediate-mode contract
+// as Menu: the caller owns the loop, calls Draw, feeds Handle one Button at a time.
+type ScrollMenu struct {
+	Items []string
+	sel   int
+	off   int // index of the first visible row
+}
+
+func (m *ScrollMenu) Selected() int { return m.sel }
+func (m *ScrollMenu) SelectedItem() string {
+	if m.sel >= 0 && m.sel < len(m.Items) {
+		return m.Items[m.sel]
+	}
+	return ""
+}
+
+// Handle moves the selection for Up/Down (clamped, no wrap); returns true if Confirm/Start
+// was pressed. Offset tracking happens in Draw (it needs the box height).
+func (m *ScrollMenu) Handle(b Button) (confirmed bool) {
+	switch b {
+	case BtnUp:
+		if m.sel > 0 {
+			m.sel--
+		}
+	case BtnDown:
+		if m.sel < len(m.Items)-1 {
+			m.sel++
+		}
+	case BtnConfirm, BtnStart:
+		return true
+	}
+	return false
+}
+
+// smRowH is the per-row height ScrollMenu and Menu share.
+func smRowH(t Theme) int { return glyphH*t.BodyScale + 18 }
+
+// VisibleRows reports how many rows fit in a box of height h (>=1). Exposed for tests.
+func (m *ScrollMenu) VisibleRows(t Theme, h int) int {
+	v := h / smRowH(t)
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
+// Draw renders the visible window within (x,y,w,h), scrolling so the selection stays on
+// screen, and draws ^ / v markers when items exist above / below the window.
+func (m *ScrollMenu) Draw(c *Canvas, t Theme, x, y, w, h int) {
+	rowH := smRowH(t)
+	vis := m.VisibleRows(t, h)
+	if m.sel < m.off {
+		m.off = m.sel
+	}
+	if m.sel >= m.off+vis {
+		m.off = m.sel - vis + 1
+	}
+	if m.off < 0 {
+		m.off = 0
+	}
+	end := m.off + vis
+	if end > len(m.Items) {
+		end = len(m.Items)
+	}
+	for i := m.off; i < end; i++ {
+		ry := y + (i-m.off)*rowH
+		if i == m.sel {
+			c.FillRect(x, ry, w, rowH, t.Panel)
+			c.FillRect(x, ry, 6, rowH, t.Accent)
+		}
+		col := t.Dim
+		if i == m.sel {
+			col = t.Text
+		}
+		c.DrawText(x+22, ry+9, m.Items[i], col, t.BodyScale)
+	}
+	if m.off > 0 {
+		c.DrawText(x+w-14, y+2, "^", t.Accent, t.BodyScale)
+	}
+	if end < len(m.Items) {
+		c.DrawText(x+w-14, y+(vis-1)*rowH+9, "v", t.Accent, t.BodyScale)
+	}
+}
+
+// ParseEngineResult condenses an engine mode's combined output into ONE honest line for a
+// result screen. It prefers a structured trailer (RESULT/MIRROR/CONTINUE) or an explicit
+// reason= line; failing that it returns the last non-empty line. It never fabricates a
+// success message — an empty return means the caller should fall back to its own default
+// (feedback_no_fake_ui_state: show the engine's real words, not an invented "OK").
+func ParseEngineResult(output string) string {
+	var last, structured string
+	for _, ln := range strings.Split(output, "\n") {
+		s := strings.TrimSpace(ln)
+		if s == "" {
+			continue
+		}
+		last = s
+		if strings.HasPrefix(s, "RESULT ") || strings.HasPrefix(s, "MIRROR ") || strings.HasPrefix(s, "CONTINUE ") {
+			structured = s
+		}
+	}
+	if structured != "" {
+		return structured
+	}
+	return last
+}
+
+// ResultToken extracts the value of key=<value> from an engine RESULT/reason line, or "" if
+// the token is absent. Value is read up to the next space (tokens are space-separated).
+func ResultToken(output, key string) string {
+	for _, f := range strings.Fields(output) {
+		if strings.HasPrefix(f, key+"=") {
+			return f[len(key)+1:]
+		}
+	}
+	return ""
+}
+
 // Keyboard is an on-screen text-entry grid driven by the d-pad + Confirm.
+// Cancelled reports that the user chose BACK (the grid's BACK key) to leave the
+// step without committing - the caller uses it to navigate one step backward, so
+// the user is never trapped in a text field (blocker #170).
 type Keyboard struct {
-	Prompt string
-	Text   string
-	row    int
-	col    int
-	shift  bool
+	Prompt    string
+	Text      string
+	Cancelled bool
+	row       int
+	col       int
+	shift     bool
 }
 
 var kbGrid = [][]string{
@@ -111,7 +239,7 @@ var kbGrid = [][]string{
 	{"a", "s", "d", "f", "g", "h", "j", "k", "l", ":"},
 	{"z", "x", "c", "v", "b", "n", "m", ".", "-", "/"},
 	{"@", "_", "~", "?", "=", "&", "%", "+", "#", "*"},
-	{"SHIFT", "SPACE", "DEL", "OK"},
+	{"SHIFT", "SPACE", "DEL", "BACK", "OK"},
 }
 
 func upper(s string) string {
@@ -170,6 +298,9 @@ func (k *Keyboard) activate() (done bool) {
 		k.Text += " "
 	case "DEL":
 		k.backspace()
+	case "BACK":
+		k.Cancelled = true
+		return true
 	case "OK":
 		return true
 	default:

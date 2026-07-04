@@ -24,3 +24,10 @@ func MirrorFolderName(display, tag, mode string) string {
 	}
 	return fmt.Sprintf("%s (%s)", display, tag)
 }
+
+// CanonicalMirrorFolder returns "" on MinUI/NextUI: a user directory_mappings
+// relative_path is legitimately custom (hand-tuned, or a merge-adopted folder), so the
+// mirror NEVER heals it. Only muOS — where the folder name is dictated by info/assign —
+// overrides this to force the catalogue name, keeping catalog.healMirrorFolders a no-op
+// on the default build.
+func CanonicalMirrorFolder(fsSlug string) string { return "" }

@@ -104,30 +104,30 @@ var onionRomTags = map[string]string{
 // save dir (we never blind-write to a guessed folder). The shim always sets the env, so
 // this is a safety net, not the primary path. Verify against the card's actual core set.
 var onionDefaultCore = map[string]string{
-	"gb":           "Gambatte",
-	"gbc":          "Gambatte",
-	"gba":          "mGBA",
-	"snes":         "Snes9x",
-	"sfam":         "Snes9x",
-	"nes":          "FCEUmm",
-	"famicom":      "FCEUmm",
-	"fds":          "FCEUmm",
-	"genesis":      "Genesis Plus GX",
-	"gamegear":     "Genesis Plus GX",
-	"sms":          "Genesis Plus GX",
-	"mastersystem": "Genesis Plus GX",
-	"segacd":       "Genesis Plus GX",
-	"sega32":       "PicoDrive",
-	"sega32x":      "PicoDrive",
-	"lynx":         "Handy",
-	"atarilynx":    "Handy",
-	"psx":          "PCSX-ReARMed",
-	"n64":          "Mupen64Plus-Next",
-	"tg16":         "Beetle PCE Fast",
-	"pcengine":     "Beetle PCE Fast",
-	"wonderswan":   "Beetle Cygne",
-	"wonderswan-color": "Beetle Cygne",
-	"virtualboy":   "Beetle VB",
+	"gb":                   "Gambatte",
+	"gbc":                  "Gambatte",
+	"gba":                  "mGBA",
+	"snes":                 "Snes9x",
+	"sfam":                 "Snes9x",
+	"nes":                  "FCEUmm",
+	"famicom":              "FCEUmm",
+	"fds":                  "FCEUmm",
+	"genesis":              "Genesis Plus GX",
+	"gamegear":             "Genesis Plus GX",
+	"sms":                  "Genesis Plus GX",
+	"mastersystem":         "Genesis Plus GX",
+	"segacd":               "Genesis Plus GX",
+	"sega32":               "PicoDrive",
+	"sega32x":              "PicoDrive",
+	"lynx":                 "Handy",
+	"atarilynx":            "Handy",
+	"psx":                  "PCSX-ReARMed",
+	"n64":                  "Mupen64Plus-Next",
+	"tg16":                 "Beetle PCE Fast",
+	"pcengine":             "Beetle PCE Fast",
+	"wonderswan":           "Beetle Cygne",
+	"wonderswan-color":     "Beetle Cygne",
+	"virtualboy":           "Beetle VB",
 	"neo-geo-pocket":       "Beetle NeoPop",
 	"neo-geo-pocket-color": "Beetle NeoPop",
 }
@@ -439,3 +439,9 @@ func MultiDiscDir(cfg *config.Config, rom romm.Rom) string {
 	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
 	return filepath.Join(romDir, rom.FsNameNoExt)
 }
+
+// CanonicalMirrorFolder returns "" on OnionOS: the bare-TAG folder OnionOS mirror
+// already writes IS canonical here, and any user mapping is legitimately custom, so the
+// mirror never heals it. Only muOS overrides this (its folder name is fixed by
+// info/assign), keeping catalog.healMirrorFolders a no-op on the onion build.
+func CanonicalMirrorFolder(fsSlug string) string { return "" }

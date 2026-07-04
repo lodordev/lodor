@@ -18,5 +18,12 @@ Lodor stands on the work of others in the RomM and retro-handheld communities.
   with merge-on-conflict, per Allium's games/game_sessions model, re-expressed as JSONL/TSV instead
   of SQLite and extended with cross-device merge over the RomM saves transport).
 
+- **QR encoder (`engine/ui/qr.go`)** — original CGO-free, stdlib-only Go, written from scratch to the
+  **ISO/IEC 18004** QR Code specification (byte mode, ECC level M, versions 1-9) for the muOS onboarding
+  wizard's Tailscale sign-in screen. No third-party code is vendored. It was **cross-checked module-for-
+  module** against **[Project Nayuki's QR Code generator](https://www.nayuki.io/page/qr-code-generator-library)**
+  (qrcodegen, MIT) and **[libqrencode](https://github.com/fukuchi/libqrencode)** (LGPL — used only as an
+  external oracle during testing, not linked or distributed), and every output decodes cleanly under zbar.
+
 Trademarks and product names belong to their respective owners. Lodor ships **no** BIOS, firmware, or
 copyrighted game content — you supply your own, on your own server.

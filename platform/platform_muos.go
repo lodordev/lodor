@@ -461,3 +461,17 @@ func MultiDiscDir(cfg *config.Config, rom romm.Rom) string {
 	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
 	return filepath.Join(romDir, rom.FsNameNoExt)
 }
+
+// CanonicalMirrorFolder returns the ONLY Roms/ folder name muOS will recognise for a
+// slug — the catalogue name info/assign binds to an emulator. muOS resolves a system
+// PURELY by this folder name, so a directory_mappings relative_path that differs (an
+// onion bare-TAG "GG", a MinUI "Sega Game Gear (GG)" left in a config.json carried
+// across CFWs, or a hand-edit) is unlaunchable and must be HEALED. catalog.ensure-
+// DirectoryMappings calls this to snap such a mapping back to the catalogue name.
+// Returns "" for a slug muOS does not map (content-pack system) so the caller leaves it.
+func CanonicalMirrorFolder(fsSlug string) string {
+	if f, ok := muosRomFolders[fsSlug]; ok {
+		return f
+	}
+	return ""
+}

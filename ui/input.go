@@ -185,6 +185,10 @@ func (s *EvdevSource) read(f *os.File) {
 }
 
 func (s *EvdevSource) Buttons() <-chan Button { return s.ch }
+
+// Count is the number of input devices successfully opened (for the startup phase log).
+func (s *EvdevSource) Count() int { return len(s.files) }
+
 func (s *EvdevSource) Close() error {
 	s.once.Do(func() {
 		close(s.closed)

@@ -220,7 +220,13 @@ func ensureDirectoryMappings(client romClient, cfg *config.Config) error {
 		return nil
 	}
 	if len(cfg.DirectoryMappings) > 0 {
-		return nil // respect existing/hand-tuned mappings — never overwrite
+		// Respect existing/hand-tuned mappings — but on a host where the Roms folder name
+		// is DICTATED by the frontend (muOS: info/assign binds by catalogue name), snap a
+		// foreign/stale relative_path (an onion bare-TAG "GG", a config.json carried across
+		// CFWs) back to the canonical name so stubs land where the frontend looks. No-op on
+		// MinUI/OnionOS (platform.CanonicalMirrorFolder returns "" — custom mappings stand).
+		healMirrorFolders(cfg)
+		return nil
 	}
 
 	lister, ok := client.(platformLister)
@@ -257,4 +263,35 @@ func ensureDirectoryMappings(client romClient, cfg *config.Config) error {
 		fmt.Fprintf(os.Stderr, "MAPGEN  %s -> %s\n", s, mappings[s].RelativePath)
 	}
 	return nil
+}
+
+// healMirrorFolders snaps directory_mappings whose relative_path is not the host's
+// canonical folder for that slug back to the canonical name, persisting any change. It
+// exists for muOS, where the Roms folder name is DICTATED by info/assign (the catalogue
+// name): a config.json carried over from another CFW (onion's bare "GG", MinUI's "Sega
+// Game Gear (GG)") or a hand-edit leaves a mapping muOS cannot launch, so we snap it to
+// the catalogue name. On MinUI/OnionOS platform.CanonicalMirrorFolder returns "" for
+// every slug, so this is a pure no-op there (user mappings are legitimately custom and
+// never touched). Slugs the host does not map (canonical == "") are left as-is. Logged
+// to STDERR only; never touches the token/host block.
+func healMirrorFolders(cfg *config.Config) {
+	if cfg == nil || len(cfg.DirectoryMappings) == 0 {
+		return
+	}
+	changed := false
+	for slug, m := range cfg.DirectoryMappings {
+		want := platform.CanonicalMirrorFolder(slug)
+		if want == "" || m.RelativePath == want {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "MAPGEN heal %s: %q -> %q (host catalogue name)\n", slug, m.RelativePath, want)
+		m.RelativePath = want
+		cfg.DirectoryMappings[slug] = m
+		changed = true
+	}
+	if changed {
+		if err := config.WriteDirectoryMappings(cfg.DirectoryMappings); err != nil {
+			fmt.Fprintf(os.Stderr, "MAPGEN heal persist failed: %v\n", err)
+		}
+	}
 }
