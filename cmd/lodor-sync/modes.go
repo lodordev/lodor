@@ -7,6 +7,7 @@ package main
 // lives here too.
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
@@ -29,6 +30,11 @@ import (
 	"lodor/romm"
 	"lodor/sync"
 )
+
+// extractTimeout bounds a single archive (7z/zip) extraction. Generous enough for a
+// multi-GB CHD/ISO on slow handheld storage, finite so a wedged decoder can never hang
+// the download path forever (HARDENING — the unbounded-wait class).
+const extractTimeout = 20 * time.Minute
 
 // runDownloadRom downloads ONE ROM's real file (turning a 0-byte stub into a
 // playable game), verifies it against RomM's recorded hash, and streams coarse
@@ -334,11 +340,20 @@ func extract7zInto(archivePath, dest string) error {
 		return err
 	}
 	defer os.RemoveAll(outdir)
-	cmd := exec.Command(bin, "e", "-y", "-o"+outdir, archivePath)
+	// HARDENING: bound the extraction. A bare exec.Command().Run() waits forever, so a
+	// wedged/hung 7zz child (corrupt archive, stuck FUSE mount, a decoder spinning on a
+	// malformed header) would freeze the download path with no ceiling. CommandContext
+	// kills the child on deadline; a legitimately large CHD/ISO extracts well inside it.
+	ctx, cancel := context.WithTimeout(context.Background(), extractTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "e", "-y", "-o"+outdir, archivePath)
 	cmd.Stdout = io.Discard
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("7z: extraction timed out after %s", extractTimeout)
+		}
 		return fmt.Errorf("7z: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	entries, err := os.ReadDir(outdir)
@@ -1188,7 +1203,7 @@ func runListSaves(client *romm.Client, cfg *config.Config, romPath string) {
 	if !ok || id == 0 {
 		os.Exit(0) // unmanaged ROM — nothing to list
 	}
-	allSaves, err := client.GetSaves(romm.SaveQuery{RomID: id})
+	allSaves, err := sync.GetSavesAttributed(client, cfg, romm.SaveQuery{RomID: id})
 	if err != nil {
 		noteAuthErr(err)
 		fmt.Fprintf(os.Stderr, "FATAL list-saves: %s\n", safeErr(err))
@@ -1225,8 +1240,8 @@ func runListSaves(client *romm.Client, cfg *config.Config, romPath string) {
 	markedCurrent := false // the NEWEST matching row got the CURRENT tag
 	for _, s := range saves {
 		who := s.Emulator
-		if len(s.DeviceSyncs) > 0 && s.DeviceSyncs[0].DeviceName != "" {
-			who = s.DeviceSyncs[0].DeviceName
+		if dn := sync.AttributedDeviceName(s, sync.SelfDeviceID(cfg)); dn != "" {
+			who = dn
 		}
 		// Field 4 (optional — EXTENDS, never reorders fields 0-3): "CURRENT" on the single
 		// newest revision whose content matches the on-device save; absent on every other row.
@@ -1353,7 +1368,7 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 	var saves []romm.Save
 	seen := map[int]bool{}
 	for _, p := range platforms {
-		ps, gerr := client.GetSaves(romm.SaveQuery{PlatformID: p.ID})
+		ps, gerr := sync.GetSavesAttributed(client, cfg, romm.SaveQuery{PlatformID: p.ID})
 		if gerr != nil {
 			noteAuthErr(gerr)
 			continue
@@ -1382,10 +1397,7 @@ func runSyncFeed(client *romm.Client, cfg *config.Config) {
 		if e := filepath.Ext(game); len(e) >= 2 && len(e) <= 5 {
 			game = strings.TrimSuffix(game, e)
 		}
-		device := ""
-		if len(s.DeviceSyncs) > 0 && s.DeviceSyncs[0].DeviceName != "" {
-			device = s.DeviceSyncs[0].DeviceName
-		}
+		device := sync.AttributedDeviceName(s, sync.SelfDeviceID(cfg))
 		fmt.Printf("%s\t%s\t%s\n", game, s.UpdatedAt.Format("2006-01-02 15:04"), device)
 	}
 	exitModeQuiet(0)
@@ -1406,7 +1418,7 @@ func runRecent(client *romm.Client, cfg *config.Config) {
 	var newest romm.Save
 	found := false
 	for _, p := range platforms {
-		ps, gerr := client.GetSaves(romm.SaveQuery{PlatformID: p.ID})
+		ps, gerr := sync.GetSavesAttributed(client, cfg, romm.SaveQuery{PlatformID: p.ID})
 		if gerr != nil {
 			noteAuthErr(gerr)
 			continue
@@ -1437,10 +1449,7 @@ func runRecent(client *romm.Client, cfg *config.Config) {
 	if game == "" {
 		game = rom.FsNameNoExt
 	}
-	device := ""
-	if len(newest.DeviceSyncs) > 0 {
-		device = newest.DeviceSyncs[0].DeviceName
-	}
+	device := sync.AttributedDeviceName(newest, sync.SelfDeviceID(cfg))
 	fmt.Printf("%s\t%s\t%s\t%s\n", path, game, newest.UpdatedAt.Format("2006-01-02 15:04"), device)
 	exitModeQuiet(0)
 }

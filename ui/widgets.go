@@ -359,7 +359,7 @@ func (k *Keyboard) Draw(c *Canvas, t Theme, x, y, w, h int) {
 // Message draws a centered title + wrapped body in the content area; used for welcome,
 // status, error, and done screens. Honest: callers pass real state only.
 func (t Theme) Message(c *Canvas, title, body string, bodyColor Color) {
-	x, y, w, _ := t.Frame(c, "Lodor Sync Setup", "A: continue   B: back")
+	x, y, w, _ := t.Frame(c, "Lodor Setup", "A: continue   B: back")
 	c.DrawTextCentered(x, y+10, w, title, t.Accent, t.TitleScale-1)
 	t.DrawTextWrappedAt(c, x, y+10+glyphH*(t.TitleScale-1)+30, w, body, bodyColor, t.BodyScale)
 }
@@ -372,7 +372,7 @@ func (t Theme) DrawTextWrappedAt(c *Canvas, x, y, w int, s string, col Color, sc
 // Progress draws a labeled progress bar (0..100) plus a phase line. Used during mirror/
 // download. pct<0 renders an indeterminate (full-dim) bar.
 func (t Theme) Progress(c *Canvas, title, phase string, pct int) {
-	x, y, w, _ := t.Frame(c, "Lodor Sync Setup", "please wait...")
+	x, y, w, _ := t.Frame(c, "Lodor Setup", "please wait...")
 	c.DrawText(x, y+10, title, t.Text, t.BodyScale)
 	by := y + 10 + glyphH*t.BodyScale + 24
 	barH := 28

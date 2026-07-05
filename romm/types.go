@@ -120,10 +120,15 @@ type Firmware struct {
 	Sha1Hash string `json:"sha1_hash"`
 }
 
-// Collection is a named RomM collection and its member ROM ids.
+// Collection is a named RomM collection and its member ROM ids. ID and IsFavorite
+// are additive (task #167): the write-back favourites flow keys the special
+// "Favourites" collection on is_favorite==true and addresses it by id. Older
+// consumers (the catalog mirror) read only Name/RomIDs and are unaffected.
 type Collection struct {
-	Name   string `json:"name"`
-	RomIDs []int  `json:"rom_ids"`
+	ID         int    `json:"id"`
+	Name       string `json:"name"`
+	IsFavorite bool   `json:"is_favorite"`
+	RomIDs     []int  `json:"rom_ids"`
 }
 
 // PaginatedRoms is the paged response envelope for GET /api/roms.

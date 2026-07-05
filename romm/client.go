@@ -33,6 +33,14 @@ type Client struct {
 	cfClientID     string
 	cfClientSecret string
 	httpClient     *http.Client
+
+	// serverVer caches the RomM version string parsed from GET /api/heartbeat
+	// (SYSTEM.VERSION), fetched at most once per Client via ServerVersion(). The
+	// device_save_sync feature gate (>= 4.9.0) reads it so a per-save best-effort
+	// call costs one heartbeat, not one per row. serverVerSet distinguishes "cached
+	// empty" (heartbeat answered but omitted a version) from "never fetched".
+	serverVer    string
+	serverVerSet bool
 }
 
 // hostTransport builds the *http.Transport for a host, or returns nil to let the

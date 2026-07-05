@@ -431,6 +431,12 @@ func writeSave(client *romm.Client, cfg *config.Config, saveID int, localPath st
 	if err := fsutil.WriteFileAtomic(localPath, data, 0o644); err != nil {
 		return PullResult{Outcome: PullError, Reason: "write failed"}
 	}
+	// LEDGER CONFIRM (#176): the bytes are now safely on the card, so record that this
+	// device holds save saveID (POST /api/saves/{id}/downloaded). We download with
+	// optimistic=false precisely so the server does NOT advance the sync row until this
+	// point. Best-effort and non-blocking — a failed confirm never turns a written save
+	// into a pull error (the save is already durable); gated on RomM >= 4.9.0.
+	confirmDownloaded(client, cfg, saveID)
 	return PullResult{Outcome: PullWritten, LocalPath: localPath}
 }
 

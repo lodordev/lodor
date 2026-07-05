@@ -86,6 +86,14 @@ func main() {
 		loginProfile      string
 		loginUser         string
 		loginDevice       string
+		trackSave         string
+		untrackSave       string
+		setFavorite       string
+		unsetFavorite     string
+		setRating         string
+		setStatus         string
+		setProps          string
+		checkBios         string
 	)
 	flag.BoolVar(&mirrorCatalog, "mirror-catalog", false, "stub every not-downloaded RomM game into Roms/ and write catalog-index.json; prints MIRROR created=.. existing=.. skipped=.. multifile=.. covers=..  (UPDATE: only new games + missing covers)")
 	flag.BoolVar(&mirrorFull, "full", false, "with --mirror-catalog: FULL refresh — re-fetch every cover even if already present (default is the fast incremental update)")
@@ -99,6 +107,7 @@ func main() {
 	flag.BoolVar(&pullSaves, "pull-saves", false, "TARGETED bulk pull (fast 'Sync now' leg): for every on-card game with a real server save, decide by CONTENT-HASH LINEAGE (local==newest: no-op; local==older revision: pull newest, .bak kept; local unknown to server: push it instead — never overwrite; ghosts filtered) — no catalog mirror; prints RESULT pulled=<N> checked=<M> ghosts=<G> pushed=<K>")
 	flag.BoolVar(&syncContinue, "sync-continue", false, "LIGHT Continue refresh (fast 'Sync now' leg): rebuild the cross-device '0) Continue' collection and merge it into the host's native Recently Played from the local index + server saves — no catalog mirror; prints CONTINUE entries=<N> then RECENTS merged=<M> total=<T>")
 	flag.BoolVar(&downloadBios, "download-bios", false, "download BIOS/firmware for every mapped platform; prints RESULT bios=<count>")
+	flag.StringVar(&checkBios, "check-bios", "", "OFFLINE pre-launch BIOS gate: does this ROM's system REQUIRE a BIOS the user must supply, and is it present where the emulator reads it? prints RESULT bios_ok=1, or RESULT bios_ok=0 missing=<f1,f2> system=<name>. System TAG from LODOR_ROM_TAG or the ROM folder; extra search dirs via LODOR_BIOS_DIRS (colon-sep)")
 	flag.BoolVar(&downloadQueue, "download-queue", false, "download every ROM queued in download-queue.txt (resolve, fetch, hash-verify each, reusing the --download path), dropping landed entries and keeping failures for retry; prints RESULT downloaded=<N> failed=<M> remaining=<K>")
 	flag.BoolVar(&syncFeed, "sync-feed", false, "list recent server saves across mapped platforms, newest first, tab-separated")
 	flag.BoolVar(&recent, "recent", false, "print the single most-recently-played game across devices as <localRomPath>\\t<game>\\t<when>\\t<device> (drives the Continue tile); empty if unreachable/none")
@@ -126,6 +135,13 @@ func main() {
 	flag.StringVar(&sessionStart, "session-start", "", "PLAYTIME (#146): stage a play session for this ROM path (/tmp marker: wall clock + /proc/uptime anchor). Offline, sub-second, config optional — never blocks a launch.")
 	flag.StringVar(&sessionEnd, "session-end", "", "PLAYTIME (#146): finish the staged session for this ROM path — duration from the UPTIME DELTA (clock-jump immune), start_utc back-computed, appended to sessions.jsonl, totals.json/totals.tsv rebuilt. Offline. Prints RESULT recorded=<0|1> [secs=<N>]")
 	flag.BoolVar(&syncPlaytime, "sync-playtime", false, "PLAYTIME (#146): pull peers' .lodortime meta-saves across mapped platforms and dedup-merge them into totals (newest record per device+key; own device skipped); prints RESULT playtime_fetched=<N> merged=<M>")
+	flag.StringVar(&trackSave, "track-save", "", "DEVICE-SYNC (#176): RESUME syncing this device's save for one ROM path (POST /api/saves/{id}/track on the newest server save; RomM >= 4.9.0). Best-effort, touches no bytes; prints RESULT tracked=<0|1> reason=<token>")
+	flag.StringVar(&untrackSave, "untrack-save", "", "DEVICE-SYNC (#176): STOP syncing this device's save for one ROM path (POST /api/saves/{id}/untrack on the newest server save; RomM >= 4.9.0). Best-effort, touches no bytes; prints RESULT untracked=<0|1> reason=<token>")
+	flag.StringVar(&setFavorite, "set-favorite", "", "WRITE-BACK (#167): mark one ROM path as a favorite (add to the user's Favourites collection, creating it on the first-ever favorite; RomM collections.write). Best-effort; prints RESULT favorited=<0|1> reason=<token>")
+	flag.StringVar(&unsetFavorite, "unset-favorite", "", "WRITE-BACK (#167): remove one ROM path from favorites (Favourites collection). Best-effort; prints RESULT unfavorited=<0|1> reason=<token>")
+	flag.StringVar(&setRating, "set-rating", "", "WRITE-BACK (#167): set one ROM's rating; the positional arg is 0-10 (0 clears). PUT /api/roms/{id}/props; RomM roms.user.write. Prints RESULT rating_set=<0|1> reason=<token>")
+	flag.StringVar(&setStatus, "set-status", "", "WRITE-BACK (#167): set one ROM's play status; the positional arg is incomplete|finished|completed_100|retired|never_playing (or clear/null). Prints RESULT status_set=<0|1> reason=<token>")
+	flag.StringVar(&setProps, "set-props", "", "WRITE-BACK (#167): set several rom_user props at once from key=val positional args (rating,difficulty [0-10]; completion [0-100]; status; backlogged,now_playing,hidden,is_main_sibling [bool]); only the given keys are written. Prints RESULT props_set=<0|1> reason=<token>")
 	flag.Parse()
 
 	// --ra-cmd is PURELY LOCAL (a loopback UDP datagram to a running RetroArch —
@@ -135,6 +151,16 @@ func main() {
 	if raCmd != "" {
 		runRACmd(raCmd, raRecv, setServerPort)
 		return // runRACmd always exits; defensive
+	}
+
+	// --check-bios is the OFFLINE pre-launch BIOS gate (build #158): a pure local
+	// file check with NO config.json, host, network, or device. It runs before
+	// config.Load() so a launcher can call it from any cwd on a card in any pairing
+	// state — and so a missing/corrupt config never turns the gate into a FATAL that
+	// the launcher would (correctly) treat as fail-open and launch anyway.
+	if checkBios != "" {
+		runCheckBios(nil, checkBios)
+		return // runCheckBios always exits; defensive
 	}
 
 	// --session-start / --session-end are OFFLINE and must work in ANY pairing
@@ -297,8 +323,23 @@ func main() {
 		runSyncContinue(client, cfg)
 	case syncPlaytime:
 		runSyncPlaytime(client, cfg)
+	case trackSave != "":
+		runTrackSave(client, cfg, trackSave)
+	case untrackSave != "":
+		runUntrackSave(client, cfg, untrackSave)
+	case setFavorite != "":
+		// WRITE-BACK (#167): user-scoped rom props/favorites — no device_id required.
+		runSetFavorite(client, cfg, setFavorite, true)
+	case unsetFavorite != "":
+		runSetFavorite(client, cfg, unsetFavorite, false)
+	case setRating != "":
+		runSetRating(client, cfg, setRating, flag.Arg(0))
+	case setStatus != "":
+		runSetStatus(client, cfg, setStatus, flag.Arg(0))
+	case setProps != "":
+		runSetProps(client, cfg, setProps, flag.Args())
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
 		os.Exit(2)
 	}
 }

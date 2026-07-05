@@ -26,6 +26,18 @@ import (
 
 const W, H = 720, 480
 
+// Menu first-paint settle (RG34XX display-handoff fix, 2026-07-04). Unlike onboarding — which
+// redraws continuously as Wi-Fi/pairing animate and so naturally wins the panel — the main menu
+// draws ONE frame and blocks on input. If muOS composites its "Loading Application" overlay (or
+// re-pans the panel) a beat AFTER our first blit, that single frame loses and the menu is drawn
+// but never shown. So on the FIRST menu paint we re-blit the same frame a handful of times over a
+// short, bounded window (each Flush also re-pans page 0 to the front) to win the display, THEN
+// fall through to the blocking input loop. Bounded + cheap: fixed frame count, no busy-spin.
+const (
+	settleFrames   = 6
+	settleInterval = 110 * time.Millisecond // ~0.66s total; one-time, only at menu entry
+)
+
 // Subprocess timeouts (BUG 2b hardening): NOTHING the wizard shells may freeze the UI. The
 // menu-build probe (tsAvailable) uses the SHORT ceiling and degrades to false on timeout so
 // the FIRST menu paint can never block; the long TS shim ops (reconnect/up-interactive) and
@@ -158,7 +170,7 @@ func (w *wizard) splash(title, body, tone string) int {
 	case "bad":
 		col, hint = t.Bad, "returning to menu"
 	}
-	x, y, ww, _ := t.Frame(c, "Lodor Sync", hint)
+	x, y, ww, _ := t.Frame(c, "Lodor", hint)
 	c.DrawTextCentered(x, y+10, ww, title, t.Accent, t.TitleScale-1)
 	t.DrawTextWrappedAt(c, x, y+10+wizGlyphH*(t.TitleScale-1)+30, ww, body, col, t.BodyScale)
 	fb.Flush(c)
@@ -241,8 +253,33 @@ func (w *wizard) runEngine(args ...string) (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, w.bin, args...)
 	cmd.Dir = w.dataDir
-	out, err := cmd.CombinedOutput()
-	return string(out), timeoutErr(ctx, err, engineTimeout)
+	return runCaptured(ctx, cmd, engineTimeout)
+}
+
+// runCaptured runs cmd under ctx (deadline d), capturing combined stdout+stderr to a
+// REAL temp file rather than CombinedOutput — the same defeated-timeout fix runShimFor
+// carries (muOS 9741ace only patched the shim). CombinedOutput wires the child's stdout/
+// stderr through an os.Pipe plus a copier goroutine that cmd.Wait() blocks on; if the
+// engine child ever leaves a grandchild holding that write end, Wait() never returns even
+// after the context has killed the direct child — the timeout is silently defeated and the
+// wizard wedges. A real *os.File dup'd straight to the child has no copier goroutine, so
+// Wait() returns the instant the direct child is reaped/killed; the context still kills
+// ONLY the direct child. On temp-file creation failure it falls back to CombinedOutput
+// (correct output, original wedge risk) rather than losing the call. The caller sets
+// cmd.Dir/Stdin before calling; this owns only Stdout/Stderr.
+func runCaptured(ctx context.Context, cmd *exec.Cmd, d time.Duration) (string, error) {
+	tf, ferr := os.CreateTemp("", "lodor-engine-*.out")
+	if ferr != nil {
+		out, err := cmd.CombinedOutput()
+		return string(out), timeoutErr(ctx, err, d)
+	}
+	defer os.Remove(tf.Name())
+	cmd.Stdout, cmd.Stderr = tf, tf
+	runErr := cmd.Run()
+	_ = tf.Sync()
+	b, _ := os.ReadFile(tf.Name())
+	_ = tf.Close()
+	return string(b), timeoutErr(ctx, runErr, d)
 }
 
 func resultFlag(out, key string) bool {
@@ -270,21 +307,21 @@ func (w *wizard) render(s step, kb *ui.Keyboard) *ui.Canvas {
 	t := w.t
 	switch s {
 	case stepWelcome:
-		t.Message(c, "Welcome", "This sets up Lodor Sync. Your whole library appears in the games menu, each game downloads on first launch, and saves sync automatically around every session.\n\nPress A to begin, or B to exit back to muOS.", t.Text)
+		t.Message(c, "Welcome", "This sets up Lodor. Your whole library appears in the games menu, each game downloads on first launch, and saves sync automatically around every session.\n\nPress A to begin, or B to exit back to muOS.", t.Text)
 	case stepWifi:
 		if w.wifiUp {
 			t.Message(c, "Wi-Fi connected", "Your handheld is online. Press A to continue, or B to go back.", t.Good)
 		} else {
-			t.Message(c, "Connect Wi-Fi first", "Open muOS Settings, Network, and join your Wi-Fi. Then press A to re-check.\n\nPress B to go back (you can sync later from the Lodor Sync app).", t.Bad)
+			t.Message(c, "Connect Wi-Fi first", "Open muOS Settings, Network, and join your Wi-Fi. Then press A to re-check.\n\nPress B to go back (you can sync later from the Lodor app).", t.Bad)
 		}
 	case stepServer:
-		x, y, ww, hh := t.Frame(c, "Lodor Sync Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
+		x, y, ww, hh := t.Frame(c, "Lodor Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
 		kb.Draw(c, t, x, y, ww, hh)
 	case stepCode:
-		x, y, ww, hh := t.Frame(c, "Lodor Sync Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
+		x, y, ww, hh := t.Frame(c, "Lodor Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
 		kb.Draw(c, t, x, y, ww, hh)
 	case stepDevice:
-		x, y, ww, hh := t.Frame(c, "Lodor Sync Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
+		x, y, ww, hh := t.Frame(c, "Lodor Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
 		kb.Draw(c, t, x, y, ww, hh)
 	case stepValidate:
 		body := "Server reachable: " + yn(w.reach) + "\nLogin accepted: " + yn(w.auth)
@@ -448,7 +485,7 @@ func (w *wizard) configured() bool {
 
 // ---- main management menu (parity with Lodor-NextUI's Lodor.pak) ----------------------
 // The re-runnable surface shown once setup is done. muOS can't hook the stock launcher
-// (never fork muOS), so ALL day-to-day management lives HERE inside the Lodor Sync app as
+// (never fork muOS), so ALL day-to-day management lives HERE inside the Lodor app as
 // a framebuffer menu. Every row is a thin shell over ONE confirmed engine mode (host
 // rendering only; the engine owns all RomM logic). Conditional rows + dynamic labels are
 // LOCAL file reads so drawing the menu never touches the network.
@@ -561,6 +598,8 @@ func (w *wizard) runMainMenu(draw func(*ui.Canvas), btn func() ui.Button) {
 				if !drawn {
 					w.phaseMenuFirstDraw()
 					drawn = true
+					w.settlePaint(c, draw) // re-blit the first frame briefly so it wins the display
+					return
 				}
 				draw(c)
 			}
@@ -572,13 +611,26 @@ func (w *wizard) runMainMenu(draw func(*ui.Canvas), btn func() ui.Button) {
 				return btn()
 			}
 		}
-		sel, ok := w.pickScroll("Lodor Sync", "Up/Down: move   A: select   B: exit", m, mdraw, mbtn)
+		sel, ok := w.pickScroll("Lodor", "Up/Down: move   A: select   B: exit", m, mdraw, mbtn)
 		if !ok {
 			return // B on the main menu = clean exit to muOS
 		}
 		if w.dispatch(rows[sel].act, draw, btn) {
 			return
 		}
+	}
+}
+
+// settlePaint blits the SAME rendered menu frame settleFrames times over a short window, so the
+// first menu paint wins the panel against a late muOS overlay composite / re-pan (see the const
+// doc above). draw is the real fb-flushing closure; each call re-blits AND re-pans page 0 to the
+// front. Bounded and honest (feedback_no_fake_ui_state): it repaints the ACTUAL frame, shows no
+// fake progress, and never spins — a fixed count of flushes with a fixed sleep, then it returns
+// and the caller blocks on real input.
+func (w *wizard) settlePaint(c *ui.Canvas, draw func(*ui.Canvas)) {
+	for i := 0; i < settleFrames; i++ {
+		draw(c)
+		time.Sleep(settleInterval)
 	}
 }
 
@@ -737,8 +789,7 @@ func (w *wizard) runEngineStdin(pw string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, w.bin, args...)
 	cmd.Dir = w.dataDir
 	cmd.Stdin = strings.NewReader(pw + "\n")
-	out, err := cmd.CombinedOutput()
-	return string(out), timeoutErr(ctx, err, engineTimeout)
+	return runCaptured(ctx, cmd, engineTimeout)
 }
 
 // working paints one honest "working" frame (NOT fake progress — the op really is running
@@ -746,7 +797,7 @@ func (w *wizard) runEngineStdin(pw string, args ...string) (string, error) {
 // calls that have no progress side-channel.
 func (w *wizard) working(draw func(*ui.Canvas), body string) {
 	c := ui.NewCanvas(W, H)
-	x, y, ww, _ := w.t.Frame(c, "Lodor Sync", "please wait...")
+	x, y, ww, _ := w.t.Frame(c, "Lodor", "please wait...")
 	c.DrawTextCentered(x, y+10, ww, "Working", w.t.Accent, w.t.TitleScale-1)
 	w.t.DrawTextWrappedAt(c, x, y+10+wizGlyphH*(w.t.TitleScale-1)+30, ww, body, w.t.Text, w.t.BodyScale)
 	draw(c)
@@ -756,7 +807,7 @@ func (w *wizard) working(draw func(*ui.Canvas), body string) {
 func (w *wizard) showMsg(title, body string, col ui.Color, draw func(*ui.Canvas), btn func() ui.Button) {
 	for {
 		c := ui.NewCanvas(W, H)
-		x, y, ww, _ := w.t.Frame(c, "Lodor Sync", "A: OK")
+		x, y, ww, _ := w.t.Frame(c, "Lodor", "A: OK")
 		c.DrawTextCentered(x, y+10, ww, title, w.t.Accent, w.t.TitleScale-1)
 		w.t.DrawTextWrappedAt(c, x, y+10+wizGlyphH*(w.t.TitleScale-1)+30, ww, body, col, w.t.BodyScale)
 		draw(c)
@@ -1338,7 +1389,7 @@ func (w *wizard) screenChoice(subtitle string, items []string, draw func(*ui.Can
 	m := &ui.Menu{Items: items}
 	for {
 		c := ui.NewCanvas(W, H)
-		x, y, ww, hh := w.t.Frame(c, "Lodor Sync Setup", "Up/Down: move   A: select   B: back")
+		x, y, ww, hh := w.t.Frame(c, "Lodor Setup", "Up/Down: move   A: select   B: back")
 		c.DrawText(x, y, subtitle, w.t.Text, w.t.BodyScale)
 		m.Draw(c, w.t, x, y+50, ww, hh-50)
 		draw(c)
@@ -1517,7 +1568,7 @@ func (w *wizard) doAddProfile(draw func(*ui.Canvas), btn func() ui.Button) {
 func (w *wizard) screenKeyboardFree(kb *ui.Keyboard, draw func(*ui.Canvas), btn func() ui.Button) {
 	for {
 		c := ui.NewCanvas(W, H)
-		x, y, ww, hh := w.t.Frame(c, "Lodor Sync", "D-pad: move   A: type   B: delete   BACK: cancel   Start: OK")
+		x, y, ww, hh := w.t.Frame(c, "Lodor", "D-pad: move   A: type   B: delete   BACK: cancel   Start: OK")
 		kb.Draw(c, w.t, x, y, ww, hh)
 		draw(c)
 		if kb.Handle(btn()) {
@@ -2034,7 +2085,7 @@ func (w *wizard) doRemoveLodor(draw func(*ui.Canvas), btn func() ui.Button) {
 	w.working(draw, "Removing Lodor files...")
 	out, _ := w.runEngine(args...)
 	if ui.ResultToken(out, "uninstalled") == "1" {
-		w.showMsg("Removed", fmt.Sprintf("Removed %s Lodor file(s). Delete the Lodor Sync app to finish.", nz(ui.ResultToken(out, "removed"))), w.t.Good, draw, btn)
+		w.showMsg("Removed", fmt.Sprintf("Removed %s Lodor file(s). Delete the Lodor app to finish.", nz(ui.ResultToken(out, "removed"))), w.t.Good, draw, btn)
 	} else {
 		w.showMsg("Remove Lodor", "Nothing removed - Lodor's file records were missing. Run Refresh library once, then retry.", w.t.Bad, draw, btn)
 	}
@@ -2086,7 +2137,7 @@ func (w *wizard) capture(dir string) {
 	// the SAME buildMenuRows spine the interactive loop uses, with representative state so
 	// the conditional rows (pending/queue counts, Tailscale) all appear.
 	mc := ui.NewCanvas(W, H)
-	mx, my, mw, mh := w.t.Frame(mc, "Lodor Sync", "Up/Down: move   A: select   B: exit")
+	mx, my, mw, mh := w.t.Frame(mc, "Lodor", "Up/Down: move   A: select   B: exit")
 	rows := buildMenuRows(menuState{pendingN: 2, queueN: 3, userLabel: "Default", tsAvail: true})
 	labels := make([]string, len(rows))
 	for i, rw := range rows {
@@ -2103,7 +2154,7 @@ func (w *wizard) capture(dir string) {
 	_ = gc.SavePNG(filepath.Join(dir, "13-gamemanager.png"))
 	// Connect choice (Tailscale vs plain URL) + the Tailscale sign-in screen (login URL as text).
 	cc := ui.NewCanvas(W, H)
-	cx, cy, cw, chh := w.t.Frame(cc, "Lodor Sync Setup", "Up/Down: move   A: select   B: back")
+	cx, cy, cw, chh := w.t.Frame(cc, "Lodor Setup", "Up/Down: move   A: select   B: back")
 	cc.DrawText(cx, cy, "Where is your RomM server?", w.t.Text, w.t.BodyScale)
 	cm := &ui.Menu{Items: []string{"Connect via Tailscale", "Home network / public URL"}}
 	cm.Draw(cc, w.t, cx, cy+50, cw, chh-50)

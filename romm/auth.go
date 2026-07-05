@@ -24,8 +24,8 @@ import (
 // (a viewer gets write scopes when KIOSK_MODE is off), so requesting broadly is safe.
 var PasswordGrantScopes = []string{
 	"me.read", "me.write", "roms.read", "roms.user.read", "roms.user.write",
-	"assets.read", "assets.write", "collections.read", "platforms.read",
-	"firmware.read", "devices.read", "devices.write", "users.read",
+	"assets.read", "assets.write", "collections.read", "collections.write",
+	"platforms.read", "firmware.read", "devices.read", "devices.write", "users.read",
 }
 
 // PasswordGrant performs an OAuth2 password grant against RomM (POST /api/token,
