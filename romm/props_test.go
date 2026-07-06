@@ -155,7 +155,11 @@ func (m *propsMock) server() *httptest.Server {
 		_ = json.NewEncoder(w).Encode(out)
 	})
 
-	// POST /api/collections → collections.write; multipart form (name + is_favorite).
+	// POST /api/collections → collections.write. name/description are multipart form
+	// fields; is_favorite is a QUERY parameter (real RomM 4.9.2/5.0 read it ONLY from
+	// the query string — a form field is ignored). Read it from r.URL.Query() here (NOT
+	// r.FormValue, which merges query+form and would mask the client sending it in the
+	// wrong place) so this test fails if the client ever regresses to a form field.
 	mux.HandleFunc("POST /api/collections", func(w http.ResponseWriter, r *http.Request) {
 		if !requireScopes(w, r, "collections.write") {
 			return
@@ -164,7 +168,7 @@ func (m *propsMock) server() *httptest.Server {
 			unprocessable(w, "not multipart")
 			return
 		}
-		fav := r.FormValue("is_favorite") == "true"
+		fav := r.URL.Query().Get("is_favorite") == "true"
 		id := m.nextColID
 		m.nextColID++
 		col := &Collection{ID: id, Name: r.FormValue("name"), IsFavorite: fav}

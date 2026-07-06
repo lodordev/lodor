@@ -188,14 +188,19 @@ func (c *Client) findFavouriteCollection() (int, bool, error) {
 	return 0, false, nil
 }
 
-// createFavouritesCollection POSTs a new "Favourites" collection via
-// multipart/form-data with name AND is_favorite=true sent explicitly (the documented
-// create shape). Returns the created CollectionSchema (201).
+// createFavouritesCollection POSTs a new "Favourites" collection. is_favorite is a
+// QUERY parameter on POST /api/collections (verified against the RomM 4.9.2 AND
+// 5.0.0-beta.1 source — `is_favorite: bool | None = None` with no Form()/Body() —
+// and confirmed live against 5.0.0-beta.1). It is NOT a multipart form field: a form
+// field named is_favorite is silently ignored (FastAPI reads the value from the query
+// string only), so the created collection lands is_favorite=false, findFavouriteCollection
+// never matches it, and every favorite write errors "favourites collection not present
+// after create". Only name/description travel as multipart form fields. Returns the
+// created CollectionSchema (201).
 func (c *Client) createFavouritesCollection() (Collection, error) {
 	var out Collection
-	err := c.doMultipartForm(http.MethodPost, "/api/collections", map[string]string{
-		"name":        "Favourites",
-		"is_favorite": "true",
+	err := c.doMultipartForm(http.MethodPost, "/api/collections?is_favorite=true", map[string]string{
+		"name": "Favourites",
 	}, &out)
 	return out, err
 }

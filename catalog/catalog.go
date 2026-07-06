@@ -744,6 +744,18 @@ func slugForRomPath(cfg *config.Config, romPath string) (string, bool) {
 			return slug, true
 		}
 	}
+	// FOLDER-NAME-NATIVE fallback (task #182 — muOS/OnionOS DLFAIL): frontends that name
+	// the Roms/ folder by the platform's own catalogue/system name ("Nintendo N64",
+	// "Sony PlayStation" on muOS; a bare "GBA" on OnionOS) leave no trailing "(TAG)" for
+	// the paren extract above, so a device with absent/stale directory_mappings could not
+	// reverse the path at all (DLFAIL resolve — the shipped #182 field bug). The folder
+	// name IS the tag on those hosts, so resolve it directly. On MinUI (folders always
+	// carry an explicit "(TAG)") a bare full folder name matches no emulator tag, so
+	// platform.FsSlugForTag returns false and this stays a pure no-op there — additive,
+	// never a mis-resolve.
+	if slug, ok := platform.FsSlugForTag(dir); ok {
+		return slug, true
+	}
 	return "", false
 }
 

@@ -66,6 +66,7 @@ func main() {
 		evict             string
 		uninstallMirror   bool
 		removeDownloads   bool
+		writeGamelists    bool
 		pair              string
 		pairProfile       string
 		registerDevice    string
@@ -94,6 +95,9 @@ func main() {
 		setStatus         string
 		setProps          string
 		checkBios         string
+		showVersion       bool
+		checkUpdate       bool
+		fetchUpdate       bool
 	)
 	flag.BoolVar(&mirrorCatalog, "mirror-catalog", false, "stub every not-downloaded RomM game into Roms/ and write catalog-index.json; prints MIRROR created=.. existing=.. skipped=.. multifile=.. covers=..  (UPDATE: only new games + missing covers)")
 	flag.BoolVar(&mirrorFull, "full", false, "with --mirror-catalog: FULL refresh — re-fetch every cover even if already present (default is the fast incremental update)")
@@ -120,6 +124,7 @@ func main() {
 	flag.StringVar(&evict, "evict", "", "delete ONE downloaded ROM's bytes from the card and re-create its 0-byte cloud stub (✓→✘), carrying its save+cover with the rename — saves are NEVER deleted; multi-disc .m3u deletes its disc files too; offline, no device; prints RESULT evicted=<0|1> [reason=…]")
 	flag.BoolVar(&uninstallMirror, "uninstall-mirror", false, "remove every MIRROR-OWNED artifact from the card (manifest walk: stubs, our covers/collections/folders; downloads KEPT unless --remove-downloads; saves NEVER touched; user files byte-identical); offline; prints RESULT uninstalled=<0|1> removed=<N> kept_downloads=<K> skipped=<S>")
 	flag.BoolVar(&removeDownloads, "remove-downloads", false, "with --uninstall-mirror: also delete Lodor-downloaded games (the explicit second confirmation)")
+	flag.BoolVar(&writeGamelists, "write-gamelists", false, "KNULLI BUILD ONLY (#186): merge-write every owned roms/<system>/gamelist.xml from the mirror manifest — clean marker-stripped <name>, cover <image> when present, foreign entries preserved verbatim; offline; prints RESULT gamelists=<N> entries=<M> (other builds refuse, exit 2)")
 	flag.StringVar(&pair, "pair", "", "exchange a RomM pairing code for a client-token, validate it, write config.json (clearing any password); prints RESULT paired=<0|1> scopes_ok=<0|1>")
 	flag.StringVar(&pairProfile, "pair-profile", "", "MULTI-USER: sign a profile in with a RomM PAIRING CODE (client-token exchange, not a password); stores the token owner as a profile; prints RESULT paired=<0|1> username=<name>")
 	flag.StringVar(&registerDevice, "register-device", "", "register this device by name, store device_id+device_name in config.json; prints RESULT registered=<0|1>")
@@ -142,7 +147,27 @@ func main() {
 	flag.StringVar(&setRating, "set-rating", "", "WRITE-BACK (#167): set one ROM's rating; the positional arg is 0-10 (0 clears). PUT /api/roms/{id}/props; RomM roms.user.write. Prints RESULT rating_set=<0|1> reason=<token>")
 	flag.StringVar(&setStatus, "set-status", "", "WRITE-BACK (#167): set one ROM's play status; the positional arg is incomplete|finished|completed_100|retired|never_playing (or clear/null). Prints RESULT status_set=<0|1> reason=<token>")
 	flag.StringVar(&setProps, "set-props", "", "WRITE-BACK (#167): set several rom_user props at once from key=val positional args (rating,difficulty [0-10]; completion [0-100]; status; backlogged,now_playing,hidden,is_main_sibling [bool]); only the given keys are written. Prints RESULT props_set=<0|1> reason=<token>")
+	flag.BoolVar(&showVersion, "version", false, "print 'lodor-sync <version>' and exit (release builds are stamped via ldflags; anything else says dev)")
+	flag.BoolVar(&checkUpdate, "check-update", false, "SELF-UPDATE: fetch versions.json and compare against this build; prints RESULT update=<0|1> current=<v> latest=<v> channel=<ch> (+ NOTES\\t<line> when newer); exit 3 = manifest unreachable (shell stays silent). Reads update_channel from settings.conf; never writes it. Works unpaired.")
+	flag.BoolVar(&fetchUpdate, "fetch-update", false, "SELF-UPDATE (LodorOS lane): download + sha256-verify + extract this lane's update asset (key from LODOR_UPDATE_ASSET) into ./.update/tree and write the READY marker; the SHELL applies it — this mode never swaps a binary. Prints RESULT fetched=<0|1> version=<v> bytes=<n>; exit 4 = hash mismatch (staging removed).")
 	flag.Parse()
+
+	// --version / update modes run before EVERYTHING (config.Load included):
+	// version is pure, and an unpaired or misconfigured device must still be
+	// able to check for and stage an update — the fix for a broken card may BE
+	// the update.
+	if showVersion {
+		runVersion()
+		return // always exits; defensive
+	}
+	if checkUpdate {
+		runCheckUpdate()
+		return // always exits; defensive
+	}
+	if fetchUpdate {
+		runFetchUpdate()
+		return // always exits; defensive
+	}
 
 	// --ra-cmd is PURELY LOCAL (a loopback UDP datagram to a running RetroArch —
 	// task #145 session bracketing): no config.json, no host, no device. It runs
@@ -215,6 +240,14 @@ func main() {
 	// before the hosts gate so "Remove Lodor" works with Wi-Fi off.
 	if uninstallMirror {
 		runUninstallMirror(cfg, removeDownloads)
+		return // always exits; defensive
+	}
+	// --write-gamelists is manifest-walk-only and OFFLINE (like --uninstall-mirror):
+	// rebuild the owned gamelist.xml files from the mirror manifest. Knulli build
+	// only — every other build refuses (no host there reads gamelists). Runs before
+	// the hosts gate so a display refresh works with Wi-Fi off.
+	if writeGamelists {
+		runWriteGamelists(cfg)
 		return // always exits; defensive
 	}
 	// RetroAchievements credential-spine modes (task #46): account-global, they need
@@ -339,7 +372,7 @@ func main() {
 	case setProps != "":
 		runSetProps(client, cfg, setProps, flag.Args())
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --write-gamelists --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
 		os.Exit(2)
 	}
 }

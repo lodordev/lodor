@@ -52,6 +52,11 @@ func runMirrorCatalog(client *romm.Client, cfg *config.Config, coverForce bool) 
 		fmt.Fprintf(os.Stderr, "FATAL mirror: %s\n", safeErr(err))
 		exitMode(3)
 	}
+	// Gamelist refresh (#186, knulli builds only — a compiled no-op elsewhere):
+	// the freshly-mirrored stubs/downloads get their clean-name gamelist entries
+	// now, in the same pass. Best-effort by contract: stderr only, never fails
+	// the mirror, stdout contract below is untouched.
+	maybeWriteGamelists(cfg)
 	// adopted= is APPENDED so every existing field parser (the pak seds on
 	// created=/…) keeps matching byte-identically; merge-mode runs report how many
 	// server games were matched to the user's own files instead of stubbed.

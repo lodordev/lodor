@@ -235,3 +235,97 @@ func TestParseButtonScript(t *testing.T) {
 		t.Fatalf("expected error on unknown token, got nil")
 	}
 }
+
+// ---- #180A: post-mirror in-session re-seed --------------------------------------------
+
+// writeFakeSeeder installs a fake bin/lodor-seed.sh under a fake LODOR_APPDIR that
+// records its invocation (sentinel file) and emits the real seeder's summary line.
+func writeFakeSeeder(t *testing.T, exitCode int) (appdir, sentinel string) {
+	t.Helper()
+	appdir = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(appdir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel = filepath.Join(appdir, "seeded.sentinel")
+	script := "#!/bin/sh\n: > \"" + sentinel + "\"\necho \"SEED overrides=3 skipped=1\"\nexit " +
+		string(rune('0'+exitCode)) + "\n"
+	if err := os.WriteFile(filepath.Join(appdir, "bin", "lodor-seed.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LODOR_APPDIR", appdir)
+	return appdir, sentinel
+}
+
+// TestReseedOverridesRunsSeeder: reseedOverrides shells the seeder and logs the seeder's
+// OWN overrides count (honest line, no fake numbers).
+func TestReseedOverridesRunsSeeder(t *testing.T) {
+	dir := t.TempDir()
+	_, sentinel := writeFakeSeeder(t, 0)
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir}
+	w.reseedOverrides()
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatal("seeder was not invoked")
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "wizard.log"))
+	if err != nil {
+		t.Fatalf("wizard.log not written: %v", err)
+	}
+	if !strings.Contains(string(b), "seed: post-mirror re-seed, overrides=3") {
+		t.Fatalf("honest overrides count missing from log: %q", b)
+	}
+}
+
+// TestReseedOverridesSeederFailureIsLoud: a failing seeder logs FAILED, never a success line.
+func TestReseedOverridesSeederFailureIsLoud(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeSeeder(t, 1)
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir}
+	w.reseedOverrides()
+	b, _ := os.ReadFile(filepath.Join(dir, "wizard.log"))
+	if !strings.Contains(string(b), "post-mirror re-seed FAILED") {
+		t.Fatalf("failure not logged loudly: %q", b)
+	}
+	if strings.Contains(string(b), "re-seed, overrides=") {
+		t.Fatalf("fake success line logged on failure: %q", b)
+	}
+}
+
+// TestReseedOverridesMissingSeederNoop: no seeder on the host (off-hardware / non-muOS
+// packaging) is a logged no-op, not a crash and not a silent pass.
+func TestReseedOverridesMissingSeederNoop(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LODOR_APPDIR", t.TempDir()) // exists, but has no bin/lodor-seed.sh
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir}
+	w.reseedOverrides()
+	b, _ := os.ReadFile(filepath.Join(dir, "wizard.log"))
+	if !strings.Contains(string(b), "re-seed skipped - no seeder") {
+		t.Fatalf("missing-seeder no-op not logged: %q", b)
+	}
+}
+
+// TestScreenMirrorArgsReseedsOnSuccessOnly: the #180A seam itself — a mirror that exits 0
+// re-seeds in-session; a failed mirror does NOT (overrides state untouched on failure).
+func TestScreenMirrorArgsReseedsOnSuccessOnly(t *testing.T) {
+	dir := t.TempDir()
+	_, sentinel := writeFakeSeeder(t, 0)
+	draw := func(*ui.Canvas) {}
+
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir, bin: "/bin/true"}
+	if rc := w.screenMirrorArgs(draw); rc != 0 {
+		t.Fatalf("mirror rc = %d, want 0", rc)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatal("successful mirror must re-seed in-session (#180A)")
+	}
+
+	if err := os.Remove(sentinel); err != nil {
+		t.Fatal(err)
+	}
+	w = &wizard{t: ui.DefaultTheme(), dataDir: dir, bin: "/bin/false"}
+	if rc := w.screenMirrorArgs(draw); rc == 0 {
+		t.Fatal("mirror rc = 0 from /bin/false?")
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatal("failed mirror must NOT re-seed")
+	}
+}

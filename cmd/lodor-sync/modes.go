@@ -1147,6 +1147,12 @@ func writeLastSynced(romPath string, count int) error {
 // RESULT reconciled=<0|1> (1 = the marker actually flipped). Offline; no network/device.
 func runReconcile(cfg *config.Config, romPath string) {
 	flipped := catalog.ReconcileAfterDownload(cfg, romPath)
+	// Gamelist refresh (#186, knulli builds only — a compiled no-op elsewhere): a
+	// ✘→✓ flip renamed the on-disk file, so the owned gamelist <path> in THIS rom's
+	// directory must follow it. Scoped to the one directory; offline; best-effort.
+	if flipped {
+		maybeWriteGamelists(cfg, filepath.Dir(romPath))
+	}
 	fmt.Printf("RESULT reconciled=%d\n", b2i(flipped))
 	os.Exit(0)
 }
@@ -1159,7 +1165,11 @@ func runReconcile(cfg *config.Config, romPath string) {
 // either way — the reason token is the honest failure signal.
 func runEvict(cfg *config.Config, romPath string) {
 	evicted, reason := catalog.EvictToStub(cfg, romPath)
+	// Gamelist refresh (#186, knulli builds only — a compiled no-op elsewhere): the
+	// ✓→✘ flip renamed the on-disk file back to its cloud-stub name, so the owned
+	// gamelist <path> must follow. Scoped to the one directory; offline; best-effort.
 	if evicted {
+		maybeWriteGamelists(cfg, filepath.Dir(romPath))
 		fmt.Println("RESULT evicted=1")
 	} else {
 		fmt.Printf("RESULT evicted=0 reason=%s\n", reason)

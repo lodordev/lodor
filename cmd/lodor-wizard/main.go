@@ -18,9 +18,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"lodor/buildinfo"
 	"lodor/ui"
 )
 
@@ -46,6 +48,7 @@ const (
 	tsProbeTimeout = 6 * time.Second  // menu-build probes: available/status/ip — must be quick
 	tsShimTimeout  = 90 * time.Second // reconnect/up-interactive have internal ~45s waits
 	engineTimeout  = 60 * time.Minute // engine safety net (downloads/mirror can be long)
+	seedTimeout    = 2 * time.Minute  // lodor-seed.sh post-mirror re-seed (O(folders), seconds)
 )
 
 // timeoutErr maps a context deadline into an honest error the caller renders (no fake success).
@@ -124,6 +127,13 @@ func main() {
 	// deterministic replay of the same phase strings the startup path uses.
 	if len(args) >= 1 && args[0] == "--phase-selftest" {
 		w.phaseSelftest()
+		return
+	}
+	// --reseed: run the host launch-override seeder exactly as the post-mirror hook does
+	// (#180A) and exit. Field diagnostic + harness surface: proves the wizard->seeder seam
+	// on the built binary without fb/input. No fb, no engine calls.
+	if len(args) >= 1 && args[0] == "--reseed" {
+		w.reseedOverrides()
 		return
 	}
 	// --splash <title> <body> [good|bad]: draw ONE full-screen message to /dev/fb0 and exit.
@@ -512,6 +522,7 @@ const (
 	actTsReset
 	actReSetup
 	actRemoveLodor
+	actCheckUpdates
 	actExit
 )
 
@@ -529,6 +540,7 @@ type menuState struct {
 	userLabel      string
 	coversOn       bool
 	tsAvail        bool
+	updateAvail    string // settings.conf update_available, "" when none/already installed
 }
 
 // buildMenuRows is the PURE menu spine: local state -> ordered rows + their engine action.
@@ -553,6 +565,11 @@ func buildMenuRows(st menuState) []menuRow {
 	}
 	add("Download BIOS", actDownloadBios)
 	add("Recent activity", actRecent)
+	if st.updateAvail != "" {
+		// store lane: install happens via muOS App Downloader / Archive Manager, never a
+		// self-swap — selecting the row re-checks and shows what's new + where to get it
+		add(fmt.Sprintf("Update available (%s)", st.updateAvail), actCheckUpdates)
+	}
 	add(fmt.Sprintf("Switch user (%s)", st.userLabel), actSwitchUser)
 	add("Add profile", actAddProfile)
 	if st.coversOn {
@@ -566,6 +583,7 @@ func buildMenuRows(st menuState) []menuRow {
 		add("Tailscale: Reconnect", actTsReconnect)
 		add("Tailscale: Reset & forget", actTsReset)
 	}
+	add("Check for updates", actCheckUpdates)
 	add("Setup / Re-pair", actReSetup)
 	add("Remove Lodor from this card", actRemoveLodor)
 	add("Exit", actExit)
@@ -673,6 +691,8 @@ func (w *wizard) dispatch(a menuAct, draw func(*ui.Canvas), btn func() ui.Button
 		w.doTsReset(draw, btn)
 	case actRemoveLodor:
 		w.doRemoveLodor(draw, btn)
+	case actCheckUpdates:
+		w.doCheckUpdates(draw, btn)
 	case actExit:
 		return true
 	}
@@ -688,7 +708,19 @@ func (w *wizard) menuState() menuState {
 		userLabel:      w.activeProfileLabel(),
 		coversOn:       w.fetchCoversOn(),
 		tsAvail:        w.tsAvailable(),
+		updateAvail:    w.updateAvailable(),
 	}
+}
+
+// updateAvailable reads the update_available stamp (written by doCheckUpdates, cleared when a
+// check says up-to-date). The badge self-retires once the named version IS the running build —
+// the App Downloader install changes buildinfo.Version, not settings.conf.
+func (w *wizard) updateAvailable() string {
+	v := w.getSetting("update_available")
+	if v == "" || v == buildinfo.Version {
+		return ""
+	}
+	return v
 }
 
 // pairingExpired reports the sticky flag written when any engine call returns rc=6. Cleared
@@ -908,10 +940,79 @@ func (w *wizard) doSyncNow(draw func(*ui.Canvas), btn func() ui.Button) {
 	rc := max(exitCode(e1), max(exitCode(e2), exitCode(e3)))
 	w.markPairFlag(rc)
 	if rc == 0 {
+		w.maybeCheckUpdates(draw)
 		w.showMsg("Done", "Sync complete.", w.t.Good, draw, btn)
 	} else {
 		w.showMsg("Problem", w.diagnose(rc, ""), w.t.Bad, draw, btn)
 	}
+}
+
+// ---- self-update notices (store lane) ----------------------------------------------------
+// On muOS, updates INSTALL via the App Downloader (or a .muxapp through Archive Manager) —
+// Lodor only CHECKS and points there. The engine's --check-update reads versions.json
+// (gh-pages, needs real internet — NOT just RomM reachability) and compares against the
+// stamped build; the wizard owns every settings.conf stamp.
+
+// doCheckUpdates is the manual check (menu row) — honest outcome in all three cases.
+func (w *wizard) doCheckUpdates(draw func(*ui.Canvas), btn func() ui.Button) {
+	if !w.requireOnline(draw, btn) {
+		return
+	}
+	w.working(draw, "Checking for updates...")
+	out, err := w.runEngine("--check-update")
+	if exitCode(err) != 0 {
+		w.showMsg("Updates", "Couldn't reach the update server - this check needs internet access, not just your RomM server.", w.t.Bad, draw, btn)
+		return
+	}
+	w.stampUpdateState(out)
+	latest := ui.ResultToken(out, "latest")
+	current := ui.ResultToken(out, "current")
+	if ui.ResultToken(out, "update") != "1" {
+		w.showMsg("Updates", fmt.Sprintf("You're up to date (%s).", current), w.t.Good, draw, btn)
+		return
+	}
+	body := fmt.Sprintf("Lodor %s is out (you have %s).\nInstall it with the muOS App Downloader,\nor grab the .muxapp from GitHub and use\nArchive Manager.", latest, current)
+	if notes := notesLine(out); notes != "" {
+		body += "\n\nNew: " + notes
+	}
+	w.showMsg("Update available", body, w.t.Good, draw, btn)
+}
+
+// maybeCheckUpdates is the opportunistic tail of a good Sync now: radio already up, manifest
+// GET nearly free. At most once a day, and EVERY failure is silent — a background path never
+// nags. The honest working frame covers the wait (no invisible stall).
+func (w *wizard) maybeCheckUpdates(draw func(*ui.Canvas)) {
+	if last, err := strconv.ParseInt(w.getSetting("update_last_check"), 10, 64); err == nil {
+		if time.Now().Unix()-last < 86400 {
+			return
+		}
+	}
+	w.working(draw, "Checking for updates...")
+	out, err := w.runEngine("--check-update")
+	if exitCode(err) == 0 {
+		w.stampUpdateState(out)
+	}
+}
+
+// stampUpdateState records a successful check: update_available set from update=1 (cleared on
+// up-to-date, so an installed update self-clears its badge) + the last-check gate stamp.
+func (w *wizard) stampUpdateState(out string) {
+	if ui.ResultToken(out, "update") == "1" {
+		_ = w.setSetting("update_available", ui.ResultToken(out, "latest"))
+	} else {
+		_ = w.setSetting("update_available", "")
+	}
+	_ = w.setSetting("update_last_check", strconv.FormatInt(time.Now().Unix(), 10))
+}
+
+// notesLine extracts the engine's single-line NOTES\t<text> trailer ("" when absent).
+func notesLine(out string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "NOTES\t") {
+			return strings.TrimPrefix(ln, "NOTES\t")
+		}
+	}
+	return ""
 }
 
 func (w *wizard) doPushPending(draw func(*ui.Canvas), btn func() ui.Button) {
@@ -1215,10 +1316,20 @@ func (w *wizard) screenMirrorArgs(draw func(*ui.Canvas), args ...string) int {
 	for {
 		select {
 		case err := <-done:
+			rc := exitCode(err)
+			if rc == 0 {
+				// #180A: re-seed the launch overrides IN-SESSION, right after a
+				// successful mirror. mux_launch.sh seeds BEFORE the wizard runs, so a
+				// first-run or menu-driven Refresh that just created the system folders
+				// would otherwise leave MUOS/info/override/ empty until the NEXT app
+				// open — every fresh stub launch dead in between (RG40XXV field log
+				// 2026-07-05: 6939 stubs mirrored, overrides wired only on relaunch).
+				w.reseedOverrides()
+			}
 			c := ui.NewCanvas(W, H)
 			w.t.Progress(c, "Building your library...", "Done", 100)
 			draw(c)
-			return exitCode(err)
+			return rc
 		case <-time.After(400 * time.Millisecond):
 			pct := readPct()
 			phase := readPhase()
@@ -1254,6 +1365,46 @@ func readPct() int {
 func readPhase() string {
 	b, _ := os.ReadFile("/tmp/romm-phase")
 	return strings.TrimSpace(string(b))
+}
+
+// seederScript locates the host's launch-override seeder (bin/lodor-seed.sh):
+// $LODOR_APPDIR/bin first (mux_launch exports it; tests set it), else next to the
+// wizard binary — the same precedence lodor_appdir() uses in the shell lib.
+func seederScript() string {
+	if d := os.Getenv("LODOR_APPDIR"); d != "" {
+		return filepath.Join(d, "bin", "lodor-seed.sh")
+	}
+	self, _ := os.Executable()
+	return filepath.Join(filepath.Dir(self), "bin", "lodor-seed.sh")
+}
+
+// reseedOverrides re-runs the host's launch-override seeder IN-SESSION (#180A). The seed
+// script owns ALL assign/override knowledge (host plumbing); the wizard only shells it —
+// the same engine/host boundary shape as the lodor-ts.sh shim. Honest logging only: the
+// success line reports the seeder's OWN overrides count, a failure is loud, and a host
+// without the seeder (off-hardware unit tests, non-muOS packaging) is a logged no-op.
+// The seeder also re-stamps the seed-gate (lodor-seed.sh stamps itself post-seed), so
+// the next app launch skips instead of re-seeding what this call just did.
+func (w *wizard) reseedOverrides() {
+	script := seederScript()
+	if _, err := os.Stat(script); err != nil {
+		w.logPhase("seed: post-mirror re-seed skipped - no seeder at %s", script)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), seedTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", script)
+	cmd.Dir = w.dataDir
+	out, err := runCaptured(ctx, cmd, seedTimeout)
+	if err != nil {
+		w.logPhase("seed: post-mirror re-seed FAILED: %v", timeoutErr(ctx, err, seedTimeout))
+		return
+	}
+	n := ui.ResultToken(out, "overrides") // the seeder's "SEED overrides=N skipped=M" line
+	if n == "" {
+		n = "?"
+	}
+	w.logPhase("seed: post-mirror re-seed, overrides=%s", n)
 }
 
 // ---- Tailscale onboarding (host delivery via the lodor-ts.sh shim) --------------------
@@ -2028,6 +2179,18 @@ func (w *wizard) doToggleCovers(draw func(*ui.Canvas), btn func() ui.Button) {
 	} else {
 		w.showMsg("Box art", "Only downloaded games fetch box art now. Art already on the card is kept.", w.t.Good, draw, btn)
 	}
+}
+
+// getSetting reads one key=value from settings.conf ("" when absent). Same file the
+// NextUI pak's set_setting writes; the wizard is the settings writer on muOS.
+func (w *wizard) getSetting(key string) string {
+	for _, ln := range strings.Split(readFileString(filepath.Join(w.dataDir, "settings.conf")), "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, key+"=") {
+			return strings.TrimPrefix(ln, key+"=")
+		}
+	}
+	return ""
 }
 
 // fetchCoversOn reads fetch_covers from settings.conf, falling back to config.json's

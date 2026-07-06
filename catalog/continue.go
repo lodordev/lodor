@@ -53,6 +53,30 @@ type saveLister interface {
 	GetSaves(q romm.SaveQuery) ([]romm.Save, error)
 }
 
+// ContinueEntry is one cross-device continue item: the SDCARD-relative on-card path
+// (leading "/") plus the newest cross-device save time that ranked it — the SERVER's
+// UpdatedAt, never the device clock (RTC-less handhelds boot in 1970, task #147).
+// Host deliveries that encode recency out-of-band (muOS history file mtimes, #181)
+// stamp this time onto their artifacts.
+type ContinueEntry struct {
+	Rel string
+	T   time.Time
+}
+
+// relLines projects entries to their SDCARD-relative paths — the []string shape the
+// collection/recents/head writers consume. nil for an empty list (the writers' "leave
+// the existing file alone" signal).
+func relLines(entries []ContinueEntry) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		lines = append(lines, e.Rel)
+	}
+	return lines
+}
+
 // ContinueList builds the cross-device continue list: the N most-recently-played
 // games ACROSS DEVICES (RomM server saves, newest first), deduped per game,
 // resolved to their on-card SDCARD-relative paths via idPath. Entries whose
@@ -63,6 +87,13 @@ type saveLister interface {
 // Every failure path returns an empty list, never an error: Continue is a
 // convenience layer, never a reason to fail the pass that asked for it.
 func ContinueList(client romClient, cfg *config.Config, idPath map[int]string) []string {
+	return relLines(ContinueEntries(client, cfg, idPath))
+}
+
+// ContinueEntries is the derivation behind ContinueList, keeping each entry's
+// cross-device recency timestamp alongside its path (the muOS history injector
+// needs the times; the MinUI-family writers only the paths).
+func ContinueEntries(client romClient, cfg *config.Config, idPath map[int]string) []ContinueEntry {
 	sl, ok := client.(saveLister)
 	if !ok {
 		return nil
@@ -117,7 +148,7 @@ func ContinueList(client romClient, cfg *config.Config, idPath map[int]string) [
 	})
 
 	sd := sdcardRoot()
-	var lines []string
+	var out []ContinueEntry
 	for _, e := range order {
 		rel, found := idPath[e.id]
 		if !found || rel == "" {
@@ -127,12 +158,12 @@ func ContinueList(client romClient, cfg *config.Config, idPath map[int]string) [
 		if !cok {
 			continue // stale index entry — never list a path the browser can't open
 		}
-		lines = append(lines, onCard)
-		if len(lines) == continueCap {
+		out = append(out, ContinueEntry{Rel: onCard, T: e.t})
+		if len(out) == continueCap {
 			break
 		}
 	}
-	return lines
+	return out
 }
 
 // resolveOnCardRel returns the SDCARD-relative path that is on-card TRUE for rel: rel
@@ -211,10 +242,14 @@ func ContinueDir() string {
 // it never prunes sibling collections and an empty feed leaves the existing
 // Continue file untouched. Returns entries written, recents merged, recents total.
 func SyncContinue(client romClient, cfg *config.Config) (entries, merged, total int) {
-	lines := ContinueList(client, cfg, LoadIndexIDPath(cfg))
+	ents := ContinueEntries(client, cfg, LoadIndexIDPath(cfg))
+	lines := relLines(ents)
 	entries = writeContinueFile(ContinueDir(), lines)
 	merged, total = MergeRecents(lines)
 	deliverContinueHead(lines)
+	// muOS delivery (#181): the same list rides the host's native History menu —
+	// build-tag-gated no-op everywhere else.
+	maybeInjectMuosHistory(ents)
 	return entries, merged, total
 }
 
@@ -236,15 +271,18 @@ func deliverContinueHead(lines []string) {
 // no stale "Continue" in the browser — the caller's prune removes any previous
 // file, because 0-entry runs never mark it kept).
 func mirrorContinue(client romClient, cfg *config.Config, idPath map[int]string, colDir string, kept map[string]bool) int {
-	lines := ContinueList(client, cfg, idPath)
+	ents := ContinueEntries(client, cfg, idPath)
+	lines := relLines(ents)
 	n := writeContinueFile(colDir, lines)
 	if n > 0 {
 		kept[sanitizeCollectionName(continueCollectionName)+".txt"] = true
 	}
 	// Cross-device recents ride the same list (task #132): merge is best-effort
-	// and never affects the mirror's counts.
+	// and never affects the mirror's counts. Same for the muOS History injection
+	// (#181, build-tag-gated no-op off-muOS).
 	MergeRecents(lines)
 	deliverContinueHead(lines)
+	maybeInjectMuosHistory(ents)
 	return n
 }
 

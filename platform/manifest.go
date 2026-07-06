@@ -49,6 +49,20 @@ const (
 	ManifestFolder     = "folder"
 	ManifestCollection = "collection"
 	ManifestContinue   = "continue"
+	// ManifestGamelist marks a per-folder gamelist.xml the engine merge-writes on
+	// hosts whose launcher reads one (Knulli/Batocera EmulationStation, #186). The
+	// FILE is recorded, not individual <game> entries; it is deliberately NOT
+	// removed by uninstall (it may hold the user's own scraped entries — the
+	// merge-writer only ever adds/updates Lodor-owned entries inside it).
+	ManifestGamelist = "gamelist"
+	// ManifestHistory marks a muOS info/history content pointer
+	// (<name>-<hash>.cfg) the engine injected so cross-device recents ride the
+	// host's native History menu (#181). Like gamelist, deliberately NOT removed
+	// by uninstall: muOS rewrites an injected pointer in place when the user
+	// launches it natively, so by uninstall time it may BE the user's real
+	// history — deleting it would erase that. Ownership is used only to decide
+	// which pointers the injector may rewrite/re-key.
+	ManifestHistory = "history"
 )
 
 // manifestFileName is the on-disk name, beside catalog-index.json in PakDir().

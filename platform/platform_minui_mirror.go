@@ -1,4 +1,4 @@
-//go:build !onion && !muos
+//go:build !onion && !muos && !knulli
 
 package platform
 
