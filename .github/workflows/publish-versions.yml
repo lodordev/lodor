@@ -1,0 +1,63 @@
+# publish-versions — verify a release's update assets LIVE, then publish versions.json to
+# gh-pages. This workflow is the manifest's integrity gate: devices poll
+# https://lodordev.github.io/lodor/versions.json and trust its sha256 entries, so the
+# manifest must never precede (or disagree with) the assets it names.
+#
+# Flow (assets + versions.json are uploaded to the GitHub release by the LOCAL gated
+# release run — CI builds nothing):
+#   1. download versions.json from the release for the given tag
+#   2. re-download EVERY asset the manifest names, recompute sha256, compare
+#   3. only if all match: commit versions.json to the gh-pages branch
+name: publish-versions
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag carrying the assets + versions.json (e.g. v0.9.6)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch versions.json from the release
+        run: |
+          curl -sfL -o versions.json \
+            "https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/versions.json"
+          python3 -c "import json; m=json.load(open('versions.json')); assert m.get('schema')==1, 'schema != 1'"
+
+      - name: Verify every named asset live (download + sha256)
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, subprocess, sys
+          m = json.load(open("versions.json"))
+          assets = {}
+          for ch in ("stable", "beta"):
+              for key, a in (m.get(ch) or {}).get("assets", {}).items():
+                  assets[f"{ch}/{key}"] = a
+          if not assets:
+              sys.exit("manifest names no assets — refusing to publish an empty manifest")
+          for label, a in assets.items():
+              subprocess.run(["curl", "-sfL", "-o", "asset.bin", a["url"]], check=True)
+              h = hashlib.sha256(open("asset.bin", "rb").read()).hexdigest()
+              if h != a["sha256"]:
+                  sys.exit(f"HASH MISMATCH for {label}: live {h} != manifest {a['sha256']}")
+              print(f"ok: {label} live + hash-verified")
+          PY
+
+      - name: Commit versions.json to gh-pages
+        run: |
+          git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" pages \
+            || { git init pages && cd pages && git checkout -b gh-pages && \
+                 git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" && cd ..; }
+          cp versions.json pages/versions.json
+          cd pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git diff --cached --quiet || git commit -m "versions.json for ${{ inputs.tag }}"
+          git push origin gh-pages
