@@ -262,3 +262,105 @@ func TestInjectMuosHistoryEmptyFeedNoop(t *testing.T) {
 		t.Fatalf("empty feed wrote/rekeyed/skipped = %d/%d/%d, want 0/0/0", w, r, s)
 	}
 }
+
+// TestInjectMuosHistoryHealsDeadForeignPointer is the #187 heal: the USER'S own
+// (unmarked, unowned) pointer whose file_path died in a Lodor rename (here: the
+// mirror re-marked the rom ✘) is re-pointed to the live name with the user's
+// mtime preserved, instead of stranding a "Could not launch" entry forever.
+func TestInjectMuosHistoryHealsDeadForeignPointer(t *testing.T) {
+	dir := t.TempDir()
+	roms := t.TempDir() // REAL root — the heal stats paths on disk
+	man := testManifest()
+	sys := filepath.Join(roms, "Sega Game Gear")
+	if err := os.MkdirAll(sys, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Live rom on card under the CURRENT (marked) name.
+	live := filepath.Join(sys, "✘ Zilion (USA).gg")
+	if err := os.WriteFile(live, []byte("stub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The user's pointer from before the rename: clean name, not manifest-owned,
+	// file_path no longer exists.
+	deadPath := filepath.Join(sys, "Zilion (USA).gg")
+	deadFile := filepath.Join(dir, "Zilion (USA)-"+upperHex8(t, cFNV1a32(deadPath))+".cfg")
+	if err := os.WriteFile(deadFile, []byte(deadPath+"\nSega Game Gear\nZilion (USA)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	userMt := time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(deadFile, userMt, userMt); err != nil {
+		t.Fatal(err)
+	}
+
+	feedT := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	entries := []ContinueEntry{{Rel: "/Roms/Sega Game Gear/✘ Zilion (USA).gg", T: feedT}}
+	wrote, rekeyed, skipped := injectMuosHistory(dir, roms, entries, man)
+	if wrote != 0 || rekeyed != 1 || skipped != 0 {
+		t.Fatalf("wrote/rekeyed/skipped = %d/%d/%d, want 0/1/0 (heal counts as rekeyed)", wrote, rekeyed, skipped)
+	}
+	if _, err := os.Stat(deadFile); !os.IsNotExist(err) {
+		t.Fatalf("dead pointer still present: %v", err)
+	}
+	healed := filepath.Join(dir, "✘ Zilion (USA)-"+upperHex8(t, cFNV1a32(live))+".cfg")
+	hb, err := os.ReadFile(healed)
+	if err != nil {
+		t.Fatalf("healed pointer missing: %v", err)
+	}
+	if want := live + "\nSega Game Gear\n✘ Zilion (USA)"; string(hb) != want {
+		t.Fatalf("healed content = %q, want %q", hb, want)
+	}
+	fi, err := os.Stat(healed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(userMt) {
+		t.Fatalf("healed mtime = %v, want the USER'S %v (their recency, not the feed's)", fi.ModTime(), userMt)
+	}
+	// Ownership NOT taken: the healed file carries a marker, so the NEXT run treats
+	// it like any Lodor-marked pointer and restamps it to the feed time — from here
+	// on it lives under the normal marked-pointer rules.
+	wrote, rekeyed, skipped = injectMuosHistory(dir, roms, entries, man)
+	if wrote != 1 || rekeyed != 0 || skipped != 0 {
+		t.Fatalf("second run wrote/rekeyed/skipped = %d/%d/%d, want 1/0/0", wrote, rekeyed, skipped)
+	}
+	if fi, err = os.Stat(healed); err != nil || !fi.ModTime().Equal(feedT) {
+		t.Fatalf("second-run mtime = %v err=%v, want feed time %v", fi.ModTime(), err, feedT)
+	}
+}
+
+// A dead UNMARKED heal target (extension change: stub .gg -> downloaded .zip with
+// a clean name) stays the user's: unowned, unmarked, mtime preserved across runs.
+func TestInjectMuosHistoryHealStaysForeignWhenUnmarked(t *testing.T) {
+	dir := t.TempDir()
+	roms := t.TempDir()
+	man := testManifest()
+	sys := filepath.Join(roms, "Sega Game Gear")
+	if err := os.MkdirAll(sys, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(sys, "Zilion (USA).zip")
+	if err := os.WriteFile(live, []byte("rom"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadPath := filepath.Join(sys, "Zilion (USA).gg")
+	deadFile := filepath.Join(dir, "Zilion (USA)-"+upperHex8(t, cFNV1a32(deadPath))+".cfg")
+	if err := os.WriteFile(deadFile, []byte(deadPath+"\nSega Game Gear\nZilion (USA)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	userMt := time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC)
+	_ = os.Chtimes(deadFile, userMt, userMt)
+
+	entries := []ContinueEntry{{Rel: "/Roms/Sega Game Gear/Zilion (USA).zip", T: time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)}}
+	if w, r, s := injectMuosHistory(dir, roms, entries, man); w != 0 || r != 1 || s != 0 {
+		t.Fatalf("first run = %d/%d/%d, want 0/1/0", w, r, s)
+	}
+	healed := filepath.Join(dir, "Zilion (USA)-"+upperHex8(t, cFNV1a32(live))+".cfg")
+	// Second run: the healed pointer is unmarked + unowned -> foreign -> skipped,
+	// mtime untouched (the user's recency survives indefinitely).
+	if w, r, s := injectMuosHistory(dir, roms, entries, man); w != 0 || r != 0 || s != 1 {
+		t.Fatalf("second run = %d/%d/%d, want 0/0/1", w, r, s)
+	}
+	if fi, err := os.Stat(healed); err != nil || !fi.ModTime().Equal(userMt) {
+		t.Fatalf("mtime = %v err=%v, want preserved %v", fi.ModTime(), err, userMt)
+	}
+}

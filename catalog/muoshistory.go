@@ -207,6 +207,16 @@ func readMuosHistory(dir string, man *platform.Manifest) []muosHistExisting {
 	return out
 }
 
+// muosPathExists reports whether a pointer's file_path resolves to a real file on
+// the card — the liveness test behind the #187 dead-pointer heal.
+func muosPathExists(p string) bool {
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err == nil
+}
+
 // muosPathsEqualFold compares two pointer paths the way the card's exFAT does.
 func muosPathsEqualFold(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
@@ -236,6 +246,7 @@ func injectMuosHistory(dir, romsRoot string, entries []ContinueEntry, man *platf
 		// Classify every same-game file already present.
 		var cur *muosHistExisting // ours, already at the target name
 		var stale []*muosHistExisting
+		var foreignEx *muosHistExisting
 		foreign := false
 		for i := range existing {
 			ex := &existing[i]
@@ -253,12 +264,37 @@ func injectMuosHistory(dir, romsRoot string, entries []ContinueEntry, man *platf
 				stale = append(stale, ex) // Lodor pointer under an old name (marker flip)
 			default:
 				foreign = true // the user's own entry — their recency wins
+				foreignEx = ex
 			}
 			if foreign {
 				break
 			}
 		}
 		if foreign {
+			// HEAL (#187): the user's pointer is sacred — but a pointer whose
+			// file_path no longer EXISTS is dead weight: muxhistory toasts "Could
+			// not launch" forever (a Lodor rename — marker flip, (RomM)
+			// disambiguator, stub->real download — moved the rom out from under
+			// it, and unlike the marked case its name gives no proof we did it).
+			// When the live target for the SAME game exists on card, re-point it:
+			// live 3-line content under the canonical filename, the USER'S mtime
+			// preserved (their recency, never the feed's), dead file removed, and
+			// ownership NOT taken (no manifest record — it stays their entry and
+			// every future run still classifies it foreign-and-skips).
+			if foreignEx != nil && !muosPathExists(foreignEx.line1) && muosPathExists(tgt.path) {
+				abs := filepath.Join(dir, tgt.fname)
+				if err := fsutil.WriteFileAtomicString(abs, tgt.content, 0o644); err == nil {
+					_ = os.Chtimes(abs, foreignEx.mtime, foreignEx.mtime)
+					if foreignEx.fname != tgt.fname {
+						old := filepath.Join(dir, foreignEx.fname)
+						if rmErr := os.Remove(old); rmErr == nil || os.IsNotExist(rmErr) {
+							foreignEx.removed = true
+						}
+					}
+					rekeyed++ // counted with re-keys: a pointer moved to a live name
+					continue
+				}
+			}
 			skipped++
 			continue
 		}

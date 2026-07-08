@@ -215,6 +215,13 @@ func LoadIndexIDPath(cfg *config.Config) map[int]string {
 // transient-empty feed must not erase a good list; the full mirror's prune is
 // the one place a stale Continue is removed). Returns entries written.
 func writeContinueFile(colDir string, lines []string) int {
+	// #187: on muOS the Continue list is delivered into the NATIVE History menu
+	// (muoshistory.go); the MinUI-style collection file would be a stray in the
+	// user's ROMS tree. Returning 0 also means the full mirror never marks it
+	// kept, so its prune REMOVES any stray file earlier builds left behind.
+	if !hostUsesContinueFile {
+		return 0
+	}
 	if len(lines) == 0 {
 		return 0
 	}

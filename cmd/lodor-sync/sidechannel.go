@@ -3,19 +3,29 @@ package main
 import (
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-// The two /tmp side-channels the native launcher reads while a long mode runs
+// The two side-channels the native launcher reads while a long mode runs
 // (BLUEPRINT §8, §10). They are best-effort: a write failure never changes a mode's
 // RESULT line or exit code — the launcher's bar/label is cosmetic, the RESULT is the
-// real gate.
+// real gate. Default home is /tmp (every CFW lane, unchanged); LODOR_PROGRESS_DIR
+// relocates them for hosts without a writable /tmp — the Android app points it at
+// its cache dir and polls the same two files. Same contract, different directory.
 
-const (
-	progressPath = "/tmp/dl-progress" // integer percent 0..100, newline-terminated
-	phasePath    = "/tmp/romm-phase"  // one-line human label, newline-terminated
+var (
+	progressPath = sideChannelPath("dl-progress") // integer percent 0..100, newline-terminated
+	phasePath    = sideChannelPath("romm-phase")  // one-line human label, newline-terminated
 )
+
+func sideChannelPath(name string) string {
+	if d := os.Getenv("LODOR_PROGRESS_DIR"); d != "" {
+		return filepath.Join(d, name)
+	}
+	return "/tmp/" + name
+}
 
 // writeProgress writes an integer percent (0..100) to /tmp/dl-progress for the
 // launcher's progress bar. Out-of-range values are clamped so the launcher never

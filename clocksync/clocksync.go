@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"syscall"
 	"time"
 )
 
@@ -31,12 +30,9 @@ const probeTimeout = 10 * time.Second
 // sane reports whether t is plausibly a real current time (so we leave the clock alone).
 func sane(t time.Time) bool { return t.Year() >= minYear }
 
-// setClock sets the system wall clock. A var so tests can stub it (settimeofday needs root
-// and would mutate the test host's clock). Linux-only by build; the device paks run as root.
-var setClock = func(t time.Time) error {
-	tv := syscall.NsecToTimeval(t.UnixNano())
-	return syscall.Settimeofday(&tv)
-}
+// setClock sets the system wall clock; the real implementation is per-build-tag in
+// clocksync_settime*.go (Android forbids settimeofday to apps). A var so tests can stub
+// it (settimeofday needs root and would mutate the test host's clock).
 
 // nowFn is time.Now, indirected for tests.
 var nowFn = time.Now

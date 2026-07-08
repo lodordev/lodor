@@ -8,13 +8,16 @@ package romm
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -58,7 +61,8 @@ type Client struct {
 // unset — identical to the pre-tier-1 behavior.
 func hostTransport(host config.Host) *http.Transport {
 	skipTLS := host.SkipTLSVerify()
-	if host.Socks5Proxy == "" && !skipTLS {
+	dnsServer := os.Getenv(dnsServerEnv)
+	if host.Socks5Proxy == "" && !skipTLS && dnsServer == "" {
 		return nil
 	}
 	tr := &http.Transport{}
@@ -67,8 +71,39 @@ func hostTransport(host config.Host) *http.Transport {
 	}
 	if host.Socks5Proxy != "" {
 		tr.DialContext = socks5DialContext(host.Socks5Proxy)
+	} else if dnsServer != "" {
+		tr.DialContext = dnsDialContext(dnsServer)
 	}
 	return tr
+}
+
+// dnsServerEnv names a DNS server ("ip" or "ip:port", port defaults to 53) that
+// hostname lookups must use, overriding the system resolver. Exists for the
+// Android lane: an exec'd pure-Go binary there has no /etc/resolv.conf, so Go's
+// fallback resolver dials 127.0.0.1:53 and every hostname lookup fails even
+// though the OS resolves fine — the app reads the live DNS server from Android's
+// LinkProperties (100.100.100.100 when the Tailscale VPN is up) and exports it.
+// Unset = stdlib behavior, byte-identical on every other lane. A host with a
+// socks5_proxy never needs it (SOCKS5 does remote DNS).
+const dnsServerEnv = "LODOR_DNS_SERVER"
+
+// dnsDialContext returns a DialContext whose hostname lookups go through the
+// given DNS server instead of the system resolver. TLS verification is untouched
+// — the certificate is still checked against the HOSTNAME, so this is strictly a
+// resolution override, not a trust change.
+func dnsDialContext(server string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if _, _, err := net.SplitHostPort(server); err != nil {
+		server = net.JoinHostPort(server, "53")
+	}
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, network, server)
+		},
+	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second, Resolver: resolver}
+	return dialer.DialContext
 }
 
 // NewClient builds a Client for the given host with the supplied request timeout.

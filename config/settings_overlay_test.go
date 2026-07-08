@@ -71,3 +71,38 @@ func TestSettingsConfAbsent(t *testing.T) {
 		t.Errorf("with no settings.conf, config.json fetch_covers=true should stand")
 	}
 }
+
+// state_retain: the user's Handoff retention-depth knob (2026-07-07).
+func TestStateRetainKnob(t *testing.T) {
+	load := func(conf string) *Config {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.Chdir(dir); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, dir, "config.json", `{"hosts":[{"root_uri":"https://romm.example.com","token":"x"}]}`)
+		if conf != "" {
+			writeFile(t, dir, "settings.conf", conf)
+		}
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	if got := load("state_retain=12\n").ResolvedStateRetain(); got != 12 {
+		t.Fatalf("state_retain=12 -> %d", got)
+	}
+	// absent / zero / junk / negative -> default 5; runaway clamps to 50
+	for conf, want := range map[string]int{
+		"":                   5,
+		"state_retain=0\n":   5,
+		"state_retain=-3\n":  5,
+		"state_retain=x\n":   5,
+		"state_retain=999\n": 50,
+	} {
+		if got := load(conf).ResolvedStateRetain(); got != want {
+			t.Fatalf("conf %q -> %d, want %d", conf, got, want)
+		}
+	}
+}

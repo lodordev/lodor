@@ -15,6 +15,9 @@ import (
 // rename (no orphan), and (c) keep the catalog index's by_id path pointing at the real
 // on-disk name. This is Issue 1 end-to-end, OFFLINE (no client).
 func TestReconcileAfterDownloadFlipsMarkerAndMigratesSave(t *testing.T) {
+	if platform.HostShowsStateNatively() {
+		t.Skip("marker-less host (hard-true build tag): there is no ✘→✓ flip; reconcile is a no-op by design")
+	}
 	cfg, rom, unmarked := markerTestCfg(t)
 	dir := filepath.Dir(unmarked)
 	base := filepath.Base(unmarked)

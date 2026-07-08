@@ -125,6 +125,9 @@ func TestManifestSaveIsAtomicAndClean(t *testing.T) {
 // TestReclaimableStubTripleGate: each leg of the triple gate individually denies —
 // a user file can never be all three (0-byte AND ✘-marked AND catalog-resolving).
 func TestReclaimableStubTripleGate(t *testing.T) {
+	if HostShowsStateNatively() {
+		t.Skip("marker-less host (hard-true build tag): the ✘ marker leg under test does not apply")
+	}
 	base := manifestTestEnv(t)
 	t.Setenv("LODOR_HOST_OS", "nextui") // marker-baking host: the marker leg applies
 	dir := filepath.Join(base, "Roms", "GBA")

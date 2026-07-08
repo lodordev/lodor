@@ -13,6 +13,9 @@ import (
 // a 0-byte stub, renamed back to its cloud name ("✘ …"), and its SAVE and COVER
 // ride the rename — never deleted, never orphaned. The index by_id follows.
 func TestEvictFlipsToCloudStubAndKeepsSave(t *testing.T) {
+	if platform.HostShowsStateNatively() {
+		t.Skip("marker-less host (hard-true build tag): evict writes an unmarked stub; ✘ expectations do not apply")
+	}
 	cfg, rom, unmarked := markerTestCfg(t)
 	dir := filepath.Dir(unmarked)
 	base := filepath.Base(unmarked)
@@ -147,6 +150,9 @@ func TestEvictRefusesUnmanagedPath(t *testing.T) {
 // it references (they ARE the bytes), removes the emptied per-game folder, and
 // leaves the .m3u itself as the 0-byte cloud stub.
 func TestEvictMultiDiscRemovesDiscFiles(t *testing.T) {
+	if platform.HostShowsStateNatively() {
+		t.Skip("marker-less host (hard-true build tag): evict writes an unmarked stub; ✘ expectations do not apply")
+	}
 	cfg, _, unmarked := markerTestCfg(t)
 	dir := filepath.Dir(unmarked)
 	dev := filepath.Join(dir, platform.MarkerOnDevice+"Chrono (USA).m3u")

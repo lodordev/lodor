@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -234,6 +235,12 @@ type Config struct {
 	// downloaded game's Details view shows art even with bulk off.
 	FetchCovers *bool `json:"fetch_covers,omitempty"`
 
+	// StateRetain caps how many of THIS device's own save-state uploads survive
+	// per (rom, slot) after a landed push (Handoff retention, design 6.4).
+	// 0/absent = the default; user-owned via settings.conf state_retain
+	// (Jonathan 2026-07-07: retention depth is the user's knob).
+	StateRetain int `json:"state_retain,omitempty"`
+
 	// RAUsername / RAToken are the RetroAchievements credential spine (task #46):
 	// the RA account handle and its long-lived login token, stored TOP-LEVEL (not
 	// under a host) because RA is account-global, independent of any RomM host. The
@@ -242,6 +249,20 @@ type Config struct {
 	// (--ra-status) and, on LodorOS, by the minarch fork's vendored rc_client.
 	RAUsername string `json:"ra_username,omitempty"`
 	RAToken    string `json:"ra_token,omitempty"`
+}
+
+// ResolvedStateRetain returns the per-(rom,slot) cap on this device's own
+// save-state uploads: settings.conf/config state_retain when sane, else 5.
+// Clamped to [1, 50] — 0/absent means default, never "keep nothing" (retention
+// may only ever trim history, not erase it).
+func (c *Config) ResolvedStateRetain() int {
+	if c == nil || c.StateRetain <= 0 {
+		return 5
+	}
+	if c.StateRetain > 50 {
+		return 50
+	}
+	return c.StateRetain
 }
 
 // CoversEnabled reports whether the BULK cover fetch on --mirror-catalog is on.
@@ -436,6 +457,10 @@ func applySettingsConf(c *Config) {
 		case "fetch_covers":
 			b := settingTruthy(v)
 			c.FetchCovers = &b
+		case "state_retain":
+			if n, err := strconv.Atoi(v); err == nil {
+				c.StateRetain = n
+			}
 		}
 	}
 }

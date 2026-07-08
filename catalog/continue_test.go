@@ -117,8 +117,15 @@ func TestContinueCollectionNewestFirstDedupedGhostFree(t *testing.T) {
 	if written != 1 {
 		t.Fatalf("written=%d want 1 (Favorites)", written)
 	}
-	if cont != 2 {
-		t.Fatalf("cont=%d want 2 (rom1 + rom2; rom3 skipped, ghost ignored)", cont)
+	wantCont := 2
+	if !hostUsesContinueFile { // #187: no collection file on muOS builds
+		wantCont = 0
+	}
+	if cont != wantCont {
+		t.Fatalf("cont=%d want %d (rom1 + rom2; rom3 skipped, ghost ignored)", cont, wantCont)
+	}
+	if !hostUsesContinueFile {
+		return
 	}
 	data, rerr := os.ReadFile(filepath.Join(colDir, "0) Continue.txt"))
 	if rerr != nil {
@@ -187,8 +194,15 @@ func TestContinueCapsAtTwelve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MirrorCollections: %v", err)
 	}
-	if cont != continueCap {
-		t.Fatalf("cont=%d want %d", cont, continueCap)
+	wantCont := continueCap
+	if !hostUsesContinueFile { // #187: no collection file on muOS builds
+		wantCont = 0
+	}
+	if cont != wantCont {
+		t.Fatalf("cont=%d want %d", cont, wantCont)
+	}
+	if !hostUsesContinueFile {
+		return
 	}
 	data, rerr := os.ReadFile(filepath.Join(os.Getenv("SDCARD_PATH"), "Collections", "0) Continue.txt"))
 	if rerr != nil {
@@ -350,18 +364,30 @@ func TestSyncContinueLight(t *testing.T) {
 	}
 
 	entries, merged, total := SyncContinue(fake, cfg)
-	if entries != 2 || merged != 2 || total != 2 {
-		t.Fatalf("entries=%d merged=%d total=%d want 2/2/2", entries, merged, total)
+	// #187: muOS builds deliver Continue via the native History menu and write
+	// NO collection file — entries reports 0 there by design.
+	wantEntries := 2
+	if !hostUsesContinueFile {
+		wantEntries = 0
+	}
+	if entries != wantEntries || merged != 2 || total != 2 {
+		t.Fatalf("entries=%d merged=%d total=%d want %d/2/2", entries, merged, total, wantEntries)
 	}
 	if _, err := os.Stat(filepath.Join(colDir, "Sibling.txt")); err != nil {
 		t.Fatalf("light mode must NOT prune sibling collections: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(colDir, "0) Continue.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := rel(1) + "\n" + rel(2) + "\n"; string(data) != want {
-		t.Fatalf("Continue = %q want %q", data, want)
+	if hostUsesContinueFile {
+		data, err := os.ReadFile(filepath.Join(colDir, "0) Continue.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := rel(1) + "\n" + rel(2) + "\n"; string(data) != want {
+			t.Fatalf("Continue = %q want %q", data, want)
+		}
+	} else {
+		if _, err := os.Stat(filepath.Join(colDir, "0) Continue.txt")); err == nil {
+			t.Fatal("muOS build wrote the MinUI Continue collection file — #187 stray")
+		}
 	}
 	if rdata, _ := os.ReadFile(rp); string(rdata) != rel(1)+"\n"+rel(2)+"\n" {
 		t.Fatalf("recents = %q", rdata)
@@ -374,7 +400,9 @@ func TestSyncContinueLight(t *testing.T) {
 	if entries != 0 || merged != 0 {
 		t.Fatalf("empty feed: entries=%d merged=%d want 0/0", entries, merged)
 	}
-	if _, err := os.Stat(filepath.Join(colDir, "0) Continue.txt")); err != nil {
-		t.Fatalf("light empty feed must leave the Continue file: %v", err)
+	if hostUsesContinueFile {
+		if _, err := os.Stat(filepath.Join(colDir, "0) Continue.txt")); err != nil {
+			t.Fatalf("light empty feed must leave the Continue file: %v", err)
+		}
 	}
 }

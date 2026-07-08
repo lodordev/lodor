@@ -329,3 +329,116 @@ func TestScreenMirrorArgsReseedsOnSuccessOnly(t *testing.T) {
 		t.Fatal("failed mirror must NOT re-seed")
 	}
 }
+
+// ── Handoff v1: LISTSTATE parsing + Continue-row helpers ─────────────────
+
+func TestParseStateLine(t *testing.T) {
+	line := `LISTSTATE id=618 slot=auto compat=0 age=7200 size=40960 origin=lodor/knulli/gpsp@0.91/arm64 why="different architecture (arm64 vs armhf)" name="Woody Pop [2026-07-07] (lodor sauto abcdef12).state"`
+	kv := parseStateLine(line)
+	if kv["id"] != "618" || kv["slot"] != "auto" || kv["compat"] != "0" {
+		t.Fatalf("scalars: %v", kv)
+	}
+	if kv["origin"] != "lodor/knulli/gpsp@0.91/arm64" {
+		t.Fatalf("origin: %q", kv["origin"])
+	}
+	if kv["why"] != "different architecture (arm64 vs armhf)" {
+		t.Fatalf("quoted why: %q", kv["why"])
+	}
+	if kv["name"] != "Woody Pop [2026-07-07] (lodor sauto abcdef12).state" {
+		t.Fatalf("quoted name: %q", kv["name"])
+	}
+}
+
+func TestParseStateLineDegradesGracefully(t *testing.T) {
+	// truncated quote — parser stops, never panics, keeps what it had
+	kv := parseStateLine(`LISTSTATE id=5 why="unterminated`)
+	if kv["id"] != "5" {
+		t.Fatalf("id lost on malformed tail: %v", kv)
+	}
+}
+
+func TestHumanAge(t *testing.T) {
+	for _, c := range []struct {
+		s    int64
+		want string
+	}{{30, "just now"}, {600, "10m ago"}, {7200, "2h ago"}, {200000, "2d ago"}} {
+		if got := humanAge(c.s); got != c.want {
+			t.Fatalf("humanAge(%d) = %q, want %q", c.s, got, c.want)
+		}
+	}
+}
+
+func TestOriginLabel(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"lodor/knulli/gpsp@0.91/arm64", "a Knulli device"},
+		{"lodor/lodoros/gambatte/armhf", "a LodorOS device"},
+		{"foreign:builtin", "another app"},
+		{"garbage", "unknown device"},
+	} {
+		if got := originLabel(c.in); got != c.want {
+			t.Fatalf("originLabel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// ── Launch card decision helpers (launchcard.go) ─────────────────────────
+
+func TestListSavesLocal(t *testing.T) {
+	out := "12\t2026-07-06\tflip\t4KB\n34\t2026-07-05\tbrick\t4KB\tCURRENT\nLOCAL=older\n"
+	if got := listSavesLocal(out); got != "older" {
+		t.Fatalf("LOCAL = %q", got)
+	}
+	if got := listSavesLocal("12\t2026-07-06\n"); got != "" {
+		t.Fatalf("missing trailer = %q", got)
+	}
+}
+
+func TestNewestUnknownCompatState(t *testing.T) {
+	out := strings.Join([]string{
+		`LISTSTATE id=1 slot=0 compat=1 known=1 age=100 size=1 origin=lodor/knulli/gpsp/arm64 why="-" name="a"`,   // known -> not news
+		`LISTSTATE id=2 slot=auto compat=1 known=0 age=7200 size=1 origin=lodor/muos/gpsp/arm64 why="-" name="b"`, // news, older
+		`LISTSTATE id=3 slot=1 compat=1 known=0 age=60 size=1 origin=lodor/knulli/gpsp/arm64 why="-" name="c"`,    // news, newest
+		`LISTSTATE id=4 slot=2 compat=0 known=0 age=5 size=1 origin=foreign:builtin why="non-lodor" name="d"`,     // incompatible
+		"RESULT liststates=4 compatstates=3 reason=ok",
+	}, "\n")
+	best, ok := newestUnknownCompatState(out)
+	if !ok || best.id != "3" {
+		t.Fatalf("best = %+v ok=%v, want id 3", best, ok)
+	}
+	if !strings.Contains(best.label, "Slot 1") || !strings.Contains(best.label, "a Knulli device") {
+		t.Fatalf("label = %q", best.label)
+	}
+	if _, ok := newestUnknownCompatState("RESULT liststates=0 compatstates=0 reason=none"); ok {
+		t.Fatal("no rows must mean no news")
+	}
+}
+
+func TestHumanDur(t *testing.T) {
+	for _, c := range []struct {
+		s    int64
+		want string
+	}{{30, "under a minute"}, {600, "10m"}, {15120, "4h 12m"}} {
+		if got := humanDur(c.s); got != c.want {
+			t.Fatalf("humanDur(%d) = %q, want %q", c.s, got, c.want)
+		}
+	}
+}
+
+func TestPlaytimeLineFor(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("SDCARD_PATH", base)
+	dir := filepath.Join(base, ".userdata", "shared", ".lodor", "playtime")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tsv := "k1\tWoody Pop.gg\t15120\t7\t1751800000\nk2\tAlex Kidd.gg\t59\t1\t1751800000\n"
+	if err := os.WriteFile(filepath.Join(dir, "totals.tsv"), []byte(tsv), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := playtimeLineFor("Woody Pop.gg"); got != "Played 4h 12m across 7 sessions" {
+		t.Fatalf("line = %q", got)
+	}
+	if got := playtimeLineFor("Nope.gg"); got != "" {
+		t.Fatalf("missing rom line = %q", got)
+	}
+}

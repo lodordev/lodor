@@ -260,7 +260,7 @@ func qrBuildMatrix(v int, spec qrBlockSpec, codewords []byte) [][]bool {
 
 	// choose the mask with the lowest penalty (format info placed per candidate; version
 	// info and every other function module are already on g, so penalty sees the full symbol)
-	bestPenalty := 1 << 62
+	bestPenalty := 1 << 30 // max sentinel: fits a 32-bit int (armhf), dwarfs any real QR penalty
 	var best *qrGrid
 	for m := 0; m < 8; m++ {
 		trial := qrClone(g)

@@ -1350,7 +1350,11 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 	res := sync.RestoreSave(client, cfg, romPath, chosen)
 	notePullResult(res)
 	if res.Pulled() {
-		fmt.Printf("RESULT restored=1 staged=%d\n", staged)
+		// #28: retire the stale auto-load-state so the frontend can't silently
+		// auto-load it over the freshly-restored save. Best-effort, fail-safe
+		// (only retires after a clean state push); never blocks the restore.
+		retired, _ := sync.RetireAutoStateAfterRestore(client, cfg, romPath)
+		fmt.Printf("RESULT restored=1 staged=%d retiredauto=%d\n", staged, b2i(retired))
 	} else {
 		reason := "download"
 		if res.Outcome == sync.PullResolveFail {

@@ -1,4 +1,4 @@
-//go:build !onion && !muos && !knulli
+//go:build !onion && !muos && !knulli && !android && !lodorandroid
 
 package sync
 

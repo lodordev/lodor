@@ -148,7 +148,21 @@ func acquireQueueLock() (release func()) {
 // pendingRead returns the queued ROM paths in file order, skipping blank lines. A
 // missing file is an empty queue (not an error).
 func pendingRead() []string {
-	data, err := os.ReadFile(pendingPath())
+	return pendingReadFile(pendingPath())
+}
+
+// pendingWrite atomically replaces pending-saves.txt with the given paths (tmp file
+// + rename), one per line, trailing newline. An empty slice truncates the file to a
+// single trailing newline's worth of nothing (zero bytes) so the launcher's
+// "X Saves Pending" banner reads zero.
+func pendingWrite(paths []string) error {
+	return pendingWriteFile(pendingPath(), paths)
+}
+
+// pendingReadFile / pendingWriteFile are the path-parameterized queue-file
+// primitives shared by the saves queue and the states queue (pending-states.txt).
+func pendingReadFile(path string) []string {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
@@ -163,16 +177,11 @@ func pendingRead() []string {
 	return out
 }
 
-// pendingWrite atomically replaces pending-saves.txt with the given paths (tmp file
-// + rename), one per line, trailing newline. An empty slice truncates the file to a
-// single trailing newline's worth of nothing (zero bytes) so the launcher's
-// "X Saves Pending" banner reads zero.
-func pendingWrite(paths []string) error {
-	p := pendingPath()
+func pendingWriteFile(path string, lines []string) error {
 	var body string
-	if len(paths) > 0 {
-		body = strings.Join(paths, "\n") + "\n"
+	if len(lines) > 0 {
+		body = strings.Join(lines, "\n") + "\n"
 	}
 	// FAT32-atomic: temp + fsync + rename + dir fsync (fsutil).
-	return fsutil.WriteFileAtomicString(p, body, 0o644)
+	return fsutil.WriteFileAtomicString(path, body, 0o644)
 }

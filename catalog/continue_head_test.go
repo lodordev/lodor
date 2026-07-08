@@ -186,8 +186,12 @@ func TestSyncContinueWritesHead(t *testing.T) {
 		}},
 	}
 	entries, _, _ := SyncContinue(fake, cfg)
-	if entries != 2 {
-		t.Fatalf("entries = %d, want 2", entries)
+	wantEntries := 2
+	if !hostUsesContinueFile { // #187: no collection file on muOS builds
+		wantEntries = 0
+	}
+	if entries != wantEntries {
+		t.Fatalf("entries = %d, want %d", entries, wantEntries)
 	}
 	head, err := os.ReadFile(filepath.Join(base, ".userdata", "shared", "Lodor", "continue-head.txt"))
 	if err != nil {

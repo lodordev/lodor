@@ -59,6 +59,13 @@ func main() {
 		recent            bool
 		syncSave          string
 		pushSave          string
+		pushStates        string
+		queueState        string
+		pushPendingStates bool
+		listStates        string
+		pullStateRom      string
+		pullStateID       int
+		pullStateSlot     string
 		listSaves         string
 		restoreSave       string
 		downloadRom       string
@@ -117,6 +124,13 @@ func main() {
 	flag.BoolVar(&recent, "recent", false, "print the single most-recently-played game across devices as <localRomPath>\\t<game>\\t<when>\\t<device> (drives the Continue tile); empty if unreachable/none")
 	flag.StringVar(&syncSave, "sync-save", "", "pull-then-push the save for one ROM (content-hash lineage, never clock-based); prints RESULT pulled=<0|1> pushed=<0|1> ghosts=<N> reason=<token> (pushed=1 only after a verified REAL upload; an unchanged save dedups server-side and reports reason=in-sync)")
 	flag.StringVar(&pushSave, "push-save", "", "HYBRID post-game push for one ROM: push the changed save directly; on a LANDED push write last-synced.txt (the launcher's synced-✓ signal); if it does NOT land, stage the save into pending-saves.txt for later; prints RESULT pushed=<0|1> staged=<N>")
+	flag.StringVar(&pushStates, "push-states", "", "Handoff v1: upload this ROM's local save STATES (normalized, deduped vs the state ledger); requires statecores.json in the pak dir, else no-ops honestly; an offline attempt auto-queues into pending-states.txt; prints RESULT pushedstates=<N> skippedstates=<N> failedstates=<N> retiredstates=<N> queuedstate=<0|1> reason=<token>")
+	flag.StringVar(&queueState, "queue-state", "", "Handoff v1: queue this ROM into pending-states.txt (offline, instant, deduplicated) so --push-pending-states retries its state push when online; prints RESULT queuedstate=<0|1>")
+	flag.BoolVar(&pushPendingStates, "push-pending-states", false, "Handoff v1: re-run the state push for every ROM in pending-states.txt (only still-offline roms stay queued); prints PENDINGSTATE lines + RESULT pendingstates=<N> drained=<M> stuck=<K>")
+	flag.StringVar(&listStates, "list-states", "", "Handoff v1: list server save states for this ROM with compatibility annotations; prints LISTSTATE lines + RESULT")
+	flag.StringVar(&pullStateRom, "pull-state", "", "Handoff v1: place ONE server state locally for this ROM (use with --state-id, optional --state-slot); prints RESULT placedstate=<0|1> reason=<token>")
+	flag.IntVar(&pullStateID, "state-id", 0, "server state id for --pull-state")
+	flag.StringVar(&pullStateSlot, "state-slot", "", "override target slot for --pull-state (0-8 or auto)")
 	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated, then a LOCAL=<none|current|older|unpushed> trailer (single field — row parsers drop it); exit 3 when the server is unreachable (empty list + exit 0 always means zero saves)")
 	flag.StringVar(&restoreSave, "restore-save", "", "restore a specific server save by id for one ROM (save id is the positional arg); prints RESULT restored=<0|1>")
 	flag.StringVar(&downloadRom, "download", "", "download one ROM's real file (resolve, fetch, hash-verify); prints RESULT downloaded=<0|1>")
@@ -331,6 +345,16 @@ func main() {
 	case syncSave != "":
 		requireDevice(host)
 		runSyncSave(client, cfg, syncSave)
+	case listStates != "":
+		runListStates(client, cfg, listStates)
+	case pullStateRom != "":
+		runPullState(client, cfg, pullStateRom, pullStateID, pullStateSlot)
+	case pushStates != "":
+		runPushStates(client, cfg, pushStates)
+	case queueState != "":
+		runQueueState(queueState)
+	case pushPendingStates:
+		runPushPendingStates(client, cfg)
 	case pushSave != "":
 		requireDevice(host)
 		// HYBRID post-game push: uploads can be large, so use the download timeout
@@ -372,7 +396,7 @@ func main() {
 	case setProps != "":
 		runSetProps(client, cfg, setProps, flag.Args())
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --list-saves --restore-save --evict --write-gamelists --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
 		os.Exit(2)
 	}
 }

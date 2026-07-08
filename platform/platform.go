@@ -1,4 +1,4 @@
-//go:build !onion && !muos && !knulli
+//go:build !onion && !muos && !knulli && !android && !lodorandroid
 
 // Package platform re-expresses the miyoomini/MinUI save-directory data (BLUEPRINT
 // §6) as our own and provides the path helpers the engine needs: where ROMs, BIOS,

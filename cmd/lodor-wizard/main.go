@@ -140,6 +140,12 @@ func main() {
 	// The launch override calls this for honest on-screen feedback during download-on-launch
 	// (user feedback #6: "no feedback when clicking/loading a game"). No input loop, no engine
 	// calls; best-effort — a non-openable fb returns non-zero for the caller to log.
+	// --launch-card <rom>: the Handoff launch gate (launchcard.go). Probes first
+	// with no fb/input; the interactive card appears ONLY when the server has
+	// something newer. Always exits 0 — a launch is never blocked.
+	if len(args) >= 2 && args[0] == "--launch-card" {
+		os.Exit(w.launchCard(args[1]))
+	}
 	if len(args) >= 1 && args[0] == "--splash" {
 		title, body, tone := "", "", ""
 		if len(args) >= 2 {
@@ -1903,6 +1909,11 @@ func (w *wizard) gmActions(path string, draw func(*ui.Canvas), btn func() ui.But
 		} else {
 			acts = []string{"Download now", "Add to queue", "Sync save now", "Server saves", "Details"}
 		}
+		if w.statesLive() {
+			// Handoff v1: only when the assembler shipped statecores.json —
+			// a dark build gets no dead menu row (design D7).
+			acts = append(acts[:len(acts)-1], "Continue from another device", "Details")
+		}
 		m := &ui.ScrollMenu{Items: acts}
 		sel, ok := w.pickScroll(filepath.Base(path), "Up/Down: move   A: select   B: back", m, draw, btn)
 		if !ok {
@@ -1923,6 +1934,8 @@ func (w *wizard) gmActions(path string, draw func(*ui.Canvas), btn func() ui.But
 			w.gmSyncSave(path, draw, btn)
 		case "Server saves":
 			w.gmServerSaves(path, draw, btn)
+		case "Continue from another device":
+			w.gmServerStates(path, draw, btn)
 		case "Details":
 			w.gmDetails(path, draw, btn)
 		}
@@ -2092,6 +2105,180 @@ func (w *wizard) gmServerSaves(path string, draw func(*ui.Canvas), btn func() ui
 	} else {
 		w.showMsg("Problem", "Restore failed - try again.", w.t.Bad, draw, btn)
 	}
+}
+
+// statesLive: the Handoff states feature is live on this build only when the
+// assembler shipped statecores.json next to config.json (design D7 — no
+// manifest, no feature, no dead menu row).
+func (w *wizard) statesLive() bool {
+	_, err := os.Stat(filepath.Join(w.dataDir, "statecores.json"))
+	return err == nil
+}
+
+// gmServerStates: Handoff v1 "Continue from another device" — --list-states
+// picker -> confirm -> --pull-state. Incompatible states stay VISIBLE (the
+// timeline is real) but explain themselves instead of placing; placement
+// itself never destroys (engine invariant 7.1: occupant uploaded first + .bak).
+func (w *wizard) gmServerStates(path string, draw func(*ui.Canvas), btn func() ui.Button) {
+	if !w.requireOnline(draw, btn) {
+		return
+	}
+	w.working(draw, "Checking save states on your server...")
+	out, err := w.runEngine("--list-states", path)
+	rc := exitCode(err)
+	w.markPairFlag(rc)
+	if rc != 0 {
+		w.showMsg("Continue", w.diagnose(rc, out), w.t.Bad, draw, btn)
+		return
+	}
+	type offer struct {
+		id, label, why string
+		compat         bool
+	}
+	var offers []offer
+	for _, ln := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(ln, "LISTSTATE ") {
+			continue
+		}
+		kv := parseStateLine(ln)
+		if kv["id"] == "" {
+			continue
+		}
+		lbl := "Slot " + kv["slot"]
+		if kv["slot"] == "auto" {
+			lbl = "Auto-resume"
+		}
+		if age, aerr := strconv.ParseInt(kv["age"], 10, 64); aerr == nil {
+			lbl += "  -  " + humanAge(age)
+		}
+		lbl += "  -  " + originLabel(kv["origin"])
+		o := offer{id: kv["id"], why: kv["why"], compat: kv["compat"] == "1"}
+		if !o.compat {
+			lbl += "  (can't use here)"
+		}
+		o.label = lbl
+		offers = append(offers, o)
+	}
+	if len(offers) == 0 {
+		switch ui.ResultToken(out, "reason") {
+		case "no-manifest":
+			w.showMsg("Continue", "State sync isn't enabled on this build.", w.t.Text, draw, btn)
+		case "no-system":
+			w.showMsg("Continue", "State sync doesn't cover this system yet.", w.t.Text, draw, btn)
+		default:
+			w.showMsg("Continue", "No save states on your server for "+filepath.Base(path)+".", w.t.Text, draw, btn)
+		}
+		return
+	}
+	labels := make([]string, len(offers))
+	for i, o := range offers {
+		labels[i] = o.label
+	}
+	m := &ui.ScrollMenu{Items: labels}
+	sel, ok := w.pickScroll("Continue from another device", "Up/Down: move   A: continue   B: back", m, draw, btn)
+	if !ok {
+		return
+	}
+	o := offers[sel]
+	if !o.compat {
+		why := o.why
+		if why == "" || why == "-" {
+			why = "an unknown difference"
+		}
+		w.showMsg("Can't use this one", "This state can't run here: "+why+".\nUse it on the device it came from.", w.t.Text, draw, btn)
+		return
+	}
+	if !w.confirmScreen("Continue from this state? Anything already in that slot is preserved first.", "Continue here", "Cancel", draw, btn) {
+		return
+	}
+	w.working(draw, "Placing state...")
+	pout, perr := w.runEngine("--pull-state", path, "--state-id", o.id)
+	if exitCode(perr) == 0 && ui.ResultToken(pout, "placedstate") == "1" {
+		w.showMsg("Ready", "State placed - load it from the in-game menu.", w.t.Good, draw, btn)
+		return
+	}
+	switch ui.ResultToken(pout, "reason") {
+	case "occupant-unsafe":
+		w.showMsg("Not placed", "Couldn't back up the state already in that slot, so nothing was changed. Try again with the server reachable.", w.t.Bad, draw, btn)
+	case "size-mismatch":
+		w.showMsg("Not placed", "That state doesn't match this system's expected size - refused rather than risk a corrupt load.", w.t.Bad, draw, btn)
+	case "incompatible":
+		w.showMsg("Not placed", "That state isn't compatible with this device.", w.t.Bad, draw, btn)
+	case "offline":
+		w.showMsg("Not placed", "Server unreachable - nothing was changed. Try again.", w.t.Bad, draw, btn)
+	default:
+		w.showMsg("Problem", "State placement failed - nothing was changed.", w.t.Bad, draw, btn)
+	}
+}
+
+// parseStateLine parses one LISTSTATE machine line into key->value, tolerating
+// Go-%q-quoted values (why= and name= may contain spaces).
+func parseStateLine(line string) map[string]string {
+	out := map[string]string{}
+	s := strings.TrimPrefix(line, "LISTSTATE ")
+	for s != "" {
+		s = strings.TrimLeft(s, " ")
+		eq := strings.IndexByte(s, '=')
+		if eq <= 0 {
+			break
+		}
+		key := s[:eq]
+		rest := s[eq+1:]
+		var val string
+		if strings.HasPrefix(rest, `"`) {
+			q, qerr := strconv.QuotedPrefix(rest)
+			if qerr != nil {
+				break
+			}
+			val, _ = strconv.Unquote(q)
+			s = rest[len(q):]
+		} else if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+			val, s = rest[:sp], rest[sp:]
+		} else {
+			val, s = rest, ""
+		}
+		out[key] = val
+	}
+	return out
+}
+
+// humanAge renders an age in seconds the way a person reads a timeline.
+func humanAge(secs int64) string {
+	switch {
+	case secs < 90:
+		return "just now"
+	case secs < 3600:
+		return strconv.FormatInt(secs/60, 10) + "m ago"
+	case secs < 86400:
+		return strconv.FormatInt(secs/3600, 10) + "h ago"
+	default:
+		return strconv.FormatInt(secs/86400, 10) + "d ago"
+	}
+}
+
+// originLabel turns a producer tuple (lodor/<frontend>/<core>@<ver>/<arch>)
+// into a human origin. Foreign records (no tuple) come from other clients.
+func originLabel(origin string) string {
+	if strings.HasPrefix(origin, "foreign:") {
+		return "another app"
+	}
+	p := strings.Split(origin, "/")
+	if len(p) != 4 || p[0] != "lodor" {
+		return "unknown device"
+	}
+	switch p[1] {
+	case "lodoros":
+		return "a LodorOS device"
+	case "nextui":
+		return "a NextUI device"
+	case "muos":
+		return "a muOS device"
+	case "knulli":
+		return "a Knulli device"
+	case "onion":
+		return "an OnionOS device"
+	}
+	return "a " + p[1] + " device"
 }
 
 // gmDetails: offline text details (name / system / state+size / free space). No cover
