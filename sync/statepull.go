@@ -259,6 +259,10 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 
 	// Invariant 7.1: an occupant the server doesn't verifiably have gets
 	// uploaded BEFORE we touch it; upload failure aborts the placement.
+	// bakPath remembers a renamed occupant so a FAILED write of the new state can
+	// restore it — the slot must NEVER be left with only a .bak and no loadable
+	// primary file (C1: placement never destroys, even on write failure).
+	bakPath := ""
 	if occ, err := os.ReadFile(target); err == nil && len(occ) > 0 {
 		occRaw, _, perr := statefmt.ExtractRaw(occ)
 		if perr != nil {
@@ -279,7 +283,9 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 				})
 			}
 		}
-		_ = os.Rename(target, target+".bak")
+		if os.Rename(target, target+".bak") == nil {
+			bakPath = target + ".bak"
+		}
 	}
 
 	out := raw
@@ -287,9 +293,15 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 		out = statefmt.WrapRASTATE(raw)
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if bakPath != "" {
+			_ = os.Rename(bakPath, target) // restore occupant — never strand the slot
+		}
 		return PullStateResult{Reason: "write"}
 	}
 	if err := fsutil.WriteFileAtomic(target, out, 0o644); err != nil {
+		if bakPath != "" {
+			_ = os.Rename(bakPath, target) // restore occupant — never strand the slot
+		}
 		return PullStateResult{Reason: "write"}
 	}
 	_ = RecordState(rom.ID, StateLedgerEntry{
