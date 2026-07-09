@@ -1,1 +1,29 @@
-{"schema": 1}
+{
+  "schema": 1,
+  "stable": {
+    "version": "0.9.7.1",
+    "notes": "LodorOS 0.9.6 (beta)",
+    "assets": {
+      "lodoros-miyoomini": {
+        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.1/Lodor-LodorOS-update-miyoomini-0.9.7.1.zip",
+        "size": 4144928,
+        "sha256": "74459decff3151f060c9c56f9495ed04eb4672e593a1fd75a3ec960197733038"
+      },
+      "lodoros-my282": {
+        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.1/Lodor-LodorOS-update-my282-0.9.7.1.zip",
+        "size": 4144704,
+        "sha256": "75097b436d4e32fb2c5f167a8dc1e297d6e97b10db2b2eb8ef27b4ca636f4a4b"
+      },
+      "lodoros-my355": {
+        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.1/Lodor-LodorOS-update-my355-0.9.7.1.zip",
+        "size": 3950743,
+        "sha256": "56e276ff131fc6ecd8b6b9f5f49465a7d32697b8a9c970c694748f92769bb7d4"
+      }
+    }
+  },
+  "notify": {
+    "nextui": "0.9.7.1",
+    "muos": "0.9.7.1",
+    "lodoros_card": "0.9.7.1"
+  }
+}
