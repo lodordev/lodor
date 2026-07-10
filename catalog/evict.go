@@ -104,19 +104,20 @@ func EvictToStub(cfg *config.Config, romPath string) (evicted bool, reason strin
 	return true, ""
 }
 
-// evictDiscFiles deletes the disc files a real .m3u references (the engine's own
-// multi-disc download writes "<FsNameNoExt>/<disc>" lines resolved relative to
-// the m3u's directory). Defensive: absolute lines or any ".." component are
-// skipped so a hand-edited m3u can never delete outside the game's folder. The
-// per-game disc folder is removed only when the deletions left it empty
-// (os.Remove on a non-empty dir fails, silently). Best-effort throughout.
-func evictDiscFiles(m3uPath string) {
+// M3UDiscRefs returns the absolute on-card paths of the disc files a real .m3u
+// references (the engine's own multi-disc download writes "<FsNameNoExt>/<disc>"
+// lines resolved relative to the m3u's directory). Defensive: blank/comment lines,
+// absolute lines, and any ".." component are skipped, so a hand-edited m3u can never
+// point a caller outside the game's folder. Filesystem-read only, never mutates.
+// Shared by evict/uninstall (delete the referenced discs) and the disc-1-first
+// completeness checks (--check-rom / --prefetch-discs, lodor#7).
+func M3UDiscRefs(m3uPath string) []string {
 	data, err := os.ReadFile(m3uPath)
 	if err != nil {
-		return
+		return nil
 	}
 	dir := filepath.Dir(m3uPath)
-	discDirs := map[string]bool{}
+	var out []string
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -125,7 +126,19 @@ func evictDiscFiles(m3uPath string) {
 		if filepath.IsAbs(line) || strings.Contains(line, "..") {
 			continue
 		}
-		p := filepath.Join(dir, line)
+		out = append(out, filepath.Join(dir, line))
+	}
+	return out
+}
+
+// evictDiscFiles deletes the disc files a real .m3u references (present bytes AND
+// 0-byte disc-1-first stubs alike — os.Remove treats them the same). The per-game
+// disc folder is removed only when the deletions left it empty (os.Remove on a
+// non-empty dir fails, silently). Best-effort throughout.
+func evictDiscFiles(m3uPath string) {
+	dir := filepath.Dir(m3uPath)
+	discDirs := map[string]bool{}
+	for _, p := range M3UDiscRefs(m3uPath) {
 		_ = os.Remove(p)
 		if d := filepath.Dir(p); d != dir {
 			discDirs[d] = true
