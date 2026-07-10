@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"lodor/buildinfo"
 	"lodor/ui"
 )
 
@@ -440,5 +441,161 @@ func TestPlaytimeLineFor(t *testing.T) {
 	}
 	if got := playtimeLineFor("Nope.gg"); got != "" {
 		t.Fatalf("missing rom line = %q", got)
+	}
+}
+
+// ---- lodor#31: honest pairing-failure mapping -------------------------------------------
+
+func TestPairFailureMapping(t *testing.T) {
+	msg, retry := pairFailure(3, "PAIRFAIL exchange: network error\nRESULT paired=0 scopes_ok=0\n")
+	if !strings.Contains(msg, "Couldn't reach your server") {
+		t.Fatalf("rc=3 must blame reachability: %q", msg)
+	}
+	if strings.Contains(msg, "fresh code") {
+		t.Fatalf("rc=3 must never tell the user to generate a fresh code: %q", msg)
+	}
+	if retry != stepServer {
+		t.Fatalf("rc=3 retry = %d, want stepServer", retry)
+	}
+
+	msg, retry = pairFailure(6, "RESULT paired=0 scopes_ok=0\n")
+	if !strings.Contains(msg, "Pairing expired") || retry != stepCode {
+		t.Fatalf("rc=6 = %q retry=%d, want expired copy + stepCode", msg, retry)
+	}
+
+	msg, retry = pairFailure(4, "PAIRFAIL exchange: invalid or expired code\nRESULT paired=0 scopes_ok=0\n")
+	if !strings.Contains(msg, "invalid or expired code") || !strings.Contains(msg, "fresh code") || retry != stepCode {
+		t.Fatalf("rc=4 must carry the PAIRFAIL reason + fresh-code advice: %q retry=%d", msg, retry)
+	}
+
+	// flag-missing: rc=0 but no paired=1 in the output — the existing fresh-code copy.
+	msg, retry = pairFailure(0, "garbage\n")
+	if !strings.Contains(msg, "Generate a fresh code") || retry != stepCode {
+		t.Fatalf("flag-missing = %q retry=%d", msg, retry)
+	}
+}
+
+// ---- lodor#38: the scope warning keys off the engine's scopes_ok flag -------------------
+
+func TestScopesFlagParses(t *testing.T) {
+	if resultFlag("RESULT paired=1 scopes_ok=0", "scopes_ok") {
+		t.Fatal("scopes_ok=0 must not read as ok")
+	}
+	if !resultFlag("RESULT paired=1 scopes_ok=1", "scopes_ok") {
+		t.Fatal("scopes_ok=1 must read as ok")
+	}
+}
+
+// ---- lodor#32: host-OS copy table --------------------------------------------------------
+
+func TestHostCopyTable(t *testing.T) {
+	mu, kn := hostCopyFor("muos"), hostCopyFor("knulli")
+	if hostCopyFor("") != mu || hostCopyFor("unknown") != mu {
+		t.Fatal("unset/unknown host must degrade to the muOS copy")
+	}
+	if !strings.Contains(mu.wifiOpen, "muOS Settings") || mu.updateVenue != "App Downloader" {
+		t.Fatalf("muos copy wrong: %+v", mu)
+	}
+	if strings.Contains(kn.wifiOpen, "muOS") || strings.Contains(kn.noWifi, "muOS") || kn.osName != "Knulli" {
+		t.Fatalf("knulli copy still names muOS: %+v", kn)
+	}
+	if kn.updateVenue != "GitHub zip" {
+		t.Fatalf("knulli venue = %q", kn.updateVenue)
+	}
+}
+
+func TestUpdateInstructionsPerHost(t *testing.T) {
+	kb := updateInstructions("knulli", "0.9.8", "0.9.7")
+	for _, want := range []string{"Lodor-Knulli-0.9.8.zip", "/userdata", "pairing is kept", "0.9.7"} {
+		if !strings.Contains(kb, want) {
+			t.Fatalf("knulli update body missing %q: %q", want, kb)
+		}
+	}
+	if strings.Contains(kb, "muOS") {
+		t.Fatalf("knulli update body names muOS: %q", kb)
+	}
+	mb := updateInstructions("muos", "0.9.8", "0.9.7")
+	if !strings.Contains(mb, "App Downloader") || !strings.Contains(mb, "0.9.8") {
+		t.Fatalf("muos update body wrong: %q", mb)
+	}
+}
+
+// ---- lodor#36: device-name preset ---------------------------------------------------------
+
+func TestDefaultDeviceNameFrom(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "model")
+	if err := os.WriteFile(p, []byte("Anbernic RG34XX SP\x00\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := defaultDeviceNameFrom(p); got != "Anbernic RG34XX SP" {
+		t.Fatalf("model preset = %q", got)
+	}
+	if got := defaultDeviceNameFrom(filepath.Join(dir, "missing")); got == "" {
+		t.Fatal("missing model must fall back (hostname/RG34XX), never empty")
+	}
+	if err := os.WriteFile(p, []byte("\x00\x00 \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := defaultDeviceNameFrom(p); got == "" {
+		t.Fatal("NUL-only model must fall back, never empty")
+	}
+}
+
+// ---- lodor#39: validate screen carries the register outcome ------------------------------
+
+func TestValidateBodyRegisteredRow(t *testing.T) {
+	b := validateBody(true, true, true)
+	if !strings.Contains(b, "Device registered: yes") {
+		t.Fatalf("registered row missing: %q", b)
+	}
+	if strings.Contains(b, "retried automatically") {
+		t.Fatalf("registered=yes must not carry the retry line: %q", b)
+	}
+	b = validateBody(true, true, false)
+	if !strings.Contains(b, "Device registered: no") || !strings.Contains(b, "Saves start syncing once this device can register - retried automatically.") {
+		t.Fatalf("unregistered body wrong: %q", b)
+	}
+}
+
+// ---- lodor#45: version visibility ---------------------------------------------------------
+
+func TestMenuTitleCarriesVersion(t *testing.T) {
+	if !strings.Contains(menuTitle(), buildinfo.Version) {
+		t.Fatalf("menu title %q must carry buildinfo version %q", menuTitle(), buildinfo.Version)
+	}
+}
+
+func TestMenuUpdateBadgeVenue(t *testing.T) {
+	rows := buildMenuRows(menuState{userLabel: "d", updateAvail: "0.9.8", updateVenue: "App Downloader"})
+	if findRow(rows, "Update available (0.9.8) - App Downloader") != actCheckUpdates {
+		t.Fatal("muos venue suffix missing from update badge")
+	}
+	rows = buildMenuRows(menuState{userLabel: "d", updateAvail: "0.9.8", updateVenue: "GitHub zip"})
+	if findRow(rows, "Update available (0.9.8) - GitHub zip") != actCheckUpdates {
+		t.Fatal("knulli venue suffix missing from update badge")
+	}
+	rows = buildMenuRows(menuState{userLabel: "d", updateAvail: "0.9.8"})
+	if findRow(rows, "Update available (0.9.8)") != actCheckUpdates {
+		t.Fatal("badge must still appear without a venue")
+	}
+}
+
+func TestVersionFlashOnce(t *testing.T) {
+	w := &wizard{t: ui.DefaultTheme(), dataDir: t.TempDir()}
+	if got := w.versionFlash("dev"); got != "" {
+		t.Fatalf("dev build must never flash: %q", got)
+	}
+	if got := w.versionFlash("0.9.7"); got != "" {
+		t.Fatalf("first-seen version must stamp quietly: %q", got)
+	}
+	if got := w.versionFlash("0.9.7"); got != "" {
+		t.Fatalf("unchanged version must not flash: %q", got)
+	}
+	if got := w.versionFlash("0.9.8"); got != "Updated to 0.9.8." {
+		t.Fatalf("changed version flash = %q", got)
+	}
+	if got := w.versionFlash("0.9.8"); got != "" {
+		t.Fatalf("flash must be one-shot: %q", got)
 	}
 }

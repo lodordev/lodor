@@ -26,6 +26,12 @@ func (f *continueFake) GetRoms(q romm.GetRomsQuery) (romm.PaginatedRoms, error) 
 	return romm.PaginatedRoms{}, nil
 }
 func (f *continueFake) GetCollections() ([]romm.Collection, error) { return f.cols, nil }
+func (f *continueFake) GetVirtualCollections(string) ([]romm.Collection, error) {
+	return nil, &romm.StatusError{Code: 404} // older-RomM default: auto shelves absent
+}
+func (f *continueFake) GetSmartCollections() ([]romm.Collection, error) {
+	return nil, &romm.StatusError{Code: 404}
+}
 func (f *continueFake) DownloadCover(p string) ([]byte, error)     { return nil, os.ErrNotExist }
 func (f *continueFake) DownloadCoverCtx(_ context.Context, p string) ([]byte, error) {
 	return nil, os.ErrNotExist
@@ -114,7 +120,7 @@ func TestContinueCollectionNewestFirstDedupedGhostFree(t *testing.T) {
 	// contract has its own test (collections_prune_test.go).
 	seedLegacyLedger(t, "Stale.txt")
 
-	written, _, _, cont, err := MirrorCollections(fake, cfg, nil)
+	written, _, _, cont, _, _, _, err := MirrorCollections(fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("MirrorCollections: %v", err)
 	}
@@ -169,7 +175,7 @@ func TestContinueEmptyFeedRemovesFile(t *testing.T) {
 	// record (STEP 0b ledger, imported into the manifest) — seed it, or the scoped
 	// prune (correctly) refuses to touch it.
 	seedLegacyLedger(t, "0) Continue.txt")
-	_, _, _, cont, err := MirrorCollections(fake, cfg, nil)
+	_, _, _, cont, _, _, _, err := MirrorCollections(fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("MirrorCollections: %v", err)
 	}
@@ -194,7 +200,7 @@ func TestContinueCapsAtTwelve(t *testing.T) {
 		platforms: []romm.Platform{{ID: 10, FsSlug: "gba"}},
 		saves:     map[int][]romm.Save{10: saves},
 	}
-	_, _, _, cont, err := MirrorCollections(fake, cfg, nil)
+	_, _, _, cont, _, _, _, err := MirrorCollections(fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("MirrorCollections: %v", err)
 	}

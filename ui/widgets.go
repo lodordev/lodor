@@ -226,6 +226,7 @@ func ResultToken(output, key string) string {
 // the user is never trapped in a text field (blocker #170).
 type Keyboard struct {
 	Prompt    string
+	Hint      string // optional guidance line above the prompt (lodor#40); "" = none
 	Text      string
 	Cancelled bool
 	row       int
@@ -314,6 +315,11 @@ func (k *Keyboard) activate() (done bool) {
 
 // Draw renders the prompt, the current text, and the key grid within (x,y,w,h).
 func (k *Keyboard) Draw(c *Canvas, t Theme, x, y, w, h int) {
+	if k.Hint != "" {
+		c.DrawText(x, y, k.Hint, t.Dim, t.SmallScale)
+		y += glyphH*t.SmallScale + 8
+		h -= glyphH*t.SmallScale + 8
+	}
 	c.DrawText(x, y, k.Prompt, t.Dim, t.SmallScale)
 	// Text field.
 	fy := y + glyphH*t.SmallScale + 10

@@ -260,10 +260,14 @@ func (c *Client) doJSON(method, path string, body, out any) error {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
+		// Auth classification first (401 / token-invalid 403 -> *AuthError, which the
+		// re-pair flow branches on); every other non-2xx is a *StatusError whose Error()
+		// string is byte-identical to the old fmt.Errorf message, and whose Code lets
+		// callers errors.As a 404 from an endpoint an older RomM doesn't expose.
 		if aerr := authErrorFromStatus(resp.StatusCode, raw); aerr != nil {
 			return aerr
 		}
-		return fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(raw))
+		return &StatusError{Code: resp.StatusCode, Body: string(raw)}
 	}
 
 	if out != nil && resp.StatusCode != http.StatusNoContent {
@@ -272,6 +276,20 @@ func (c *Client) doJSON(method, path string, body, out any) error {
 		}
 	}
 	return nil
+}
+
+// StatusError is a non-2xx (and non-409) HTTP response from the RomM API. Its
+// Error() string is byte-identical to the fmt.Errorf message doJSON returned before
+// this type existed, so any caller matching on the message text keeps working; the
+// Code field lets newer callers branch on a specific status (e.g. a 404 from an
+// endpoint an older RomM server doesn't expose -> graceful no-op) via errors.As.
+type StatusError struct {
+	Code int
+	Body string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("API error: status %d, body: %s", e.Code, e.Body)
 }
 
 // doRaw performs an authenticated GET and returns the full response body. The path
@@ -388,6 +406,111 @@ func (p *progressCountWriter) Write(b []byte) (int, error) {
 		p.cb(p.done, p.total)
 	}
 	return n, err
+}
+
+// doRawStreamResumeTo performs an authenticated GET that RESUMES a partial download.
+// When startOffset > 0 it sends "Range: bytes=<startOffset>-" so the server returns
+// only the remaining bytes (HTTP 206), which are APPENDED to f from startOffset; the
+// progress callback is primed with startOffset already done so the bar never jumps
+// backward. Three server behaviors are handled so a resume can never corrupt the file:
+//
+//   - 206 Partial Content: honor the range. f is truncated to startOffset (dropping
+//     any bytes a previous run wrote past the requested offset) and the remainder is
+//     appended. Final size MUST equal startOffset + Content-Length.
+//   - 200 OK: the server ignored the Range header and is sending the WHOLE file from
+//     byte 0 (older RomM / proxy that strips Range). f is truncated to 0 and rewritten
+//     from scratch — the partial is discarded, so the result is always a clean file.
+//   - 416 Range Not Satisfiable: our offset is at/beyond EOF (a stale or already-complete
+//     .tmp). f is truncated to 0 and the whole file is re-fetched from byte 0 in a single
+//     retry, so a bad partial self-heals instead of wedging forever.
+//
+// On any other non-2xx a bounded error snippet is read (never the whole body). The
+// caller owns f (open/sync/close) and the final hash verify remains the ultimate gate.
+func (c *Client) doRawStreamResumeTo(path string, f *os.File, startOffset int64, onProgress func(done, total int64)) (int64, error) {
+	full, err := buildURL(c.baseURL, path)
+	if err != nil {
+		return 0, fmt.Errorf("build url: %w", err)
+	}
+	req, err := http.NewRequest("GET", full, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+	c.authorize(req)
+	if startOffset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent: // 206 — resume: append from startOffset
+		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+			return 0, fmt.Errorf("seek for resume: %w", err)
+		}
+		if err := f.Truncate(startOffset); err != nil {
+			return 0, fmt.Errorf("truncate for resume: %w", err)
+		}
+		var total int64 = -1
+		if resp.ContentLength > 0 {
+			total = startOffset + resp.ContentLength
+		}
+		w := io.Writer(f)
+		if onProgress != nil {
+			w = &progressCountWriter{dst: f, done: startOffset, total: total, cb: onProgress}
+		}
+		n, cErr := io.Copy(w, resp.Body)
+		if cErr != nil {
+			return startOffset + n, fmt.Errorf("stream response body: %w", cErr)
+		}
+		if total > 0 && startOffset+n != total {
+			return startOffset + n, fmt.Errorf("short read: got %d of %d bytes", startOffset+n, total)
+		}
+		return startOffset + n, nil
+
+	case http.StatusRequestedRangeNotSatisfiable: // 416 — stale/complete partial: restart from 0
+		if startOffset == 0 {
+			// A 416 for a request that sent no Range header means the server is broken;
+			// refuse to loop — exactly one clean re-fetch is allowed.
+			return 0, fmt.Errorf("API error: status 416 on full fetch")
+		}
+		resp.Body.Close()
+		if err := f.Truncate(0); err != nil {
+			return 0, fmt.Errorf("truncate for restart: %w", err)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return 0, fmt.Errorf("seek for restart: %w", err)
+		}
+		return c.doRawStreamResumeTo(path, f, 0, onProgress)
+
+	default:
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			return 0, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(snippet))
+		}
+		// 200 (or any other 2xx) — full body from byte 0: discard the partial, rewrite clean.
+		if err := f.Truncate(0); err != nil {
+			return 0, fmt.Errorf("truncate for full: %w", err)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return 0, fmt.Errorf("seek for full: %w", err)
+		}
+		w := io.Writer(f)
+		if onProgress != nil {
+			w = &progressCountWriter{dst: f, total: resp.ContentLength, cb: onProgress}
+		}
+		n, cErr := io.Copy(w, resp.Body)
+		if cErr != nil {
+			return n, fmt.Errorf("stream response body: %w", cErr)
+		}
+		if resp.ContentLength > 0 && n != resp.ContentLength {
+			return n, fmt.Errorf("short read: got %d of %d bytes", n, resp.ContentLength)
+		}
+		return n, nil
+	}
 }
 
 // doMultipart POSTs a multipart/form-data body with exactly one file field named

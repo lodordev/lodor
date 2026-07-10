@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"testing"
 
 	"lodor/romm"
@@ -67,5 +68,16 @@ func TestNewOutcomesStayStuck(t *testing.T) {
 	pushed, total, stuck := sync.Counts(results)
 	if pushed != 1 || total != 3 || stuck != 2 {
 		t.Errorf("Counts = (%d,%d,%d), want (1,3,2)", pushed, total, stuck)
+	}
+}
+
+// TestSyncFeedRC locks the lodor#44 contract: a platform-fetch failure is reachability
+// (exit 3, the --list-saves convention), never a fake empty feed.
+func TestSyncFeedRC(t *testing.T) {
+	if syncFeedRC(nil) != 0 {
+		t.Fatal("no error must proceed with rc 0")
+	}
+	if syncFeedRC(errors.New("boom")) != 3 {
+		t.Fatal("platform-fetch failure must exit 3")
 	}
 }

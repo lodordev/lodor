@@ -33,6 +33,12 @@ func (f *mergeFake) GetRoms(q romm.GetRomsQuery) (romm.PaginatedRoms, error) {
 	return romm.PaginatedRoms{Items: items}, nil
 }
 func (f *mergeFake) GetCollections() ([]romm.Collection, error) { return nil, nil }
+func (f *mergeFake) GetVirtualCollections(string) ([]romm.Collection, error) {
+	return nil, &romm.StatusError{Code: 404}
+}
+func (f *mergeFake) GetSmartCollections() ([]romm.Collection, error) {
+	return nil, &romm.StatusError{Code: 404}
+}
 func (f *mergeFake) DownloadCover(p string) ([]byte, error)     { return nil, os.ErrNotExist }
 func (f *mergeFake) DownloadCoverCtx(_ context.Context, p string) ([]byte, error) {
 	return nil, os.ErrNotExist
