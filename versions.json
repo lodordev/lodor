@@ -1,29 +1,29 @@
 {
   "schema": 1,
   "stable": {
-    "version": "0.9.7.6",
-    "notes": "LodorOS 0.9.7.6",
+    "version": "0.9.7.7",
+    "notes": "LodorOS 0.9.7.7",
     "assets": {
       "lodoros-miyoomini": {
-        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.6/Lodor-LodorOS-update-miyoomini-0.9.7.6.zip",
-        "size": 4167095,
-        "sha256": "2f6b6258b3ca29a8ca91a1ca88dcbee225cfb952f552cb947da67d7f94b7590d"
+        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.7/Lodor-LodorOS-update-miyoomini-0.9.7.7.zip",
+        "size": 4186898,
+        "sha256": "cb192510af091a20aef6e23421d1d2d8fb90980c318b86953fafd95be5a7a2e5"
       },
       "lodoros-my282": {
-        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.6/Lodor-LodorOS-update-my282-0.9.7.6.zip",
-        "size": 4166871,
-        "sha256": "9fc84cec41b546c8b77df4ace6b0f2d86005050b80d73efe9019d27125b99af2"
+        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.7/Lodor-LodorOS-update-my282-0.9.7.7.zip",
+        "size": 4186674,
+        "sha256": "f1fc77df31caaee612d14daaf8ead4ba3941b9c6dbdbfc36b871f00f52ab2f30"
       },
       "lodoros-my355": {
-        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.6/Lodor-LodorOS-update-my355-0.9.7.6.zip",
-        "size": 3965681,
-        "sha256": "ad43315d6f41c9e8eab9d54a776c6847f05998a91e8dd86627054650e5ad9ab3"
+        "url": "https://github.com/lodordev/lodor/releases/download/v0.9.7.7/Lodor-LodorOS-update-my355-0.9.7.7.zip",
+        "size": 3987011,
+        "sha256": "3dd0db36f0317da90a4b0c5212a957d4eb8692ceb968ec1170cb6b15c7814ea4"
       }
     }
   },
   "notify": {
-    "nextui": "0.9.7.6",
-    "muos": "0.9.7.6",
-    "lodoros_card": "0.9.7.6"
+    "nextui": "0.9.7.7",
+    "muos": "0.9.7.7",
+    "lodoros_card": "0.9.7.7"
   }
 }
