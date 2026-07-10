@@ -23,11 +23,23 @@ jobs:
   verify-and-publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch versions.json from the release
+      - name: Fetch versions.json (+ its ed25519 signature) from the release
         run: |
-          curl -sfL -o versions.json \
-            "https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/versions.json"
+          base="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}"
+          curl -sfL -o versions.json "$base/versions.json"
           python3 -c "import json; m=json.load(open('versions.json')); assert m.get('schema')==1, 'schema != 1'"
+          # The detached signature devices verify (security HIGH #4). It is
+          # produced by the offline signer in publish-updates.sh and uploaded as
+          # a release asset; copy it to gh-pages beside versions.json so
+          # <manifest>.sig resolves. Not-yet-present is tolerated during the
+          # warn-mode rollout — a missing .sig just means devices stay in the
+          # pre-signing (hash-only) path, which is the fail-open contract.
+          if curl -sfL -o versions.json.sig "$base/versions.json.sig"; then
+            echo "signature present — will publish versions.json.sig"
+          else
+            echo "WARNING: no versions.json.sig on the release (warn-mode rollout: devices stay hash-only)"
+            rm -f versions.json.sig
+          fi
 
       - name: Verify every named asset live (download + sha256)
         run: |
@@ -48,16 +60,20 @@ jobs:
               print(f"ok: {label} live + hash-verified")
           PY
 
-      - name: Commit versions.json to gh-pages
+      - name: Commit versions.json (+ .sig) to gh-pages
         run: |
           git clone --depth 1 --branch gh-pages \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" pages \
             || { git init pages && cd pages && git checkout -b gh-pages && \
                  git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" && cd ..; }
           cp versions.json pages/versions.json
+          # Publish the signature alongside the manifest when present (warn-mode
+          # rollout tolerates its absence — see the fetch step).
+          if [ -f versions.json.sig ]; then cp versions.json.sig pages/versions.json.sig; fi
           cd pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add versions.json
+          [ -f versions.json.sig ] && git add versions.json.sig
           git diff --cached --quiet || git commit -m "versions.json for ${{ inputs.tag }}"
           git push origin gh-pages
