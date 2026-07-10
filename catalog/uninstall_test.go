@@ -153,7 +153,9 @@ func TestUninstallRemoveDownloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	man.Record(dl, platform.ManifestDownload, 99)
-	// Multi-disc download: m3u + disc folder.
+	// Multi-disc download in the PARTIAL disc-1-first shape (lodor#7): disc 1 has
+	// real bytes, disc 2 is the engine's honest 0-byte stub — uninstall must sweep
+	// both (a partial set is a first-class downloaded state, not corruption).
 	discDir := filepath.Join(userDir, "Chrono (USA)")
 	if err := os.MkdirAll(discDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -161,8 +163,11 @@ func TestUninstallRemoveDownloads(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(discDir, "disc1.chd"), []byte("D1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(discDir, "disc2.chd"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	m3u := filepath.Join(userDir, platform.MarkerOnDevice+"Chrono (USA).m3u")
-	if err := os.WriteFile(m3u, []byte("Chrono (USA)/disc1.chd\n"), 0o644); err != nil {
+	if err := os.WriteFile(m3u, []byte("Chrono (USA)/disc1.chd\nChrono (USA)/disc2.chd\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	man.Record(m3u, platform.ManifestDownload, 44)

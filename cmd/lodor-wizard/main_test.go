@@ -475,6 +475,161 @@ func TestPairFailureMapping(t *testing.T) {
 	}
 }
 
+// ---- lodor#35: certificate trust for self-signed servers --------------------------------
+
+// TestCertFailureDetection: the trust offer keys ONLY on the engine's reason=tls machine
+// token with a non-zero rc — never on human text, never on a successful run.
+func TestCertFailureDetection(t *testing.T) {
+	certOut := "PAIRFAIL exchange: server certificate could not be verified\nRESULT paired=0 scopes_ok=0 reason=tls\n"
+	if !certFailure(3, certOut) {
+		t.Fatal("rc=3 + reason=tls must classify as a certificate failure")
+	}
+	if certFailure(0, certOut) {
+		t.Fatal("rc=0 must never classify as a certificate failure")
+	}
+	if certFailure(3, "PAIRFAIL exchange: network error\nRESULT paired=0 scopes_ok=0\n") {
+		t.Fatal("plain unreachable (no reason=tls) must not classify")
+	}
+	if certFailure(4, "RESULT paired=0 scopes_ok=0 reason=other\n") {
+		t.Fatal("a different reason token must not classify")
+	}
+}
+
+// TestCertTrustCopyRules: plain language — "certificate", never a bare TLS/SSL, and the
+// honest one-line tradeoff ("only do this for your own server") is present.
+func TestCertTrustCopyRules(t *testing.T) {
+	for _, s := range []string{certTrustTitle, certTrustBody, certTrustOption} {
+		if strings.Contains(s, "TLS") || strings.Contains(s, "SSL") {
+			t.Fatalf("copy must not say TLS/SSL: %q", s)
+		}
+	}
+	if !strings.Contains(certTrustBody, "certificate") || !strings.Contains(certTrustOption, "certificate") {
+		t.Fatal("copy must name the certificate")
+	}
+	if !strings.Contains(certTrustBody, "self-signed home servers") {
+		t.Fatalf("body must normalize the self-signed case: %q", certTrustBody)
+	}
+	if !strings.Contains(certTrustBody, "only do this for your own server") {
+		t.Fatalf("body must carry the honest tradeoff line: %q", certTrustBody)
+	}
+}
+
+// writeFakeCertEngine installs a fake lodor-sync that answers --pair with the engine's
+// REAL certificate-failure contract (reason=tls, rc=3) until --set-server has been
+// re-run with --insecure (recorded via a marker file), after which pairing succeeds —
+// the exact engine behavior the trust-retry flow rides.
+func writeFakeCertEngine(t *testing.T, dir string) (bin, marker string) {
+	t.Helper()
+	marker = filepath.Join(dir, "insecure-set")
+	script := `#!/bin/sh
+case "$1" in
+--set-server)
+	for a in "$@"; do [ "$a" = "--insecure" ] && : > "` + marker + `"; done
+	echo "RESULT server_set=1"; exit 0 ;;
+--pair)
+	if [ -f "` + marker + `" ]; then
+		echo "RESULT paired=1 scopes_ok=1"; exit 0
+	fi
+	echo "PAIRFAIL exchange: server certificate could not be verified" >&2
+	echo "RESULT paired=0 scopes_ok=0 reason=tls"; exit 3 ;;
+esac
+exit 0
+`
+	bin = filepath.Join(dir, "fake-lodor-sync")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, marker
+}
+
+// scriptedBtns feeds a fixed button sequence, then BtnBack forever (same convention as
+// driveOnboarding: a screen that ignores the script backs out instead of hanging).
+func scriptedBtns(seq ...ui.Button) func() ui.Button {
+	ch := make(chan ui.Button, len(seq))
+	for _, b := range seq {
+		ch <- b
+	}
+	return func() ui.Button {
+		select {
+		case b := <-ch:
+			return b
+		default:
+			return ui.BtnBack
+		}
+	}
+}
+
+// TestPairServerCertTrustFlow: cert failure -> trust choice (A on the top row) ->
+// --set-server --insecure persisted -> automatic re-pair with the same code -> stepDevice.
+func TestPairServerCertTrustFlow(t *testing.T) {
+	dir := t.TempDir()
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir}
+	bin, marker := writeFakeCertEngine(t, dir)
+	w.bin = bin
+	next := w.pairServer("https://romm.home", "X7K2", func(*ui.Canvas) {}, scriptedBtns(ui.BtnConfirm))
+	if next != stepDevice {
+		t.Fatalf("trusted pair must land on stepDevice, got %d (errMsg=%q)", next, w.errMsg)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("trusting must re-run --set-server with --insecure (marker missing)")
+	}
+}
+
+// TestPairServerCertGoBack: choosing "Go back" (second row) returns to the server step
+// and never writes the insecure setting.
+func TestPairServerCertGoBack(t *testing.T) {
+	dir := t.TempDir()
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir}
+	bin, marker := writeFakeCertEngine(t, dir)
+	w.bin = bin
+	next := w.pairServer("https://romm.home", "X7K2", func(*ui.Canvas) {}, scriptedBtns(ui.BtnDown, ui.BtnConfirm))
+	if next != stepServer {
+		t.Fatalf("Go back must return to stepServer, got %d", next)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("Go back must NOT write the insecure setting")
+	}
+	// B on the choice screen is the same walk-back.
+	if next := w.pairServer("https://romm.home", "X7K2", func(*ui.Canvas) {}, scriptedBtns(ui.BtnBack)); next != stepServer {
+		t.Fatalf("B on the trust screen must return to stepServer, got %d", next)
+	}
+}
+
+// TestPairServerCertHTTPNeverOffers: reason=tls on a plain-http server (defensive — the
+// engine shouldn't produce it) maps to the normal lodor#31 error screen, no trust offer.
+func TestPairServerCertHTTPNeverOffers(t *testing.T) {
+	dir := t.TempDir()
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir}
+	bin, marker := writeFakeCertEngine(t, dir)
+	w.bin = bin
+	next := w.pairServer("http://romm.home", "X7K2", func(*ui.Canvas) {}, scriptedBtns())
+	if next != stepError {
+		t.Fatalf("http must take the normal error path, got %d", next)
+	}
+	if w.retry != stepServer || !strings.Contains(w.errMsg, "Couldn't reach your server") {
+		t.Fatalf("http cert-ish failure must keep the rc=3 mapping: retry=%d msg=%q", w.retry, w.errMsg)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("http path must never write the insecure setting")
+	}
+}
+
+// TestPairServerPlainFailureUnchanged: a non-TLS pairing failure keeps the exact
+// lodor#31 mapping (no trust screen consumed a button, errMsg/retry as before).
+func TestPairServerPlainFailureUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncase \"$1\" in --pair) echo \"PAIRFAIL exchange: invalid or expired code\" >&2; echo \"RESULT paired=0 scopes_ok=0\"; exit 4;; esac\nexit 0\n"
+	bin := filepath.Join(dir, "fake-lodor-sync")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir, bin: bin}
+	next := w.pairServer("https://romm.home", "BAD1", func(*ui.Canvas) {}, scriptedBtns())
+	if next != stepError || w.retry != stepCode || !strings.Contains(w.errMsg, "fresh code") {
+		t.Fatalf("rc=4 mapping changed: next=%d retry=%d msg=%q", next, w.retry, w.errMsg)
+	}
+}
+
 // ---- lodor#38: the scope warning keys off the engine's scopes_ok flag -------------------
 
 func TestScopesFlagParses(t *testing.T) {

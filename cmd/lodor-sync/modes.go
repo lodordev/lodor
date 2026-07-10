@@ -49,7 +49,16 @@ const extractTimeout = 20 * time.Minute
 // SECURITY: every failure prints a generic, host-free DLFAIL token to stderr — the
 // URL and the underlying client error (which can embed the host) are NEVER echoed.
 func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
-	if downloadRomCore(client, cfg, romPath) {
+	ok, st := downloadRomCoreStats(client, cfg, romPath)
+	if st.multi {
+		// Multi-disc (disc-1-first, lodor#7): the trailing disc fields are ADDITIVE —
+		// every existing parser keys on the exact "downloaded=<0|1>" token and ignores
+		// the rest of the line. downloaded=1 means the game is LAUNCHABLE (its first
+		// missing disc landed, or every disc was already present) — NOT that every
+		// disc is on the card; discs_present vs discs_total carries that truth.
+		fmt.Printf("RESULT downloaded=%d discs_total=%d discs_present=%d discs_fetched=%d\n",
+			b2i(ok), st.total, st.present, st.fetched)
+	} else if ok {
 		fmt.Println("RESULT downloaded=1")
 	} else {
 		fmt.Println("RESULT downloaded=0")
@@ -57,12 +66,39 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 	exitMode(0)
 }
 
+// discStats is the honest per-disc accounting a multi-disc download reports on its
+// RESULT line (disc-1-first, lodor#7): how many discs the playlist lists, how many
+// hold real verified bytes on the card AFTER this run, and how many this run actually
+// transferred. multi=false for a single-file ROM (the fields are then meaningless).
+type discStats struct {
+	multi   bool
+	total   int
+	present int
+	fetched int
+}
+
+// complete reports whether every listed disc is on the card.
+func (s discStats) complete() bool { return s.multi && s.total > 0 && s.present == s.total }
+
 // downloadRomCore does the actual single-ROM download work and returns true iff a
 // playable, hash-verified file landed. It prints NO RESULT line and never exits — so
 // it is shared by both --download (runDownloadRom) and --download-queue
 // (runDownloadQueue). Every progress/phase side-channel write and every host-free
 // DLFAIL stderr diagnostic from the original --download path is preserved verbatim.
 func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bool {
+	ok, _ := downloadRomCoreStats(client, cfg, romPath)
+	return ok
+}
+
+// downloadRomCoreStats is downloadRomCore plus the multi-disc accounting the RESULT
+// line reports (single-file ROMs return a zero discStats with multi=false).
+func downloadRomCoreStats(client *romm.Client, cfg *config.Config, romPath string) (bool, discStats) {
+	var st discStats
+	ok := downloadRomCoreInner(client, cfg, romPath, &st)
+	return ok, st
+}
+
+func downloadRomCoreInner(client *romm.Client, cfg *config.Config, romPath string, st *discStats) bool {
 	writeProgress(0)
 
 	id, ok := catalog.ResolveRomID(cfg, romPath)
@@ -124,8 +160,11 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	// MULTI-DISC (folder-per-game, has_multiple_files): RomM serves all discs as a
 	// mod_zip, OR each disc individually via a single file_ids selector. We download
 	// disc-by-disc (streamed, no OOM; per-disc hash-verified) and write the .m3u.
+	// DISC-1-FIRST (lodor#7): the launch path fetches ONLY the first missing disc
+	// (budget=1) — later discs stay 0-byte stubs until --fetch-next-disc /
+	// --fetch-discs / the daemon prefetch completes the set.
 	if rom.HasMultipleFiles {
-		return downloadMultiDiscCore(client, cfg, rom, romName, man)
+		return downloadMultiDiscCore(client, cfg, rom, romName, man, 1, st)
 	}
 
 	// BROKEN IMPORT GUARD: a single-file rom whose only file is a bare `.m3u` is a
@@ -489,22 +528,40 @@ func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string, man *p
 	}
 }
 
-// runDownloadMultiDisc downloads every disc of a folder-per-game multi-file ROM and
-// writes the .m3u that ties them together. Contract: RESULT downloaded=<0|1>, same as
-// the single-file path. Each disc is fetched INDIVIDUALLY via a single file_ids
-// selector (verified live: one file_ids → that file's raw bytes; two or more → a
-// mod_zip). This is chosen over pulling RomM's all-files mod_zip deliberately:
+// downloadMultiDiscCore downloads a folder-per-game multi-file ROM's discs and writes
+// the .m3u that ties them together — DISC-1-FIRST (lodor#7 hybrid). budget caps how
+// many discs this run may TRANSFER: 1 = the launch path / --fetch-next-disc (first
+// missing disc in m3u order — the disc the player is about to need); < 0 = unlimited
+// (--fetch-discs / the daemon prefetch completes the set). Missing discs beyond the
+// budget are left as honest 0-byte stubs and the FULL .m3u is always written on
+// success, so the emulator knows the whole disc list while the card only pays for
+// discs actually fetched. A populated .m3u with 0-byte disc stubs is therefore a
+// VALID on-card state now — the lane hooks detect it (incomplete-m3u scan /
+// --check-rom) and re-trigger the fetch, and mirror/evict/uninstall tolerate it.
+//
+// Each disc is fetched INDIVIDUALLY via a single file_ids selector (verified live:
+// one file_ids → that file's raw bytes; two or more → a mod_zip). This is chosen over
+// pulling RomM's all-files mod_zip deliberately:
 //   - STREAMED to disk (io.Copy), so a 1.3 GB game never sits in 128 MB of RAM;
 //   - each disc runs the SAME integrity gate as the single-file path (verifyFileHash:
 //     non-CHD discs are checked against files[].sha1/md5; .chd discs are accepted on a
 //     valid streamed transfer because RomM records a CHD's INTERNAL disc SHA1, not the
 //     container's — see isCHD; a mod_zip would expose no per-member hash to check at all);
-//   - a failed disc fails the WHOLE game honestly (partial multi-disc is unplayable):
-//     we clean up what we wrote and report downloaded=0, never a half-game.
+//   - a failed TRANSFER fails this run honestly (ok=false, no .m3u write if it was
+//     still a stub) but KEEPS every previously-verified disc — per-disc resume: the
+//     next run re-lists the verified discs and fetches only what's still missing.
+//
 // Discs land in <Roms>/<system>/<FsNameNoExt>/<disc>.chd; the .m3u (at <FsNameNoExt>.m3u
 // beside that folder) lists "<FsNameNoExt>/<disc>" lines, resolved relative to the m3u
 // dir by both the launcher (getFirstDisc) and the emulator's m3u loader.
-func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom, romName string, man *platform.Manifest) bool {
+//
+// ok=true means the game is LAUNCHABLE: every disc BEFORE the first fetched one was
+// already present, so on success disc 1 always has real bytes. st (optional) carries
+// the honest total/present/fetched accounting for the caller's RESULT line.
+func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom, romName string, man *platform.Manifest, budget int, st *discStats) bool {
+	if st != nil {
+		st.multi = true
+	}
 	if len(rom.Files) == 0 {
 		fmt.Fprintf(os.Stderr, "DLFAIL multidisc rom=%d: no files[]\n", rom.ID)
 		writePhase("This game needs re-importing on the server")
@@ -577,13 +634,22 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 	})
 
 	total := len(discFiles)
-	var m3uLines []string
+	if st != nil {
+		st.total = total
+	}
 
-	writeProgress(0)
+	// PRE-PASS (fail early, write late): validate every disc's server name +
+	// destination and take a presence census BEFORE any byte moves. A validation
+	// failure aborts with the card untouched — previously-landed discs always stay.
+	type discPlan struct {
+		file    romm.RomFile
+		dest    string
+		present bool
+	}
+	plans := make([]discPlan, 0, total)
 	for i, f := range discFiles {
 		if f.ID == 0 || f.FileName == "" {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc rom=%d: disc %d missing id/name\n", rom.ID, i+1)
-			cleanupMultiDisc(discDir)
 			writeProgress(0)
 			return false
 		}
@@ -594,41 +660,69 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		if !platform.SafeName(f.FileName) {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc unsafe-name rom=%d disc=%d\n", rom.ID, i+1)
 			writePhase("A disc's server filename is invalid")
-			cleanupMultiDisc(discDir)
 			writeProgress(0)
 			return false
 		}
-		writePhase(fmt.Sprintf("Downloading %s — disc %d/%d…", romName, i+1, total))
-
 		discDest := filepath.Join(discDir, f.FileName)
 		// SECURITY (containment suspenders, per-disc): assert the joined disc destination
 		// stays inside Roms/ before any create/rename.
 		if !platform.PathWithinRoms(discDest) {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc escape-dest rom=%d disc=%d\n", rom.ID, i+1)
 			writePhase("A disc's destination path is invalid")
-			cleanupMultiDisc(discDir)
 			writeProgress(0)
 			return false
 		}
-		// Already present and hash-clean from a prior partial run? Skip the transfer but
-		// still list it (idempotent resume — never re-pull a verified disc).
-		if existsNonEmpty(discDest) && verifyFileHash(discDest, f.Sha1Hash, f.Md5Hash) == nil {
-			m3uLines = append(m3uLines, folderName+"/"+f.FileName)
-			writeProgress((i + 1) * 100 / total)
+		// Present and hash-clean from a prior run? It will be skipped, not re-pulled
+		// (idempotent per-disc resume — same gate as before, taken once up front).
+		present := existsNonEmpty(discDest) && verifyFileHash(discDest, f.Sha1Hash, f.Md5Hash) == nil
+		plans = append(plans, discPlan{file: f, dest: discDest, present: present})
+	}
+	missing := 0
+	for _, p := range plans {
+		if !p.present {
+			missing++
+		}
+	}
+	// The progress bar spans the discs this run will actually TRANSFER — an
+	// already-present disc or a beyond-budget stub never moves it (honest bar).
+	toFetch := missing
+	if budget >= 0 && toFetch > budget {
+		toFetch = budget
+	}
+
+	var m3uLines []string
+	fetched := 0
+	writeProgress(0)
+	for i, p := range plans {
+		if p.present {
+			if st != nil {
+				st.present++
+			}
+			m3uLines = append(m3uLines, folderName+"/"+p.file.FileName)
 			continue
 		}
+		if budget >= 0 && fetched >= budget {
+			// Beyond this run's budget (disc-1-first): leave an honest 0-byte stub so
+			// the on-card disc set matches the .m3u we write below. ADDITIVE only —
+			// anything already at the path (even a stale partial) is left alone; the
+			// per-game folder is manifest-owned, so the stub is ours to place.
+			ensureDiscStub(p.dest)
+			m3uLines = append(m3uLines, folderName+"/"+p.file.FileName)
+			continue
+		}
+		writePhase(fmt.Sprintf("Downloading %s — disc %d/%d…", romName, i+1, total))
 
-		tmp := discDest + ".tmp"
+		tmp := p.dest + ".tmp"
 		out, cErr := os.Create(tmp)
 		if cErr != nil {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc create rom=%d disc=%d\n", rom.ID, i+1)
-			cleanupMultiDisc(discDir)
+			writeProgress(0)
 			return false
 		}
-		// Real progress: this disc spans [i/total, (i+1)/total] of the overall bar;
-		// move smoothly within that band as its bytes stream.
-		discBase := i * 100 / total
-		discSpan := (i+1)*100/total - discBase
+		// Real progress: this transfer spans [fetched/toFetch, (fetched+1)/toFetch] of
+		// the overall bar; move smoothly within that band as its bytes stream.
+		discBase := fetched * 100 / toFetch
+		discSpan := (fetched+1)*100/toFetch - discBase
 		lastPct := -1
 		onProg := func(done, tot int64) {
 			if tot <= 0 || discSpan <= 0 {
@@ -640,7 +734,7 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 				writeProgress(pct)
 			}
 		}
-		n, dErr := client.DownloadRomFileTo(rom.ID, rom.FsName, f.ID, out, onProg)
+		n, dErr := client.DownloadRomFileTo(rom.ID, rom.FsName, p.file.ID, out, onProg)
 		// FAT32-durable: fsync the streamed disc bytes before rename so a power-yank
 		// can't zero a "renamed-in" .chd (streaming path — too large to buffer through
 		// fsutil, so we fsync in place). A Sync error folds into the download-failed gate.
@@ -650,38 +744,44 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 			noteAuthErr(dErr)
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc download rom=%d disc=%d: %s\n", rom.ID, i+1, safeErr(dErr))
 			_ = os.Remove(tmp)
-			cleanupMultiDisc(discDir)
+			// Previously-verified discs STAY (a partial multi-disc is a valid on-card
+			// state under disc-1-first); a still-stub .m3u is left for the hook to re-tap.
 			writeProgress(0)
 			return false
 		}
-		if rErr := os.Rename(tmp, discDest); rErr != nil {
+		if rErr := os.Rename(tmp, p.dest); rErr != nil {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc rename rom=%d disc=%d\n", rom.ID, i+1)
 			_ = os.Remove(tmp)
-			cleanupMultiDisc(discDir)
+			writeProgress(0)
 			return false
 		}
 		fsutil.SyncDir(discDir) // FAT32: persist the disc rename into the folder
 
 		// Per-disc hash verify (same gate as single-file). A .chd or a disc with no
-		// recorded hash is accepted (parity with verifyRomHash); a real mismatch fails
-		// the whole game.
-		if vErr := verifyFileHash(discDest, f.Sha1Hash, f.Md5Hash); vErr != nil {
+		// recorded hash is accepted (parity with verifyRomHash); a real mismatch
+		// deletes the bad disc and fails this run — never a corrupt disc left behind.
+		if vErr := verifyFileHash(p.dest, p.file.Sha1Hash, p.file.Md5Hash); vErr != nil {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc verify rom=%d disc=%d: %s\n", rom.ID, i+1, vErr)
-			cleanupMultiDisc(discDir)
+			_ = os.Remove(p.dest)
 			writeProgress(0)
 			return false
 		}
 
-		m3uLines = append(m3uLines, folderName+"/"+f.FileName)
-		writeProgress((i + 1) * 100 / total)
+		fetched++
+		if st != nil {
+			st.present++
+			st.fetched++
+		}
+		m3uLines = append(m3uLines, folderName+"/"+p.file.FileName)
+		writeProgress(fetched * 100 / toFetch)
 	}
 
-	// Write the .m3u FAT32-atomically (temp + fsync + rename + dir fsync); the rename
-	// overwrites any 0-byte stub at that path.
+	// Write the FULL .m3u FAT32-atomically (temp + fsync + rename + dir fsync); the
+	// rename overwrites any 0-byte stub at that path. The playlist always lists EVERY
+	// disc — present or stub — so the emulator's disc-control menu shows the whole set.
 	writePhase("Writing playlist…")
 	if wErr := fsutil.WriteFileAtomicString(m3uPath, strings.Join(m3uLines, "\n")+"\n", 0o644); wErr != nil {
 		fmt.Fprintf(os.Stderr, "DLFAIL multidisc m3u-write rom=%d\n", rom.ID)
-		cleanupMultiDisc(discDir)
 		return false
 	}
 	writeProgress(100)
@@ -764,12 +864,20 @@ func lowerASCII(c byte) byte {
 	return c
 }
 
-// cleanupMultiDisc removes the per-game disc folder after a failed multi-disc
-// download, so a partial (unplayable) game never lingers as if it were complete. The
-// stub .m3u itself is left for the menu to re-tap; only our half-written discs go.
-func cleanupMultiDisc(discDir string) {
-	if discDir != "" {
-		_ = os.RemoveAll(discDir)
+// ensureDiscStub creates a 0-byte placeholder for a not-yet-fetched disc inside the
+// (manifest-owned) per-game folder, ADDITIVELY: anything already at the path — even a
+// stale partial — is left alone. The stub keeps the on-card disc set aligned with the
+// full .m3u so the hooks' incomplete-scan and --check-rom see one honest shape.
+// Best-effort: a failed create just means the disc reads "absent" instead of "stub" to
+// the same detectors. (Pre-lodor#7 a failed multi-disc download RemoveAll'd the whole
+// disc folder; under disc-1-first a partial set is a VALID state, so nothing is ever
+// bulk-deleted on failure anymore — per-disc resume keeps verified discs.)
+func ensureDiscStub(dest string) {
+	if _, err := os.Stat(dest); err == nil {
+		return
+	}
+	if f, err := os.Create(dest); err == nil {
+		_ = f.Close()
 	}
 }
 

@@ -12,6 +12,9 @@ package main
 // and name only the failing step or the (advisory) missing scopes — never a secret.
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -22,6 +25,28 @@ import (
 	"lodor/config"
 	"lodor/romm"
 )
+
+// isCertErr reports whether err is a certificate-VERIFICATION failure (self-signed,
+// unknown authority, wrong hostname, expired cert) as opposed to plain unreachability.
+// The distinction matters to the wizard (lodor#35): only a verification failure is
+// fixed by insecure_skip_verify, so only it should trigger the "trust this server"
+// offer. The romm client wraps transport errors with %w, so the tls/x509 originals
+// are reachable through the chain; the "x509:" string probe is a fallback for an
+// error that crossed a boundary that dropped the chain. Never matches nil, dial/DNS/
+// timeout failures, or a non-TLS server answering on an https port.
+func isCertErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cve *tls.CertificateVerificationError
+	var ua x509.UnknownAuthorityError
+	var hn x509.HostnameError
+	var ci x509.CertificateInvalidError
+	if errors.As(err, &cve) || errors.As(err, &ua) || errors.As(err, &hn) || errors.As(err, &ci) {
+		return true
+	}
+	return strings.Contains(err.Error(), "x509:")
+}
 
 // runSetServer persists the wizard's server URL (scheme+host), optional port, and
 // the HTTPS skip-verify toggle to config.json BEFORE pairing — the engine's --pair
@@ -112,6 +137,19 @@ func runPair(cfg *config.Config, code string) {
 		exch, err = romm.ExchangeToken(host, code)
 		if err == nil {
 			break
+		}
+		// lodor#35: a certificate-verification failure is deterministic — retrying
+		// cannot fix it, and the generic "network error" copy misleads (the server IS
+		// answering; its certificate just can't be verified — the normal state of a
+		// self-signed home server). Name it host-free on stderr and tag the RESULT
+		// line (an ADDITIVE token: grep-based launchers keyed on paired=1 / PAIRFAIL
+		// are unaffected) so wizards can offer the skip-verify trust path. Exit stays
+		// 3 (never-reached-RomM class — the code was NOT consumed, so the SAME code
+		// survives for the trust retry).
+		if isCertErr(err) {
+			fmt.Fprintln(os.Stderr, "PAIRFAIL exchange: server certificate could not be verified")
+			fmt.Println("RESULT paired=0 scopes_ok=0 reason=tls")
+			os.Exit(3)
 		}
 		// A network error scrubs to "network error" via safeErr; anything else is a
 		// server response (bad code, rate limit) that a retry cannot fix.

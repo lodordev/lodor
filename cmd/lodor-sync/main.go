@@ -71,6 +71,11 @@ func main() {
 		listSaves         string
 		restoreSave       string
 		downloadRom       string
+		fetchNextDisc     string
+		fetchDiscs        string
+		prefetchDiscs     bool
+		prefetchDry       bool
+		checkRom          string
 		reconcile         string
 		evict             string
 		uninstallMirror   bool
@@ -140,7 +145,12 @@ func main() {
 	flag.StringVar(&pullStateSlot, "state-slot", "", "override target slot for --pull-state (0-8 or auto)")
 	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated, then a LOCAL=<none|current|older|unpushed|deleted> trailer (single field — row parsers drop it; deleted = the local save was deliberately removed on this device after a sync and the server has nothing newer, so auto-pull hooks must not resurrect it); exit 3 when the server is unreachable (empty list + exit 0 always means zero saves)")
 	flag.StringVar(&restoreSave, "restore-save", "", "restore a specific server save by id for one ROM (save id is the positional arg); prints RESULT restored=<0|1>")
-	flag.StringVar(&downloadRom, "download", "", "download one ROM's real file (resolve, fetch, hash-verify); prints RESULT downloaded=<0|1>")
+	flag.StringVar(&downloadRom, "download", "", "download one ROM's real file (resolve, fetch, hash-verify); prints RESULT downloaded=<0|1>. MULTI-DISC (lodor#7 disc-1-first): fetches only the FIRST missing disc, writes the full .m3u, stubs the rest; the RESULT line gains additive discs_total=/discs_present=/discs_fetched= fields")
+	flag.StringVar(&fetchNextDisc, "fetch-next-disc", "", "MULTI-DISC (lodor#7): fetch this game's NEXT missing disc (m3u order) — the hooks' pre-launch re-trigger for a populated-but-incomplete .m3u; prints RESULT fetched=<N> complete=<0|1> discs_total=<T> discs_present=<P> [reason=<tok>]")
+	flag.StringVar(&fetchDiscs, "fetch-discs", "", "MULTI-DISC (lodor#7): fetch EVERY missing disc of this game (same per-disc verify/resume as --download); prints RESULT fetched=<N> complete=<0|1> discs_total=<T> discs_present=<P> [reason=<tok>]")
+	flag.BoolVar(&prefetchDiscs, "prefetch-discs", false, "MULTI-DISC (lodor#7) daemon leg: complete the disc set of EVERY downloaded (non-stub) .m3u game with missing discs (mirror-manifest walk); prints RESULT prefetch_roms=<N> discs_missing=<M> fetched=<F> failed=<K>; exit 4 = some game(s) failed")
+	flag.BoolVar(&prefetchDry, "dry", false, "with --prefetch-discs: OFFLINE census only — report the pending disc work without touching network or card (runs pre-config, any pairing state)")
+	flag.StringVar(&checkRom, "check-rom", "", "OFFLINE pre-launch completeness gate: is this ROM fully present on the card? (multi-disc: real .m3u + every referenced disc non-empty). Filesystem-only, no config/host/device; prints RESULT complete=<0|1> [discs_total=<N> discs_present=<M>] [reason=<tok>]")
 	flag.StringVar(&reconcile, "reconcile", "", "post-launch: flip ONE downloaded ROM's on-disk state marker (✘→✓) to match the bytes now present, carrying its save+cover with the rename; offline, no device; prints RESULT reconciled=<0|1>")
 	flag.StringVar(&evict, "evict", "", "delete ONE downloaded ROM's bytes from the card and re-create its 0-byte cloud stub (✓→✘), carrying its save+cover with the rename — saves are NEVER deleted; multi-disc .m3u deletes its disc files too; offline, no device; prints RESULT evicted=<0|1> [reason=…]")
 	flag.BoolVar(&uninstallMirror, "uninstall-mirror", false, "remove every MIRROR-OWNED artifact from the card (manifest walk: stubs, our covers/collections/folders; downloads KEPT unless --remove-downloads; saves NEVER touched; user files byte-identical); offline; prints RESULT uninstalled=<0|1> removed=<N> kept_downloads=<K> skipped=<S>")
@@ -210,6 +220,22 @@ func main() {
 	if checkBios != "" {
 		runCheckBios(nil, checkBios)
 		return // runCheckBios always exits; defensive
+	}
+
+	// --check-rom is the OFFLINE pre-launch completeness gate (lodor#7): a pure local
+	// file check with NO config.json, host, network, or device — same placement
+	// rationale as --check-bios (any cwd, any pairing state, hooks fail open).
+	if checkRom != "" {
+		runCheckRom(checkRom)
+		return // runCheckRom always exits; defensive
+	}
+
+	// --prefetch-discs --dry is an OFFLINE census (mirror-manifest walk + file stats,
+	// env-pathed) so a daemon can ask "is a cycle worth the radio?" before config/
+	// hosts/network exist. The REAL prefetch runs through the normal gates below.
+	if prefetchDiscs && prefetchDry {
+		runPrefetchDiscs(nil, nil, true)
+		return // always exits; defensive
 	}
 
 	// --session-start / --session-end are OFFLINE and must work in ANY pairing
@@ -339,6 +365,16 @@ func main() {
 		// ROM over a 30s api timeout was a real past failure. Rebuild the client.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
 		runDownloadRom(dlClient, cfg, downloadRom)
+	case fetchNextDisc != "":
+		// Disc transfers are (possibly huge) file transfers — the long download timeout.
+		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		runFetchDiscs(dlClient, cfg, fetchNextDisc, 1)
+	case fetchDiscs != "":
+		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		runFetchDiscs(dlClient, cfg, fetchDiscs, -1)
+	case prefetchDiscs:
+		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		runPrefetchDiscs(dlClient, cfg, false)
 	case downloadBios:
 		// BIOS fetches are file transfers too — give them the download timeout.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
@@ -414,7 +450,7 @@ func main() {
 		requireDevice(host)
 		runReportSession(client, host, cfg, reportSession, sessionStarted, sessionEnded)
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --push-all-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --report-session --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --fetch-next-disc --fetch-discs --prefetch-discs --check-rom --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --push-all-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --report-session --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
 		os.Exit(2)
 	}
 }

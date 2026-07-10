@@ -523,6 +523,92 @@ func pairFailure(rc int, out string) (msg string, retry step) {
 	return "Pairing failed. Generate a fresh code in RomM and try again.", stepCode
 }
 
+// ---- lodor#35: certificate trust (self-signed home servers) -----------------------------
+// A self-signed HTTPS RomM used to die at pairing with "couldn't reach your server" and
+// no UI escape (the only fix was hand-editing config.json). The engine now tags a failed
+// verification with reason=tls on the RESULT line; the wizard answers with a choice
+// screen, and trusting re-runs --set-server with --insecure — persisting the SAME
+// insecure_skip_verify config.json setting the NextUI shell wizard writes.
+
+// certFailure reports whether a failed --pair died on certificate verification: the
+// engine's machine token (reason=tls), never the human text. rc!=0 keeps a successful
+// run out of the class regardless of stray tokens.
+func certFailure(rc int, out string) bool {
+	return rc != 0 && ui.ResultToken(out, "reason") == "tls"
+}
+
+// Certificate-trust copy (rules: plain "certificate" language, the tradeoff stated
+// honestly in one line, no host-OS strings needed).
+const (
+	certTrustTitle  = "Couldn't verify the server"
+	certTrustBody   = "Couldn't verify the server's certificate. This is normal for self-signed home servers.\n\nSkipping the check means the connection is not verified - only do this for your own server."
+	certTrustOption = "Trust this server (skip certificate verification)"
+)
+
+// renderCertTrust draws the certificate-failure choice screen (pure: state -> canvas,
+// shared by the interactive loop and --capture).
+func (w *wizard) renderCertTrust(m *ui.Menu) *ui.Canvas {
+	c := ui.NewCanvas(W, H)
+	t := w.t
+	x, y, ww, hh := t.Frame(c, "Lodor Setup", "Up/Down: move   A: select   B: back")
+	c.DrawTextCentered(x, y+6, ww, certTrustTitle, t.Accent, t.TitleScale-1)
+	top := y + 6 + wizGlyphH*(t.TitleScale-1) + 16
+	bot := t.DrawTextWrappedAt(c, x, top, ww, certTrustBody, t.Text, t.BodyScale)
+	m.Draw(c, t, x, bot+16, ww, hh-(bot+16-y))
+	return c
+}
+
+// offerCertTrust runs the choice screen: true = the user chose to trust the server
+// (skip verification); false = go back (B or the "Go back" row).
+func (w *wizard) offerCertTrust(draw func(*ui.Canvas), btn func() ui.Button) bool {
+	m := &ui.Menu{Items: []string{certTrustOption, "Go back"}}
+	for {
+		draw(w.renderCertTrust(m))
+		b := btn()
+		if b == ui.BtnBack {
+			return false
+		}
+		if m.Handle(b) {
+			return m.Selected() == 0
+		}
+	}
+}
+
+// pairServer runs the --pair exchange for the code step and maps the outcome to the
+// next onboarding step (stepDevice on success; stepError with w.errMsg/w.retry set on
+// failure). lodor#35: a certificate-verification failure on an https server offers
+// the trust screen INSTEAD of the misleading unreachable copy; trusting re-runs
+// --set-server with --insecure (persisting insecure_skip_verify) and pairs once more
+// with the SAME code — a cert failure never reached RomM, so the code was not consumed.
+func (w *wizard) pairServer(server, code string, draw func(*ui.Canvas), btn func() ui.Button) step {
+	w.working(draw, "Pairing with your server...")
+	out, err := w.runEngine("--pair", code)
+	if certFailure(exitCode(err), out) && strings.HasPrefix(server, "https://") {
+		if !w.offerCertTrust(draw, btn) {
+			return stepServer // go back and fix the address instead
+		}
+		if sout, serr := w.runEngine("--set-server", server, "--insecure"); serr != nil || !resultFlag(sout, "server_set") {
+			w.errMsg = "Could not save the server address. Check it and try again."
+			w.retry = stepServer
+			return stepError
+		}
+		w.working(draw, "Pairing with your server...")
+		out, err = w.runEngine("--pair", code)
+	}
+	if err != nil || !resultFlag(out, "paired") {
+		// lodor#31: the engine exit code is authoritative — an unreachable server
+		// (rc=3) never blames the code, and B walks back to the server step.
+		w.errMsg, w.retry = pairFailure(exitCode(err), out)
+		return stepError
+	}
+	// lodor#38: paired, but the token lacks sync scopes — warn NOW (NextUI
+	// launch.sh parity) instead of letting saves fail confusingly later.
+	if !resultFlag(out, "scopes_ok") {
+		w.showMsg("Paired", "Paired - but the token is missing some sync permissions. Re-generate it in RomM with all scopes.", w.t.Bad, draw, btn)
+	}
+	return stepDevice
+}
+
 // pairFailLine extracts the engine's last PAIRFAIL reason line ("" when absent).
 func pairFailLine(out string) string {
 	why := ""
@@ -1399,20 +1485,9 @@ func (w *wizard) runOnboarding(draw func(*ui.Canvas), btn func() ui.Button) {
 			}
 			code = strings.TrimSpace(kb.Text)
 			w.code = code
-			out, err := w.runEngine("--pair", code)
-			if err != nil || !resultFlag(out, "paired") {
-				// lodor#31: the engine exit code is authoritative — an unreachable server
-				// (rc=3) never blames the code, and B walks back to the server step.
-				w.errMsg, w.retry = pairFailure(exitCode(err), out)
-				s = stepError
-				continue
-			}
-			// lodor#38: paired, but the token lacks sync scopes — warn NOW (NextUI
-			// launch.sh parity) instead of letting saves fail confusingly later.
-			if !resultFlag(out, "scopes_ok") {
-				w.showMsg("Paired", "Paired - but the token is missing some sync permissions. Re-generate it in RomM with all scopes.", w.t.Bad, draw, btn)
-			}
-			s = stepDevice
+			// lodor#31 failure mapping + the lodor#35 certificate-trust path live in
+			// pairServer (extracted so the off-hardware tests drive the real flow).
+			s = w.pairServer(server, code, draw, btn)
 
 		case stepDevice:
 			kb := &ui.Keyboard{Prompt: "Name this device:", Text: device}
@@ -2690,5 +2765,7 @@ func (w *wizard) capture(dir string) {
 	w.tsURL = "https://login.tailscale.com/a/1a2b3c4d5e6f"
 	w.tsPhase = "Open this link in a browser and approve this device. Waiting for sign-in... (B to cancel)"
 	_ = w.render(stepTsSignin, nil).SavePNG(filepath.Join(dir, "12-tailscale.png"))
+	// Certificate-trust offer (lodor#35) — the self-signed-server escape hatch.
+	_ = w.renderCertTrust(&ui.Menu{Items: []string{certTrustOption, "Go back"}}).SavePNG(filepath.Join(dir, "14-certtrust.png"))
 	fmt.Println("captured wizard screens to", dir)
 }
