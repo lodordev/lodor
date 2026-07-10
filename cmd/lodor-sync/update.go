@@ -85,7 +85,17 @@ func runFetchUpdate() {
 		fmt.Fprintf(os.Stderr, "fetch-update: channel %s has no asset %q\n", channel, assetKey)
 		os.Exit(3)
 	}
-	err := update.Stage(asset, update.StageDirName, ch.Version, fetchUpdateTimeout)
+	// Bridge the update package's HONEST staging progress onto the same /tmp
+	// side-channel the mirror/download-queue paths use, so the launcher renders
+	// a real bar for this ~MB-over-slow-radio transfer instead of a static
+	// "Downloading…". writePhase/writeProgress are best-effort (sidechannel.go).
+	prog := func(phase string, pct int) {
+		writePhase(phase)
+		if pct >= 0 {
+			writeProgress(pct)
+		}
+	}
+	err := update.Stage(asset, update.StageDirName, ch.Version, fetchUpdateTimeout, prog)
 	if err == update.ErrHashMismatch {
 		fmt.Fprintln(os.Stderr, "fetch-update: artifact hash mismatch — staging removed, nothing applied")
 		fmt.Printf("RESULT fetched=0 version=%s bytes=0\n", ch.Version)

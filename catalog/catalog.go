@@ -11,18 +11,40 @@
 package catalog
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"lodor/config"
 	"lodor/cover"
+	"lodor/covercancel"
 	"lodor/fsutil"
 	"lodor/platform"
 	"lodor/romm"
 )
+
+// coverRequestTimeout bounds a SINGLE cover download. On the slow Miyoo radio a healthy
+// small.png lands in ~1-2s; 15s is generous headroom for a slow-but-alive link while
+// still guaranteeing the bulk pass can't wedge for minutes on one stalled cover — and,
+// combined with the between-covers cancel check, keeps a B-press honest. This bounds
+// ONLY the cosmetic cover fetch; ROM/save/state transfers use their own long timeouts.
+const coverRequestTimeout = 15 * time.Second
+
+// fetchCoverCancellable fetches one cover with a per-cover timeout that is ALSO cut
+// short by the user's cancel sentinel (covercancel), so an in-flight download on a slow
+// radio aborts on B-press instead of waiting out the network. It is a thin wrapper over
+// cover.FetchAndSaveCtx used by both cover-fetch spots in MirrorCatalog.
+func fetchCoverCancellable(dl coverDownloaderCtx, coverPath, anchorPath string, force bool) (cover.Outcome, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), coverRequestTimeout)
+	defer cancel()
+	ctx, cancel2 := covercancel.WithSignal(ctx)
+	defer cancel2()
+	return cover.FetchAndSaveCtx(ctx, dl, coverPath, anchorPath, force)
+}
 
 // saveExts are extensions that mark a file as a SAVE rather than a game. Such files
 // must never be stubbed into Roms/ (BLUEPRINT §4 — ".state" included).
@@ -68,12 +90,20 @@ type romClient interface {
 	GetRoms(query romm.GetRomsQuery) (romm.PaginatedRoms, error)
 	GetCollections() ([]romm.Collection, error)
 	DownloadCover(coverPath string) ([]byte, error)
+	DownloadCoverCtx(ctx context.Context, coverPath string) ([]byte, error)
+}
+
+// coverDownloaderCtx is the cancellable cover-fetch capability the cover pass needs.
+// Every romClient satisfies it (romClient lists the same method); fetchCoverCancellable
+// takes this narrower interface so the loop passes `client` straight through.
+type coverDownloaderCtx interface {
+	DownloadCoverCtx(ctx context.Context, coverPath string) ([]byte, error)
 }
 
 // platformIndex holds the lookup tables for one platform.
 type platformIndex struct {
-	ByBasename map[string]int    `json:"by_basename"`
-	ByFsname   map[string]int    `json:"by_fsname"`
+	ByBasename map[string]int `json:"by_basename"`
+	ByFsname   map[string]int `json:"by_fsname"`
 	// ByID maps rom_id -> SDCARD-relative path for every stubbed/present ROM, so
 	// --mirror-collections can resolve collection members WITHOUT re-fetching the whole
 	// library (that per-platform refetch was the multi-minute "collections hang").
@@ -159,6 +189,18 @@ func IndexPath(cfg *config.Config) string {
 func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverForce bool) (created, existing, skipped, multifile, covers, adopted int, err error) {
 	idx := index{Version: 1, Platforms: map[string]platformIndex{}}
 	coversOn := cfg.CoversEnabled()
+
+	// Clear any stale cover-cancel sentinel BEFORE the cover pass so a leftover from a
+	// previous cancelled run can't instantly abort this one. Only meaningful when covers
+	// are on; harmless otherwise (best-effort remove of a /tmp file).
+	if coversOn {
+		covercancel.Clear()
+	}
+	// coversCancelled latches once the user cancels the cover fetch: the stub/index work
+	// (already complete for a game by the time we reach its cover) is untouched, but every
+	// SUBSEQUENT cover is skipped so the run ends promptly instead of grinding through the
+	// remaining library on a slow radio. Box art is cosmetic — a partial cover pass is fine.
+	coversCancelled := false
 
 	// Mirror-owned manifest (C2): every path this run CREATES is recorded so the
 	// destructive paths (prune/evict/download-fill/uninstall) can gate on real
@@ -340,12 +382,15 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 					adopted++
 					existing++
 					// Box art for their file: additive-only (force NEVER applies here —
-					// a --full refresh must not overwrite the user's own art; FetchAndSave
-					// without force skips any existing cover).
-					if coversOn {
-						if cp := rom.CoverPath(); cp != "" {
+					// a --full refresh must not overwrite the user's own art; the fetch
+					// without force skips any existing cover). Cancellable: skip once
+					// cancelled, and cut an in-flight fetch short on B-press.
+					if coversOn && !coversCancelled {
+						if covercancel.Requested() {
+							coversCancelled = true
+						} else if cp := rom.CoverPath(); cp != "" {
 							coverDone++
-							if out, _ := cover.FetchAndSave(client, cp, uf.abs, false); out == cover.OutcomeSaved {
+							if out, _ := fetchCoverCancellable(client, cp, uf.abs, false); out == cover.OutcomeSaved {
 								covers++
 								man.Record(cover.MediaPath(uf.abs), platform.ManifestCover, rom.ID)
 							}
@@ -408,13 +453,20 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 			// it. WHOLE-library (stubs included). Graceful + non-fatal: a coverless rom is
 			// skipped, an already-present cover is skipped, any fetch/decode error is counted
 			// but NEVER aborts the mirror; progress flows through the side-channels only.
-			if coversOn {
-				if cp := rom.CoverPath(); cp != "" {
+			if coversOn && !coversCancelled {
+				// Honor a cancel BETWEEN covers: check the sentinel before starting the
+				// next download so a B-press is respected within one cover, not one whole
+				// run. Stubs + index for every game are already written above, so cancelling
+				// the cosmetic cover pass leaves the library fully usable.
+				if covercancel.Requested() {
+					coversCancelled = true
+					rep.phase("Cancelling covers…")
+				} else if cp := rom.CoverPath(); cp != "" {
 					coverDone++
 					if coverTotal > 0 {
 						rep.phase(fmt.Sprintf("Fetching cover %d/%d…", coverDone, coverTotal))
 					}
-					if out, _ := cover.FetchAndSave(client, cp, finalPath, coverForce); out == cover.OutcomeSaved {
+					if out, _ := fetchCoverCancellable(client, cp, finalPath, coverForce); out == cover.OutcomeSaved {
 						covers++
 						// Manifest: our box art is removable at uninstall (kind=cover).
 						man.Record(cover.MediaPath(finalPath), platform.ManifestCover, rom.ID)
@@ -572,8 +624,8 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 		if name == "" {
 			continue
 		}
-		if werr := os.WriteFile(filepath.Join(colDir, name+".txt"),
-			[]byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
+		if werr := fsutil.WriteFileAtomicString(filepath.Join(colDir, name+".txt"),
+			strings.Join(lines, "\n")+"\n", 0o644); werr != nil {
 			return written, empty, total, 0, werr
 		}
 		kept[name+".txt"] = true

@@ -156,3 +156,40 @@ func TestDrainPendingStatesDropsWhenDark(t *testing.T) {
 		t.Fatalf("dark rom must drop from queue: %v", left)
 	}
 }
+
+// TestPushAllStatesOfflineEnqueues drives the bulk sweep exactly as
+// runPushAllStates does — sync.PushAllLocalStates with the offline-enqueue
+// callback — against a dead server, and asserts the eligible ROM (the one with
+// local state files) lands in pending-states.txt. Two ROMs are indexed; only
+// 9752 has a local state, so ONLY 9752 may be queued (the local pre-filter must
+// keep the stateless 9753 out of the network path entirely).
+func TestPushAllStatesOfflineEnqueues(t *testing.T) {
+	// dead server (port 9, discard) → every resolve fails → reason=offline.
+	client, cfg, romPath := pendingStatesEnv(t, "http://127.0.0.1:9")
+
+	// pendingStatesEnv writes an index with an empty by_id; the bulk sweep walks
+	// by_id, so overwrite it with two mapped ROMs on the gamegear platform.
+	idx := `{"version":1,"platforms":{"gamegear":{` +
+		`"by_basename":{"Woody Pop (USA, Europe, Brazil) (En)":9752,"Columns (USA, Europe)":9753},` +
+		`"by_fsname":{"Woody Pop (USA, Europe, Brazil) (En).gg":9752,"Columns (USA, Europe).gg":9753},` +
+		`"by_id":{` +
+		`"9752":"Roms/Sega Game Gear/Woody Pop (USA, Europe, Brazil) (En).gg",` +
+		`"9753":"Roms/Sega Game Gear/Columns (USA, Europe).gg"}}}}`
+	if err := os.WriteFile(filepath.Join(os.Getenv("LODOR_PAK_DIR"), "catalog-index.json"), []byte(idx), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mirror runPushAllStates' callback: enqueue every offline per-ROM push.
+	res := sync.PushAllLocalStates(client, cfg, func(rp string, pr sync.PushStatesResult) {
+		if pr.Reason == "offline" {
+			_, _ = enqueuePendingState(rp)
+		}
+	})
+	if res.Reason != "ok" || res.RomsWithStates != 1 || res.Queued != 1 {
+		t.Fatalf("offline bulk sweep: %+v", res)
+	}
+	queued := pendingReadFile(pendingStatesPath())
+	if len(queued) != 1 || queued[0] != romPath {
+		t.Fatalf("pending-states.txt = %v, want exactly [%s] (only the ROM with local states)", queued, romPath)
+	}
+}

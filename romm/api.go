@@ -1,6 +1,7 @@
 package romm
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
@@ -289,17 +290,42 @@ func (c *Client) DownloadFirmwareContent(fwID int, fileName string) ([]byte, err
 // space in the path itself. An empty coverPath is a programmer error (callers must
 // check rom.CoverPath() != "" first). The bytes are a PNG (image/png) from RomM /assets.
 func (c *Client) DownloadCover(coverPath string) ([]byte, error) {
+	p, err := normalizeCoverPath(coverPath)
+	if err != nil {
+		return nil, err
+	}
+	return c.doRaw("GET", p)
+}
+
+// DownloadCoverCtx is DownloadCover under a caller-supplied context so a slow cover
+// fetch can be cancelled (user B-press) or capped by a short per-cover deadline. Same
+// path normalization; the ONLY difference is the request runs under ctx and aborts the
+// instant ctx is cancelled instead of waiting out the client-wide Timeout. Cosmetic
+// box-art only — nothing here touches a game/save/state.
+func (c *Client) DownloadCoverCtx(ctx context.Context, coverPath string) ([]byte, error) {
+	p, err := normalizeCoverPath(coverPath)
+	if err != nil {
+		return nil, err
+	}
+	return c.doRawCtx(ctx, "GET", p)
+}
+
+// normalizeCoverPath validates a rom.CoverPath() and returns the server-relative asset
+// path to request: it STRIPS the "?ts=" cache-buster (its value carries a raw space
+// that would 400) and ensures a leading slash. Shared by the plain and ctx cover
+// fetchers so both apply the identical, tested normalization.
+func normalizeCoverPath(coverPath string) (string, error) {
 	if strings.TrimSpace(coverPath) == "" {
-		return nil, fmt.Errorf("empty cover path")
+		return "", fmt.Errorf("empty cover path")
 	}
 	if i := strings.IndexByte(coverPath, '?'); i >= 0 {
 		coverPath = coverPath[:i]
 	}
 	if coverPath == "" {
-		return nil, fmt.Errorf("empty cover path")
+		return "", fmt.Errorf("empty cover path")
 	}
 	if coverPath[0] != '/' {
 		coverPath = "/" + coverPath
 	}
-	return c.doRaw("GET", coverPath)
+	return coverPath, nil
 }

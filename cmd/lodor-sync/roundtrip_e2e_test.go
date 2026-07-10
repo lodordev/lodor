@@ -10,10 +10,10 @@ package main
 // RomM through the COMPLETE journey a device actually takes. This test does exactly
 // that, in sequence, asserting each hop — so a regression anywhere along
 // register → mirror → download → push → cross-device reconcile → conflict is caught
-// by `go test ./...`, not by Jonathan's card.
+// by `go test ./...`, not by a real device card.
 //
 // It is DETERMINISTIC and mock-based on purpose: live RomM is infra-blocked (network
-// sidecar) and is Jonathan's PRODUCTION library — never write to it. The mock mirrors
+// sidecar) and is a real PRODUCTION library — never write to it. The mock mirrors
 // the verified 4.9.x wire shape (heartbeat gate, device register, catalog listing,
 // hash-verified rom content, additive datetime-tagged save timeline with per-device
 // attribution, the 409 foreign-device interlock). The wire shape reuses the design of

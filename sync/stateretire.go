@@ -24,6 +24,8 @@ package sync
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"lodor/config"
 	"lodor/platform"
@@ -75,9 +77,39 @@ func RetireAutoStateAfterRestore(client *romm.Client, cfg *config.Config, romPat
 
 	// 3. Retire by rename — NEVER delete, and manual slots (.state1/.st0..8) are
 	// untouched because we only ever name the "auto" slot.
-	retired := auto + ".pre-sync"
+	//
+	// #24: version the retired name so a SECOND restore doesn't clobber the FIRST
+	// restore's retired snapshot. os.Rename(auto, auto+".pre-sync") atomically
+	// REPLACES an existing ".pre-sync" — the header promises retired snapshots are
+	// "never deleted", but the earlier one was being destroyed on every re-restore.
+	// The first retirement keeps the plain "<auto>.pre-sync" name (compat with any
+	// tooling that looks for it); later ones get a timestamp-versioned suffix.
+	retired := nonCollidingRetiredPath(auto)
 	if err := os.Rename(auto, retired); err != nil {
 		return false, "rename-failed"
 	}
 	return true, "retired"
+}
+
+// nonCollidingRetiredPath returns a retired auto-state path that never clobbers
+// an existing one (#24). The first retirement takes the plain "<auto>.pre-sync";
+// each later one takes "<auto>.pre-sync.<UTC-timestamp>" (nanosecond precision),
+// with a bounded numeric disambiguator if two restores land in the same instant,
+// so every prior retired snapshot survives.
+func nonCollidingRetiredPath(auto string) string {
+	base := auto + ".pre-sync"
+	if _, err := os.Stat(base); os.IsNotExist(err) {
+		return base
+	}
+	stamp := base + "." + time.Now().UTC().Format("20060102T150405.000000000")
+	if _, err := os.Stat(stamp); os.IsNotExist(err) {
+		return stamp
+	}
+	for i := 1; i < 10000; i++ {
+		cand := stamp + "." + strconv.Itoa(i)
+		if _, err := os.Stat(cand); os.IsNotExist(err) {
+			return cand
+		}
+	}
+	return stamp
 }

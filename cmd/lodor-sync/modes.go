@@ -75,6 +75,20 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 		fmt.Fprintf(os.Stderr, "DLFAIL getrom id=%d\n", id)
 		return false
 	}
+	// SECURITY (path-traversal belt): every server-supplied name this download will
+	// join under the card (platform_fs_slug, fs_name_no_ext, each file_name) MUST be a
+	// safe single path component. A malicious/compromised RomM returning
+	// file_name:"../../../../.system/<plat>/bin/lodor-sync" is rejected here before any
+	// path is computed — hash verify is no defence (the server supplies the hash). This
+	// centralises the check for the single-file, stub, archive AND multi-disc paths that
+	// all flow through this rom. The MultiDiscDir/discDest containment assertions below
+	// are the suspenders.
+	if !platform.ValidateRomNames(rom) {
+		fmt.Fprintf(os.Stderr, "DLFAIL unsafe-name rom=%d\n", rom.ID)
+		writePhase("This game's server filenames are invalid")
+		writeProgress(0)
+		return false
+	}
 	// Fill the stub IN PLACE at the exact path the launcher passed (and will launch).
 	// That path carries the leading state marker ("[^] Game.gba"); a NextUI pre-launch
 	// hook cannot redirect the post-hook launch and exFAT has no symlinks, so writing the
@@ -133,6 +147,17 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	}
 
 	writePhase(fmt.Sprintf("Downloading %s…", romName))
+
+	// SECURITY (containment suspenders): assert the final destination resolves inside
+	// Roms/ before creating/renaming any bytes. dest is the launcher-passed romPath; a
+	// poisoned directory_mapping or slug that survived the belt cannot land a write
+	// outside the ROM tree.
+	if !platform.PathWithinRoms(dest) {
+		fmt.Fprintf(os.Stderr, "DLFAIL escape-dest rom=%d\n", rom.ID)
+		writePhase("This game's destination path is invalid")
+		writeProgress(0)
+		return false
+	}
 
 	// Stream the content straight to the .tmp file (io.Copy via DownloadRomContentTo),
 	// NEVER buffering the whole ROM in RAM — a multi-hundred-MB CHD OOM-crashes the
@@ -260,6 +285,14 @@ func restoreStub(dest string) {
 // then extract the single inner ROM into dest (which is already named with the raw .nds
 // extension, via onDiskExt). Logs the real on-device extract time (EXTRACT line).
 func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm.Rom, dest, romName string, man *platform.Manifest) bool {
+	// SECURITY (containment suspenders): this path also writes real bytes to dest (via
+	// the .7z.dl temp + extract), so assert dest is inside Roms/ before any create.
+	if !platform.PathWithinRoms(dest) {
+		fmt.Fprintf(os.Stderr, "DLFAIL escape-dest rom=%d\n", rom.ID)
+		writePhase("This game's destination path is invalid")
+		writeProgress(0)
+		return false
+	}
 	writePhase(fmt.Sprintf("Downloading %s…", romName))
 	_ = os.MkdirAll(filepath.Dir(dest), 0o755)
 	arc := dest + ".7z.dl"
@@ -471,6 +504,16 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		fmt.Fprintf(os.Stderr, "DLFAIL multidisc dest-empty rom=%d\n", rom.ID)
 		return false
 	}
+	// SECURITY (containment suspenders): both the .m3u and the per-game disc folder must
+	// resolve inside Roms/. The per-component belt (ValidateRomNames, run in the caller)
+	// already vetted the slug + FsNameNoExt these are built from; this catches any
+	// poisoned directory_mapping folder that survived it.
+	if !platform.PathWithinRoms(m3uPath) || !platform.PathWithinRoms(discDir) {
+		fmt.Fprintf(os.Stderr, "DLFAIL multidisc escape-dest rom=%d\n", rom.ID)
+		writePhase("This game's destination path is invalid")
+		writeProgress(0)
+		return false
+	}
 
 	// V5 gate, m3u leg: the canonical m3uPath may differ from the launcher-passed
 	// (marked) romPath the caller already gated — e.g. an ADOPTED user .m3u in
@@ -530,9 +573,29 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 			writeProgress(0)
 			return false
 		}
+		// SECURITY (path-traversal belt, per-disc): each disc's server file_name must be a
+		// safe single component before it is joined into discDir. ValidateRomNames in the
+		// caller already vetted the whole rom, but re-check the exact value used here so the
+		// join can never absorb "../" or a separator.
+		if !platform.SafeName(f.FileName) {
+			fmt.Fprintf(os.Stderr, "DLFAIL multidisc unsafe-name rom=%d disc=%d\n", rom.ID, i+1)
+			writePhase("A disc's server filename is invalid")
+			cleanupMultiDisc(discDir)
+			writeProgress(0)
+			return false
+		}
 		writePhase(fmt.Sprintf("Downloading %s — disc %d/%d…", romName, i+1, total))
 
 		discDest := filepath.Join(discDir, f.FileName)
+		// SECURITY (containment suspenders, per-disc): assert the joined disc destination
+		// stays inside Roms/ before any create/rename.
+		if !platform.PathWithinRoms(discDest) {
+			fmt.Fprintf(os.Stderr, "DLFAIL multidisc escape-dest rom=%d disc=%d\n", rom.ID, i+1)
+			writePhase("A disc's destination path is invalid")
+			cleanupMultiDisc(discDir)
+			writeProgress(0)
+			return false
+		}
 		// Already present and hash-clean from a prior partial run? Skip the transfer but
 		// still list it (idempotent resume — never re-pull a verified disc).
 		if existsNonEmpty(discDest) && verifyFileHash(discDest, f.Sha1Hash, f.Md5Hash) == nil {

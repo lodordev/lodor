@@ -27,13 +27,30 @@ const StageDirName = ".update"
 // unreachable host (exit 3).
 var ErrHashMismatch = fmt.Errorf("update: downloaded artifact does not match expected sha256")
 
+// Progress reports HONEST staging progress to the caller so the launcher can
+// draw a real bar (never a fabricated one). phase is a short human label
+// ("Downloading update…", "Verifying…", "Extracting…"); pct is 0..100, or -1
+// when the byte total is unknown so no bar can be drawn truthfully. It is
+// best-effort UI only: a Progress callback never changes Stage's error or the
+// mode's exit code. A nil callback disables reporting (every test call site).
+type Progress func(phase string, pct int)
+
+func (p Progress) report(phase string, pct int) {
+	if p != nil {
+		p(phase, pct)
+	}
+}
+
 // Stage downloads an update asset, verifies its sha256, extracts it into
 // <dir>/tree, and writes the READY marker — in that order, so READY implies a
 // complete verified tree. ANY failure removes the whole staging dir: rollback
 // is "the update never started", and the running binary is never touched here
 // (the shell applier owns the swap; a running binary can't replace itself on
 // FAT32 anyway).
-func Stage(asset Asset, dir, version string, timeout time.Duration) error {
+//
+// progress (may be nil) is fed REAL byte-level download percent + the current
+// phase so a launcher can render an honest progress screen — see Progress.
+func Stage(asset Asset, dir, version string, timeout time.Duration, progress Progress) error {
 	fail := func(err error) error {
 		_ = os.RemoveAll(dir)
 		return err
@@ -46,12 +63,16 @@ func Stage(asset Asset, dir, version string, timeout time.Duration) error {
 		return err
 	}
 	zipPath := filepath.Join(dir, "download.zip")
-	if err := download(asset, zipPath, timeout); err != nil {
+	if err := download(asset, zipPath, timeout, progress); err != nil {
 		if err == ErrHashMismatch {
 			return fail(err)
 		}
 		return fail(fmt.Errorf("update download: %w", err))
 	}
+	// The bytes are down + sha256-verified in download(); extraction is a local,
+	// fast step. Report it as a distinct phase so a stalled unzip is never
+	// mistaken for a stalled download.
+	progress.report("Verifying update…", 100)
 	treeDir := filepath.Join(dir, "tree")
 	if err := extractZip(zipPath, treeDir); err != nil {
 		return fail(fmt.Errorf("update extract: %w", err))
@@ -64,10 +85,43 @@ func Stage(asset Asset, dir, version string, timeout time.Duration) error {
 	return nil
 }
 
+// countingWriter tallies bytes as they stream and emits a REAL percent to a
+// Progress callback, throttled to whole-percent changes so a slow radio doesn't
+// thrash the side-channel file. total<=0 means the size is unknown, so it
+// reports pct=-1 (the launcher shows the phase label, no bar) — never a guess.
+type countingWriter struct {
+	total    int64
+	written  int64
+	lastPct  int
+	progress Progress
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	w.written += int64(n)
+	if w.progress == nil {
+		return n, nil
+	}
+	if w.total <= 0 {
+		w.progress.report("Downloading update…", -1)
+		return n, nil
+	}
+	pct := int(w.written * 100 / w.total)
+	if pct > 100 {
+		pct = 100
+	}
+	if pct != w.lastPct {
+		w.lastPct = pct
+		w.progress.report("Downloading update…", pct)
+	}
+	return n, nil
+}
+
 // download streams the asset to path while hashing, then verifies both the
 // sha256 and (when the manifest carries one) the byte size. Content-Length is
-// also enforced mid-stream so a truncated body can never verify.
-func download(asset Asset, path string, timeout time.Duration) error {
+// also enforced mid-stream so a truncated body can never verify. progress (may
+// be nil) receives the live byte percent as the body streams.
+func download(asset Asset, path string, timeout time.Duration, progress Progress) error {
 	client := &http.Client{Timeout: timeout}
 	req, err := http.NewRequest(http.MethodGet, asset.URL, nil)
 	if err != nil {
@@ -86,8 +140,17 @@ func download(asset Asset, path string, timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
+	// Prefer the manifest's Size for the denominator (it's what the hash covers);
+	// fall back to Content-Length. Emit an initial 0% so the bar appears at the
+	// instant the transfer starts, not only after the first chunk lands.
+	total := asset.Size
+	if total <= 0 {
+		total = resp.ContentLength
+	}
+	progress.report("Downloading update…", 0)
+	cw := &countingWriter{total: total, progress: progress}
 	h := sha256.New()
-	n, cErr := io.Copy(io.MultiWriter(f, h), resp.Body)
+	n, cErr := io.Copy(io.MultiWriter(f, h, cw), resp.Body)
 	if sErr := f.Sync(); cErr == nil {
 		cErr = sErr
 	}

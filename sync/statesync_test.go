@@ -626,3 +626,181 @@ func TestRetireAutoStateFailSafeAndGates(t *testing.T) {
 		t.Fatal("manual slot touched when there was no auto-state")
 	}
 }
+
+// ── Bulk push (PushAllLocalStates) ───────────────────────────────────────
+
+// bulkServer serves two ROMs on ONE platform (gamegear) and records uploads
+// with their rom_id, so the bulk test can prove which ROM(s) actually pushed.
+// A /api/roms/<id> route is provided for both; only the ROM with local state
+// files should ever be resolved (network) — the other is filtered out locally.
+func bulkServer(t *testing.T, uploads *[]string, resolved *[]int) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"SYSTEM": map[string]string{"VERSION": "4.9.2"}})
+	})
+	rom := func(id int, fs string) {
+		mux.HandleFunc(fmt.Sprintf("/api/roms/%d", id), func(w http.ResponseWriter, r *http.Request) {
+			*resolved = append(*resolved, id)
+			stem := strings.TrimSuffix(fs, filepath.Ext(fs))
+			_ = json.NewEncoder(w).Encode(romm.Rom{ID: id, PlatformFsSlug: "gamegear",
+				FsName: fs, FsNameNoExt: stem, Files: []romm.RomFile{{FileName: fs}}})
+		})
+	}
+	rom(9752, "Woody Pop (USA, Europe, Brazil) (En).gg")
+	rom(9753, "Columns (USA, Europe).gg")
+	id := 500
+	mux.HandleFunc("/api/states", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			_ = json.NewEncoder(w).Encode([]romm.State{})
+			return
+		}
+		_ = r.ParseMultipartForm(1 << 20)
+		_, hdr, err := r.FormFile("stateFile")
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+		id++
+		*uploads = append(*uploads, fmt.Sprintf("%s|%s", r.URL.Query().Get("rom_id"), hdr.Filename))
+		_ = json.NewEncoder(w).Encode(romm.State{ID: id, RomID: 9752, FileName: hdr.Filename})
+	})
+	return httptest.NewServer(mux)
+}
+
+// writeBulkIndex overwrites the catalog index with a by_id map so the bulk sweep
+// (which walks LoadIndexBySlug) has ROMs to iterate. Two gamegear ROMs.
+func writeBulkIndex(t *testing.T) {
+	t.Helper()
+	idx := `{"version":1,"platforms":{"gamegear":{` +
+		`"by_basename":{"Woody Pop (USA, Europe, Brazil) (En)":9752,"Columns (USA, Europe)":9753},` +
+		`"by_fsname":{"Woody Pop (USA, Europe, Brazil) (En).gg":9752,"Columns (USA, Europe).gg":9753},` +
+		`"by_id":{` +
+		`"9752":"Roms/Sega Game Gear/Woody Pop (USA, Europe, Brazil) (En).gg",` +
+		`"9753":"Roms/Sega Game Gear/Columns (USA, Europe).gg"}}}}`
+	if err := os.WriteFile(filepath.Join(os.Getenv("LODOR_PAK_DIR"), "catalog-index.json"), []byte(idx), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPushAllLocalStates(t *testing.T) {
+	var ups []string
+	var resolved []int
+	srv := bulkServer(t, &ups, &resolved)
+	defer srv.Close()
+	client, cfg, _, stateRoot := statesyncEnv(t, srv.URL)
+	writeManifest(t, `{"gamegear":{"core":"picodrive","version":"abc123","dir":"GG-picodrive"}}`)
+	writeBulkIndex(t)
+
+	// Only ROM 9752 gets a local state file; 9753 has NONE. The local pre-filter
+	// must skip 9753 entirely — no resolve, no upload — while 9752 pushes.
+	dir := filepath.Join(stateRoot, "GG-picodrive")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	slot0 := "Woody Pop (USA, Europe, Brazil) (En).gg.st0"
+	if platform.StatesUseRANaming() {
+		slot0 = "Woody Pop (USA, Europe, Brazil) (En).state"
+	}
+	if err := os.WriteFile(filepath.Join(dir, slot0), []byte("RAW-PAYLOAD-0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var reported []string
+	res := PushAllLocalStates(client, cfg, func(romPath string, pr PushStatesResult) {
+		reported = append(reported, filepath.Base(romPath))
+	})
+	if res.Reason != "ok" || res.Pushed != 1 || res.Failed != 0 {
+		t.Fatalf("bulk push: %+v (uploads %v)", res, ups)
+	}
+	if res.RomsWithStates != 1 {
+		t.Fatalf("RomsWithStates = %d, want 1 (only 9752 has local states): %+v", res.RomsWithStates, res)
+	}
+	// LOCAL-FIRST proof: the stateless ROM (9753) was NEVER resolved over the
+	// network, and only 9752 ever uploaded.
+	for _, id := range resolved {
+		if id == 9753 {
+			t.Fatalf("stateless ROM 9753 was resolved over the network — pre-filter not local: resolved=%v", resolved)
+		}
+	}
+	if len(ups) != 1 || !strings.HasPrefix(ups[0], "9752|") {
+		t.Fatalf("want exactly one upload for 9752, got %v", ups)
+	}
+	if len(reported) != 1 || reported[0] != "Woody Pop (USA, Europe, Brazil) (En).gg" {
+		t.Fatalf("report callback fired for the wrong roms: %v", reported)
+	}
+
+	// Dark-launch: no manifest → honest no-op, nothing uploaded.
+	_ = os.Remove(filepath.Join(os.Getenv("LODOR_PAK_DIR"), "statecores.json"))
+	if r := PushAllLocalStates(client, cfg, nil); r.Reason != "no-manifest" || r.RomsWithStates != 0 {
+		t.Fatalf("no-manifest bulk must no-op: %+v", r)
+	}
+}
+
+// authExpiredServer resolves the ROM (heartbeat + /api/roms/9752) so a push/list
+// reaches the state endpoint, then rejects EVERY /api/states call with a bare
+// 401 — the token-expired / re-pair condition. This is BUG 4: such a 401 was
+// swallowed as a per-file "failed" (push) or "offline" (list), the mode exited 0
+// with no PAIRING_EXPIRED, and the user was never told to re-pair.
+func authExpiredServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"SYSTEM": map[string]string{"VERSION": "4.9.2"}})
+	})
+	mux.HandleFunc("/api/roms/9752", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(romm.Rom{ID: 9752, PlatformFsSlug: "gamegear",
+			FsName: "Woody Pop (USA, Europe, Brazil) (En).gg", FsNameNoExt: "Woody Pop (USA, Europe, Brazil) (En)",
+			Files: []romm.RomFile{{FileName: "Woody Pop (USA, Europe, Brazil) (En).gg"}}})
+	})
+	mux.HandleFunc("/api/states", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestPushStatesSurfacesAuthExpired locks BUG 4: a 401 on the state upload sets
+// PushStatesResult.AuthExpired (so the cmd wrapper emits PAIRING_EXPIRED), it is
+// NOT swallowed as a silent per-file failure.
+func TestPushStatesSurfacesAuthExpired(t *testing.T) {
+	srv := authExpiredServer(t)
+	defer srv.Close()
+	client, cfg, romPath, stateRoot := statesyncEnv(t, srv.URL)
+	writeManifest(t, `{"gamegear":{"core":"picodrive","version":"abc123","dir":"GG-picodrive"}}`)
+
+	dir := filepath.Join(stateRoot, "GG-picodrive")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	romBase := "Woody Pop (USA, Europe, Brazil) (En).gg"
+	stem := strings.TrimSuffix(romBase, filepath.Ext(romBase))
+	slot0 := romBase + ".st0"
+	if platform.StatesUseRANaming() {
+		slot0 = stem + ".state"
+	}
+	if err := os.WriteFile(filepath.Join(dir, slot0), []byte("RAW-PAYLOAD-0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := PushStates(client, cfg, romPath)
+	if !res.AuthExpired {
+		t.Fatalf("401 upload did not surface AuthExpired (BUG 4 fake-success): %+v", res)
+	}
+	if res.Pushed != 0 {
+		t.Fatalf("nothing should have landed on a 401: %+v", res)
+	}
+}
+
+// TestListStatesSurfacesAuthExpired locks BUG 4 on the list path: a 401 on the
+// GET /api/states must set ListStatesResult.AuthExpired, not read as "offline".
+func TestListStatesSurfacesAuthExpired(t *testing.T) {
+	srv := authExpiredServer(t)
+	defer srv.Close()
+	client, cfg, romPath, _ := statesyncEnv(t, srv.URL)
+	writeManifest(t, `{"gamegear":{"core":"picodrive","version":"abc123","dir":"GG-picodrive"}}`)
+
+	res := ListStates(client, cfg, romPath)
+	if !res.AuthExpired {
+		t.Fatalf("401 list did not surface AuthExpired (BUG 4): %+v", res)
+	}
+}

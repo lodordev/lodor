@@ -77,6 +77,48 @@ func hostTransport(host config.Host) *http.Transport {
 	return tr
 }
 
+// secretHeaders are the request headers that MUST NOT follow a redirect off the
+// origin host: the RomM bearer and the Cloudflare Access service-token pair. Go's
+// default redirect handling REPLAYS all headers set on the original request to the
+// redirect target, so a malicious/compromised RomM (or a MITM when TLS verification is
+// skipped) that answers a request with a 3xx to an attacker Location would otherwise
+// leak these credentials to the attacker's host.
+var secretHeaders = []string{"Authorization", "CF-Access-Client-Id", "CF-Access-Client-Secret"}
+
+// secureCheckRedirect returns a net/http CheckRedirect policy that keeps credentials
+// on the origin only. It REFUSES a redirect that leaves the origin host or downgrades
+// the scheme (https -> http), and caps the redirect chain at 10. Defensively it also
+// strips the secret headers on any hop it does allow whose host differs from the
+// origin (belt-and-suspenders — a refused hop never reaches this, but a future policy
+// relaxation would still not leak). origHost/origScheme are taken from the request
+// that STARTED the chain (via[0]) so every hop is compared to the true origin, not the
+// immediately preceding (possibly attacker-chosen) URL.
+func secureCheckRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	orig := via[0].URL
+	// Cross-host or scheme-downgrade: refuse outright so no credential-bearing request
+	// is ever dispatched to the new location.
+	if !strings.EqualFold(req.URL.Host, orig.Host) {
+		return fmt.Errorf("refusing cross-host redirect to %q", req.URL.Host)
+	}
+	if orig.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing scheme-downgrade redirect to %q", req.URL.Scheme)
+	}
+	// Same host + scheme not weakened: allowed (a RomM behind a path change). Still, if
+	// the host somehow differs by anything but case, strip secrets defensively.
+	if req.URL.Host != orig.Host {
+		for _, h := range secretHeaders {
+			req.Header.Del(h)
+		}
+	}
+	return nil
+}
+
 // dnsServerEnv names a DNS server ("ip" or "ip:port", port defaults to 53) that
 // hostname lookups must use, overriding the system resolver. Exists for the
 // Android lane: an exec'd pure-Go binary there has no /etc/resolv.conf, so Go's
@@ -114,7 +156,7 @@ func dnsDialContext(server string) func(ctx context.Context, network, addr strin
 // host.CFAccess (tier-2 public endpoint) installs the CF-Access service-token pair
 // so every request to this host carries the CF-Access-Client-* headers.
 func NewClient(host config.Host, timeout time.Duration) *Client {
-	hc := &http.Client{Timeout: timeout}
+	hc := &http.Client{Timeout: timeout, CheckRedirect: secureCheckRedirect}
 	if tr := hostTransport(host); tr != nil {
 		hc.Transport = tr
 	}
@@ -161,7 +203,10 @@ func (c *Client) authorize(req *http.Request) {
 // so the engine falls back to the public tier. No auth or CF headers are sent (it must
 // stay cheap and side-effect-free); the body is closed and discarded.
 func ProbeReachableHost(host config.Host, timeout time.Duration) bool {
-	hc := &http.Client{Timeout: timeout}
+	// Same redirect posture as a real client even though this probe sends no auth/CF
+	// headers: a cross-host/scheme-downgrade 3xx must not be silently followed (it would
+	// mis-report an attacker-controlled host as "the RomM endpoint is reachable").
+	hc := &http.Client{Timeout: timeout, CheckRedirect: secureCheckRedirect}
 	if tr := hostTransport(host); tr != nil {
 		hc.Transport = tr
 	}
@@ -231,14 +276,26 @@ func (c *Client) doJSON(method, path string, body, out any) error {
 
 // doRaw performs an authenticated GET and returns the full response body. The path
 // is run through url.URL so spaces (e.g. in fs_name) are %20-escaped on the wire
-// while other already-encoded sequences are preserved.
+// while other already-encoded sequences are preserved. It is doRawCtx with a
+// background context — the httpClient.Timeout still bounds it exactly as before, so
+// every existing caller's behaviour is byte-for-byte unchanged.
 func (c *Client) doRaw(method, path string) ([]byte, error) {
+	return c.doRawCtx(context.Background(), method, path)
+}
+
+// doRawCtx is doRaw wired to a caller-supplied context so an in-flight request can be
+// CANCELLED (or bounded by a shorter deadline than the client-wide Timeout) from the
+// outside. Used by the cover fetch: a per-cover timeout + the user's B-press cancel are
+// carried in ctx, so a slow-radio cover download aborts the moment cancel fires instead
+// of waiting out the network. On ctx cancellation httpClient.Do returns a context error,
+// which propagates here as the request error — no bytes, no partial write.
+func (c *Client) doRawCtx(ctx context.Context, method, path string) ([]byte, error) {
 	full, err := buildURL(c.baseURL, path)
 	if err != nil {
 		return nil, fmt.Errorf("build url: %w", err)
 	}
 
-	req, err := http.NewRequest(method, full, nil)
+	req, err := http.NewRequestWithContext(ctx, method, full, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

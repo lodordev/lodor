@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,9 +25,12 @@ type continueFake struct {
 func (f *continueFake) GetRoms(q romm.GetRomsQuery) (romm.PaginatedRoms, error) {
 	return romm.PaginatedRoms{}, nil
 }
-func (f *continueFake) GetCollections() ([]romm.Collection, error)  { return f.cols, nil }
-func (f *continueFake) DownloadCover(p string) ([]byte, error)      { return nil, os.ErrNotExist }
-func (f *continueFake) GetPlatforms() ([]romm.Platform, error)      { return f.platforms, nil }
+func (f *continueFake) GetCollections() ([]romm.Collection, error) { return f.cols, nil }
+func (f *continueFake) DownloadCover(p string) ([]byte, error)     { return nil, os.ErrNotExist }
+func (f *continueFake) DownloadCoverCtx(_ context.Context, p string) ([]byte, error) {
+	return nil, os.ErrNotExist
+}
+func (f *continueFake) GetPlatforms() ([]romm.Platform, error) { return f.platforms, nil }
 func (f *continueFake) GetSaves(q romm.SaveQuery) ([]romm.Save, error) {
 	return f.saves[q.PlatformID], nil
 }

@@ -55,7 +55,7 @@ func TestStageHappyPath(t *testing.T) {
 	srv := serveBytes(t, zipBytes)
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)), SHA256: sum(zipBytes)}
-	if err := Stage(asset, dir, "0.9.9", time.Minute); err != nil {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err != nil {
 		t.Fatalf("Stage: %v", err)
 	}
 	for _, p := range []string{
@@ -76,12 +76,63 @@ func TestStageHappyPath(t *testing.T) {
 	}
 }
 
+// TestStageReportsRealProgress proves the Progress callback fires with honest,
+// monotonic byte percentages during download (ending at 100) and reaches a
+// verify phase — never a fabricated bar. This is the data the launcher renders.
+func TestStageReportsRealProgress(t *testing.T) {
+	zipBytes := mkZip(t, map[string]string{"lodor-sync": "fake-binary-payload"})
+	srv := serveBytes(t, zipBytes)
+	dir := filepath.Join(t.TempDir(), StageDirName)
+	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)), SHA256: sum(zipBytes)}
+
+	var phases []string
+	var pcts []int
+	prog := func(phase string, pct int) {
+		phases = append(phases, phase)
+		pcts = append(pcts, pct)
+	}
+	if err := Stage(asset, dir, "0.9.9", time.Minute, prog); err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if len(pcts) == 0 {
+		t.Fatal("Progress callback never fired")
+	}
+	last := -1
+	sawDownload, sawVerify, saw100 := false, false, false
+	for i, ph := range phases {
+		if ph == "Downloading update…" {
+			sawDownload = true
+			if pcts[i] >= 0 {
+				if pcts[i] < last {
+					t.Errorf("download percent went backwards: %d after %d", pcts[i], last)
+				}
+				last = pcts[i]
+				if pcts[i] == 100 {
+					saw100 = true
+				}
+			}
+		}
+		if ph == "Verifying update…" {
+			sawVerify = true
+		}
+	}
+	if !sawDownload {
+		t.Error("no Downloading phase reported")
+	}
+	if !saw100 {
+		t.Error("download progress never reached 100%")
+	}
+	if !sawVerify {
+		t.Error("verify phase never reported")
+	}
+}
+
 func TestStageHashMismatchRemovesStaging(t *testing.T) {
 	zipBytes := mkZip(t, map[string]string{"lodor-sync": "fake"})
 	srv := serveBytes(t, zipBytes)
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)), SHA256: sum([]byte("something else"))}
-	if err := Stage(asset, dir, "0.9.9", time.Minute); err != ErrHashMismatch {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err != ErrHashMismatch {
 		t.Fatalf("Stage = %v, want ErrHashMismatch", err)
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
@@ -94,7 +145,7 @@ func TestStageSizeMismatchIsHashMismatch(t *testing.T) {
 	srv := serveBytes(t, zipBytes)
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)) + 5, SHA256: sum(zipBytes)}
-	if err := Stage(asset, dir, "0.9.9", time.Minute); err != ErrHashMismatch {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err != ErrHashMismatch {
 		t.Fatalf("Stage = %v, want ErrHashMismatch on size mismatch", err)
 	}
 }
@@ -115,7 +166,7 @@ func TestStageZipSlipRejected(t *testing.T) {
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "inner", StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)), SHA256: sum(zipBytes)}
-	if err := Stage(asset, dir, "0.9.9", time.Minute); err == nil {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err == nil {
 		t.Fatal("Stage accepted a zip-slip archive")
 	}
 	if _, err := os.Stat(filepath.Join(parent, "inner", "evil.sh")); !os.IsNotExist(err) {
@@ -129,7 +180,7 @@ func TestStageZipSlipRejected(t *testing.T) {
 func TestStageUnreachableHost(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: "http://127.0.0.1:1/nope.zip", Size: 1, SHA256: "00"}
-	if err := Stage(asset, dir, "0.9.9", 2*time.Second); err == nil {
+	if err := Stage(asset, dir, "0.9.9", 2*time.Second, nil); err == nil {
 		t.Fatal("Stage succeeded against a dead host")
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {

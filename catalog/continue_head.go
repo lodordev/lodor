@@ -37,6 +37,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"lodor/fsutil"
 )
 
 // continueRootDirName is the on-card Roms/ folder of the one-press Continue root
@@ -132,7 +134,7 @@ func WriteContinueHead(lines []string) bool {
 		b.WriteString(DisplayNameFor(rel))
 		b.WriteString("\n")
 	}
-	return writeFileAtomicSync(filepath.Join(dir, "continue-head.txt"), b.String())
+	return fsutil.WriteFileAtomicString(filepath.Join(dir, "continue-head.txt"), b.String(), 0o644) == nil
 }
 
 // UpdateContinueRootLabel rewrites the LODORCT alias line in Roms/map.txt to
@@ -172,29 +174,6 @@ func UpdateContinueRootLabel(display string) bool {
 	if cur, err := os.ReadFile(mapPath); err == nil && string(cur) == content {
 		return false // already exact — don't churn the card
 	}
-	return writeFileAtomicSync(mapPath, content)
+	return fsutil.WriteFileAtomicString(mapPath, content, 0o644) == nil
 }
 
-// writeFileAtomicSync is the FAT32-safe write: temp file, fsync, rename.
-func writeFileAtomicSync(path, content string) bool {
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return false
-	}
-	if _, err = f.WriteString(content); err == nil {
-		err = f.Sync()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	return true
-}

@@ -8,6 +8,7 @@ package catalog
 // individual mechanisms with focused assertions.
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,7 +34,10 @@ func (f *mergeFake) GetRoms(q romm.GetRomsQuery) (romm.PaginatedRoms, error) {
 }
 func (f *mergeFake) GetCollections() ([]romm.Collection, error) { return nil, nil }
 func (f *mergeFake) DownloadCover(p string) ([]byte, error)     { return nil, os.ErrNotExist }
-func (f *mergeFake) GetPlatforms() ([]romm.Platform, error)     { return f.platforms, nil }
+func (f *mergeFake) DownloadCoverCtx(_ context.Context, p string) ([]byte, error) {
+	return nil, os.ErrNotExist
+}
+func (f *mergeFake) GetPlatforms() ([]romm.Platform, error) { return f.platforms, nil }
 
 func mergeTestEnv(t *testing.T) string {
 	t.Helper()

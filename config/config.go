@@ -238,7 +238,7 @@ type Config struct {
 	// StateRetain caps how many of THIS device's own save-state uploads survive
 	// per (rom, slot) after a landed push (Handoff retention, design 6.4).
 	// 0/absent = the default; user-owned via settings.conf state_retain
-	// (Jonathan 2026-07-07: retention depth is the user's knob).
+	// (decided 2026-07-07: retention depth is the user's knob).
 	StateRetain int `json:"state_retain,omitempty"`
 
 	// RAUsername / RAToken are the RetroAchievements credential spine (task #46):

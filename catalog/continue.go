@@ -209,6 +209,32 @@ func LoadIndexIDPath(cfg *config.Config) map[int]string {
 	return idPath
 }
 
+// LoadIndexBySlug loads the catalog index PRESERVING the platform key:
+// fs_slug -> (rom_id -> SDCARD-relative-path). Same local, near-instant read as
+// LoadIndexIDPath (no network, one small file), but it keeps the top-level
+// platform grouping the on-disk index already carries. Callers that must know a
+// ROM's platform WITHOUT resolving it against RomM (e.g. bulk state push, which
+// keys statecores.json on the platform fs_slug) use this so the platform is a
+// pure local lookup. An absent/unreadable index returns an empty map.
+func LoadIndexBySlug(cfg *config.Config) map[string]map[int]string {
+	out := map[string]map[int]string{}
+	idx, lerr := loadIndex(IndexPath(cfg))
+	if lerr != nil {
+		return out
+	}
+	for slug, pidx := range idx.Platforms {
+		if len(pidx.ByID) == 0 {
+			continue
+		}
+		m := make(map[int]string, len(pidx.ByID))
+		for id, rel := range pidx.ByID {
+			m[id] = rel
+		}
+		out[slug] = m
+	}
+	return out
+}
+
 // writeContinueFile writes Collections/"0) Continue.txt" from lines (temp +
 // atomic rename — feedback: non-atomic card writes have zeroed files before).
 // lines empty => nothing is written and any existing file is LEFT ALONE (a
@@ -386,23 +412,10 @@ func MergeRecents(lines []string) (merged, total int) {
 		out = out[:nextuiMaxRecents]
 	}
 
-	tmp := rp + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return 0, 0
-	}
-	if _, err = f.WriteString(strings.Join(out, "\n") + "\n"); err == nil {
-		err = f.Sync() // FAT32: fsync before rename or a yank can zero the file
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		return 0, 0
-	}
-	if err := os.Rename(tmp, rp); err != nil {
-		_ = os.Remove(tmp)
+	// Atomic FAT32-safe replace: temp+fsync+rename+parent-dir fsync (fsutil).
+	// A hand-rolled temp+rename here previously skipped the parent-dir fsync, so
+	// the rename itself could be lost on a power-yank.
+	if err := fsutil.WriteFileAtomicString(rp, strings.Join(out, "\n")+"\n", 0o644); err != nil {
 		return 0, 0
 	}
 	return merged, len(out)

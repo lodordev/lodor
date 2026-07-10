@@ -1,6 +1,6 @@
 package main
 
-// launchcard.go — the Handoff launch gate (task #24, Jonathan 2026-07-07:
+// launchcard.go — the Handoff launch gate (task #24, decided 2026-07-07:
 // "the game manager is a crutch — make the launch hook interactive").
 //
 // Called by a lane's pre-launch hook, reachability-gated. Probes FIRST with
