@@ -33,6 +33,39 @@ func runPushStates(client *romm.Client, cfg *config.Config, romPath string) {
 	}
 	fmt.Printf("RESULT pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d queuedstate=%d reason=%s\n",
 		res.Pushed, res.Skipped, res.Failed, res.Retired, queued, res.Reason)
+	noteStateAuth(res.AuthExpired) // a rejected token here → PAIRING_EXPIRED + exit 6
+	exitMode(0)
+}
+
+// runPushAllStates is the BULK "Sync Now" state push: it uploads the local save
+// states of EVERY mirrored ROM in one call (per-ROM --push-states covers the
+// on-exit hooks). It is local-first — sync.PushAllLocalStates skips ROMs with no
+// on-disk state files without ever touching the network — so a huge library with
+// states on only a few games never hammers the radio. Contract:
+//
+//	PUSHSTATE rom=<path> pushedstates=<N> skippedstates=<N> failedstates=<N> retiredstates=<N> queuedstate=<0|1> reason=<token>
+//	RESULT pushedstates=<N> skippedstates=<N> failedstates=<N> retiredstates=<N> queuedstates=<N> roms=<N> reason=<tok>
+//
+// A per-ROM push that lands offline is auto-queued into pending-states.txt here
+// (the same cmd-owns-the-queue split as runPushStates) so --push-pending-states
+// retries it later. reason is the sweep's own reason: ok normally, no-manifest
+// when statecores.json is absent (feature dark). Exit 0 always — bulk state push
+// is additive best-effort and must never fail a background "Sync Now" chain.
+func runPushAllStates(client *romm.Client, cfg *config.Config) {
+	res := sync.PushAllLocalStates(client, cfg,
+		func(romPath string, pr sync.PushStatesResult) {
+			queued := 0
+			if pr.Reason == "offline" {
+				if _, err := enqueuePendingState(romPath); err == nil {
+					queued = 1
+				}
+			}
+			fmt.Printf("PUSHSTATE rom=%q pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d queuedstate=%d reason=%s\n",
+				romPath, pr.Pushed, pr.Skipped, pr.Failed, pr.Retired, queued, pr.Reason)
+		})
+	fmt.Printf("RESULT pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d queuedstates=%d roms=%d reason=%s\n",
+		res.Pushed, res.Skipped, res.Failed, res.Retired, res.Queued, res.RomsWithStates, res.Reason)
+	noteStateAuth(res.AuthExpired) // any per-ROM dead pairing → PAIRING_EXPIRED + exit 6
 	exitMode(0)
 }
 
@@ -58,6 +91,7 @@ func runListStates(client *romm.Client, cfg *config.Config, romPath string) {
 			o.ID, o.Slot, b2i(o.Compatible), b2i(o.Known), o.AgeSeconds, o.Size, o.Origin, why, o.FileName)
 	}
 	fmt.Printf("RESULT liststates=%d compatstates=%d reason=%s\n", len(res.Offers), compat, res.Reason)
+	noteStateAuth(res.AuthExpired) // a rejected token here → PAIRING_EXPIRED + exit 6
 	exitMode(0)
 }
 
@@ -75,5 +109,6 @@ func runPullState(client *romm.Client, cfg *config.Config, romPath string, state
 	} else {
 		fmt.Printf("RESULT placedstate=0 reason=%s\n", res.Reason)
 	}
+	noteStateAuth(res.AuthExpired) // a rejected token here → PAIRING_EXPIRED + exit 6
 	exitMode(0)
 }

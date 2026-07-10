@@ -339,12 +339,17 @@ func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string
 	folder := fsSlug
 	if cfg != nil {
 		if m, ok := cfg.DirectoryMappings[fsSlug]; ok {
-			if m.RelativePath != "" {
-				folder = m.RelativePath
-			} else {
-				folder = fsSlug
+			// SECURITY: relative_path comes from config.json, which a co-installed hostile
+			// app can write ("../../../../data/local/tmp"). Only honour it when it is a safe
+			// relative folder under Roms/; a poisoned value is DROPPED and we fall through to
+			// the canonical resolution below, never joining an escape.
+			if m.RelativePath != "" && isSafeRelFolder(m.RelativePath) {
+				return filepath.Join(RomsDir(), m.RelativePath)
 			}
-			return filepath.Join(RomsDir(), folder)
+			if m.RelativePath == "" {
+				return filepath.Join(RomsDir(), fsSlug)
+			}
+			// Unsafe relative_path: fall through to canonical resolution below.
 		}
 	}
 	if displayName != "" {

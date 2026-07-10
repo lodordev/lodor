@@ -18,6 +18,7 @@ package sync
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,9 @@ type StateOffer struct {
 type ListStatesResult struct {
 	Offers []StateOffer
 	Reason string // ok | no-manifest | no-system | none | resolve | offline
+	// AuthExpired: a server call was rejected for a bad/expired token — mapped to
+	// PAIRING_EXPIRED by the cmd layer instead of a silent "offline" (BUG4).
+	AuthExpired bool
 }
 
 // ListStates returns the rom's server states, compat-annotated.
@@ -57,7 +61,7 @@ func ListStates(client *romm.Client, cfg *config.Config, romPath string) ListSta
 	rom, _, fail, okr := resolveRomAndLocalSavePath(client, cfg, romPath, "")
 	if !okr {
 		if fail.Outcome == PullError {
-			return ListStatesResult{Reason: "offline"}
+			return ListStatesResult{Reason: "offline", AuthExpired: fail.AuthExpired}
 		}
 		return ListStatesResult{Reason: "resolve"}
 	}
@@ -67,7 +71,7 @@ func ListStates(client *romm.Client, cfg *config.Config, romPath string) ListSta
 	}
 	states, err := client.GetStates(rom.ID)
 	if err != nil {
-		return ListStatesResult{Reason: "offline"}
+		return ListStatesResult{Reason: "offline", AuthExpired: romm.IsAuthError(err)}
 	}
 	if len(states) == 0 {
 		return ListStatesResult{Reason: "none"}
@@ -185,7 +189,10 @@ type PullStateResult struct {
 	Path   string
 	Reason string // ok | no-manifest | no-system | not-found | incompatible |
 	//               size-mismatch | parse | occupant-unsafe | bad-slot |
-	//               offline | resolve | write
+	//               empty | offline | resolve | write
+	// AuthExpired: a server call was rejected for a bad/expired token — mapped to
+	// PAIRING_EXPIRED by the cmd layer instead of a silent "offline" (BUG4).
+	AuthExpired bool
 }
 
 // PullState downloads one server state by id and places it at the local slot.
@@ -197,7 +204,7 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 	rom, _, fail, okr := resolveRomAndLocalSavePath(client, cfg, romPath, "")
 	if !okr {
 		if fail.Outcome == PullError {
-			return PullStateResult{Reason: "offline"}
+			return PullStateResult{Reason: "offline", AuthExpired: fail.AuthExpired}
 		}
 		return PullStateResult{Reason: "resolve"}
 	}
@@ -207,7 +214,7 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 	}
 	states, err := client.GetStates(rom.ID)
 	if err != nil {
-		return PullStateResult{Reason: "offline"}
+		return PullStateResult{Reason: "offline", AuthExpired: romm.IsAuthError(err)}
 	}
 	var rec *romm.State
 	for i := range states {
@@ -230,8 +237,15 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 	}
 
 	data, err := client.DownloadStateContent(*rec)
-	if err != nil || len(data) == 0 {
-		return PullStateResult{Reason: "offline"}
+	if err != nil {
+		return PullStateResult{Reason: "offline", AuthExpired: romm.IsAuthError(err)}
+	}
+	// #10: an empty-but-successful download (HTTP 200, zero bytes) is NOT offline
+	// — the server answered, it just has nothing loadable to place. Reporting it
+	// as "offline" hid a real, distinct condition (a truncated/empty server
+	// record) behind a transient-network reason and invited pointless retries.
+	if len(data) == 0 {
+		return PullStateResult{Reason: "empty"}
 	}
 	raw, _, err := statefmt.ExtractRaw(data)
 	if err != nil {
@@ -244,12 +258,18 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 		return PullStateResult{Reason: "size-mismatch"}
 	}
 
+	// #10: map the slot to its REAL slot; never silently default an unparseable
+	// slot to "auto". slotFromFileName returns "?" only when neither our D6 tag
+	// nor any frontend suffix identifies the slot; auto-placing such a state into
+	// the auto-resume slot would clobber the live auto-state with an unrelated
+	// record. The record is still pullable — the caller must name a slot
+	// explicitly via slotOverride (--state-slot); absent that, refuse.
 	slot := slotOverride
 	if slot == "" {
 		slot = slotFromFileName(rec.FileName)
 	}
 	if slot == "?" {
-		slot = "auto"
+		return PullStateResult{Reason: "bad-slot"}
 	}
 	dir := platform.StateDirFor(info.Dir)
 	target := platform.StateFileForSlot(dir, filepath.Base(romPath), slot)
@@ -272,19 +292,31 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 		}
 		if occRaw != nil {
 			occSum := bytesMD5(occRaw)
-			if !StateKnown(rom.ID, occSum) {
+			// #23: gate on whether the occupant's bytes are CURRENTLY on the server
+			// (a live ServerID), not merely ever recorded. StateKnown stays true for
+			// bytes that retention has already deleted+forgotten server-side (the MD5
+			// entry survives with ServerID zeroed) — using it here would rename the
+			// occupant to .bak WITHOUT re-uploading, leaving it alive only on disk and
+			// one #8 clobber away from gone. StateOnServer requires the live id.
+			if !StateOnServer(rom.ID, occSum) {
 				up, uerr := client.UploadState(rom.ID, local,
 					stateUploadName(filepath.Base(romPath), slot, deviceShort(cfg)), occRaw)
 				if uerr != nil {
-					return PullStateResult{Reason: "occupant-unsafe"}
+					return PullStateResult{Reason: "occupant-unsafe", AuthExpired: romm.IsAuthError(uerr)}
 				}
 				_ = RecordState(rom.ID, StateLedgerEntry{
 					MD5: occSum, Size: int64(len(occRaw)), ServerID: up.ID, Slot: slot, Origin: local, Own: true,
 				})
 			}
 		}
-		if os.Rename(target, target+".bak") == nil {
-			bakPath = target + ".bak"
+		// #8: never clobber an existing preserved .bak. A 2nd pull to the same slot
+		// used to os.Rename(target, target+".bak") unconditionally, destroying the
+		// first pull's occupant that the earlier .bak was preserving. Pick a
+		// non-colliding name so every prior on-disk occupant survives. (The occupant
+		// is also on the server by the gate above — this is the belt to that braces.)
+		bakTarget := nonCollidingBakPath(target)
+		if os.Rename(target, bakTarget) == nil {
+			bakPath = bakTarget
 		}
 	}
 
@@ -308,4 +340,25 @@ func PullState(client *romm.Client, cfg *config.Config, romPath string, stateID 
 		MD5: bytesMD5(raw), Size: int64(len(raw)), ServerID: rec.ID, Slot: slot, Origin: rec.Emulator,
 	})
 	return PullStateResult{Placed: true, Path: target, Reason: "ok"}
+}
+
+// nonCollidingBakPath returns a preserved-occupant backup path that never
+// clobbers an existing one (#8). The first occupant preserved for a slot takes
+// "<target>.bak" (the historical name — restore-on-write-failure and any
+// external tooling still find it); a second, third, … concurrent occupant take
+// "<target>.bak.1", ".bak.2", … The scan is bounded belt-and-braces: if a very
+// large number of stale .bak files somehow pile up, fall back to a timestamped
+// name so the current occupant is still never destroyed.
+func nonCollidingBakPath(target string) string {
+	base := target + ".bak"
+	if _, err := os.Stat(base); os.IsNotExist(err) {
+		return base
+	}
+	for i := 1; i < 10000; i++ {
+		cand := base + "." + strconv.Itoa(i)
+		if _, err := os.Stat(cand); os.IsNotExist(err) {
+			return cand
+		}
+	}
+	return base + "." + time.Now().UTC().Format("20060102T150405.000000000")
 }

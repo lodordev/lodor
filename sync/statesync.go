@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"lodor/catalog"
 	"lodor/config"
 	"lodor/platform"
 	"lodor/romm"
@@ -81,6 +82,12 @@ type PushStatesResult struct {
 	Failed  int
 	Retired int // own old uploads deleted server-side after a landed push (6.4)
 	Reason  string // ok | no-manifest | no-system | no-states | resolve | offline
+	// AuthExpired is set when a server call this run was rejected because the
+	// client-token is invalid/expired/revoked (romm.AuthError). The cmd layer
+	// maps it to the PAIRING_EXPIRED contract (stdout line + exit 6) — a 401 must
+	// NEVER be swallowed as a per-file failure or "offline" (false success: the
+	// user is never told to re-pair and states silently never upload).
+	AuthExpired bool
 }
 
 // maxStateUpload caps a single state upload (PSX-class states are MBs; anything
@@ -98,7 +105,9 @@ func PushStates(client *romm.Client, cfg *config.Config, romPath string) PushSta
 	rom, _, fail, okr := resolveRomAndLocalSavePath(client, cfg, romPath, "")
 	if !okr {
 		if fail.Outcome == PullError {
-			return PushStatesResult{Reason: "offline"}
+			// A token-rejection during resolve is a dead pairing, not "offline":
+			// surface it so the mode emits PAIRING_EXPIRED instead of a silent retry.
+			return PushStatesResult{Reason: "offline", AuthExpired: fail.AuthExpired}
 		}
 		return PushStatesResult{Reason: "resolve"}
 	}
@@ -143,6 +152,12 @@ func PushStates(client *romm.Client, cfg *config.Config, romPath string) PushSta
 		name := stateUploadName(romBase, sf.Slot, device)
 		up, err := client.UploadState(rom.ID, tuple, name, raw)
 		if err != nil {
+			// A 401/expired-token upload is NOT a generic per-file failure: flag it
+			// so the mode surfaces PAIRING_EXPIRED and the user re-pairs (//BUG4). The
+			// file still counts as failed for the summary; the auth flag rides alongside.
+			if romm.IsAuthError(err) {
+				res.AuthExpired = true
+			}
 			res.Failed++
 			continue
 		}
@@ -165,6 +180,13 @@ func PushStates(client *romm.Client, cfg *config.Config, romPath string) PushSta
 // ID already gone server-side just heals the ledger; an ID whose server record
 // isn't lodor-origin is a contested identity and is never deleted. Any server
 // error skips the victim — retried on the next landed push.
+//
+// #9: "oldest" is ordered by the monotonic upload Seq (stable across MD5
+// refresh), NOT RecordedAt. A pull that refreshes an existing MD5 restamps
+// RecordedAt to "now", so the newest bytes could look oldest by clock time and
+// be selected as the victim — deleting the freshest state. Seq is assigned once
+// at first record and never moves, so it reflects true upload order. Legacy
+// entries with Seq==0 (pre-#9 ledgers) fall back to RecordedAt as a tiebreak.
 func retireOwnOldStates(client *romm.Client, romID, retain int) int {
 	if retain < 1 {
 		retain = 5 // belt-and-braces: retention trims history, never erases it
@@ -196,7 +218,14 @@ func retireOwnOldStates(client *romm.Client, romID, retain int) int {
 		if len(list) <= retain {
 			continue
 		}
-		sort.Slice(list, func(i, j int) bool { return list[i].RecordedAt.After(list[j].RecordedAt) })
+		// Newest-first by stable upload order (#9). Prefer Seq; both-legacy
+		// (Seq==0) entries tiebreak on RecordedAt so pre-#9 ledgers still order.
+		sort.Slice(list, func(i, j int) bool {
+			if list[i].Seq != list[j].Seq {
+				return list[i].Seq > list[j].Seq
+			}
+			return list[i].RecordedAt.After(list[j].RecordedAt)
+		})
 		for _, e := range list[retain:] {
 			emu, exists := onServer[e.ServerID]
 			if !exists {
@@ -242,4 +271,119 @@ func deviceShort(cfg *config.Config) string {
 		id = id[:8]
 	}
 	return id
+}
+
+// PushAllLocalStatesResult aggregates a bulk push across the whole mirrored
+// library (the manual "Sync Now" state path). RomsWithStates counts ROMs that
+// had at least one local state file (i.e. the ones we actually hit the network
+// for); the per-ROM counters sum the underlying PushStates results. Queued
+// counts ROMs whose per-ROM push landed offline and were auto-queued into
+// pending-states.txt by the cmd layer (statesync itself never writes the queue).
+type PushAllLocalStatesResult struct {
+	Pushed          int
+	Skipped         int
+	Failed          int
+	Retired         int
+	Queued          int // eligible ROMs that landed offline (cmd layer queues them)
+	RomsWithStates  int
+	Reason          string // ok | no-manifest
+	AuthExpired     bool   // any per-ROM push hit a rejected token (PAIRING_EXPIRED)
+}
+
+// sdcardRootForStates mirrors catalog's sdcardRoot / the cmd sdRoot(): the
+// SDCARD_PATH env, defaulting to /mnt/SDCARD. Used to turn the catalog index's
+// SDCARD-relative paths back into the absolute paths PushStates keys on.
+func sdcardRootForStates() string {
+	if sd := os.Getenv("SDCARD_PATH"); sd != "" {
+		return sd
+	}
+	return "/mnt/SDCARD"
+}
+
+// PushAllLocalStates pushes EVERY mirrored ROM's local save states in one call —
+// the bulk backing for a manual "Sync Now" (per-ROM --push-states covers the
+// on-exit hooks). It is LOCAL-FIRST by construction so a library of thousands of
+// ROMs with states on only a handful never hammers the slow radio:
+//
+//	manifest (loadStateCores) ── absent → no-op honestly (reason=no-manifest)
+//	catalog index BY SLUG (catalog.LoadIndexBySlug) ── the platform fs_slug is
+//	    the index's own top-level key, so a ROM's platform (needed for the
+//	    statecores.json lookup) is derived WITHOUT any network resolve. This is
+//	    the design choice that keeps the pre-filter truly local: PushStates gets
+//	    the platform by resolving the ROM against RomM, but here we already know
+//	    it from the on-disk index grouping.
+//	per ROM: manifest lookup → StateDirFor → StateFilesForRom (all on-disk) ──
+//	    ZERO local state files → SKIPPED with no network call (the common case).
+//	only ROMs that DO have local state files fall through to the existing
+//	    sync.PushStates (statesync.go), which resolves, normalizes, dedups vs the
+//	    ledger, uploads, auto-retains, and — offline — signals reason=offline so
+//	    the cmd layer queues the ROM.
+//
+// Best-effort and additive: individual ROM failures never abort the sweep.
+// report (may be nil) is invoked once per ROM that had local state files, with
+// its per-ROM PushStates result — the cmd layer uses it to print per-ROM lines
+// and to enqueue offline ROMs into pending-states.txt (the same split as
+// runPushStates: statesync uploads, the cmd owns the queue file).
+func PushAllLocalStates(client *romm.Client, cfg *config.Config,
+	report func(romPath string, res PushStatesResult)) PushAllLocalStatesResult {
+	sc, ok := loadStateCores()
+	if !ok {
+		return PushAllLocalStatesResult{Reason: "no-manifest"}
+	}
+	bySlug := catalog.LoadIndexBySlug(cfg)
+	sd := sdcardRootForStates()
+
+	res := PushAllLocalStatesResult{Reason: "ok"}
+	for slug, byID := range bySlug {
+		// Platform → manifest system is a PURE LOCAL lookup (index key = fs_slug).
+		// A platform absent from the manifest (unsupported on this host, or no
+		// pinned core) can never have pushable states here — skip the whole group
+		// without touching disk or network.
+		info, oks := sc.Systems[slug]
+		if !oks {
+			continue
+		}
+		dir := platform.StateDirFor(info.Dir)
+		if dir == "" {
+			continue // states unsupported on this host for this system
+		}
+		// Deterministic order (map iteration is random) so progress/output is
+		// stable and tests can assert reliably.
+		ids := make([]int, 0, len(byID))
+		for id := range byID {
+			ids = append(ids, id)
+		}
+		sort.Ints(ids)
+		for _, id := range ids {
+			rel := byID[id]
+			if rel == "" {
+				continue
+			}
+			// LOCAL PRE-FILTER: does this ROM have any state files on disk? This
+			// is the gate that MUST precede any per-ROM network call — checked by
+			// walking the manifest's on-disk state dir with the ROM's basename.
+			romBase := filepath.Base(rel)
+			if len(platform.StateFilesForRom(dir, romBase)) == 0 {
+				continue // no local states → never a network call (the common case)
+			}
+			res.RomsWithStates++
+			// Reuse the full per-ROM push (resolve+normalize+dedup+upload+retain).
+			romPath := filepath.Join(sd, rel)
+			pr := PushStates(client, cfg, romPath)
+			if report != nil {
+				report(romPath, pr)
+			}
+			res.Pushed += pr.Pushed
+			res.Skipped += pr.Skipped
+			res.Failed += pr.Failed
+			res.Retired += pr.Retired
+			if pr.AuthExpired {
+				res.AuthExpired = true // sticky: one dead-pairing taints the sweep
+			}
+			if pr.Reason == "offline" {
+				res.Queued++
+			}
+		}
+	}
+	return res
 }

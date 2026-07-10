@@ -18,6 +18,7 @@ package cover
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/png"
@@ -39,6 +40,14 @@ const MaxEdge = 320
 // an interface so the writer is testable without a live server.
 type coverDownloader interface {
 	DownloadCover(coverPath string) ([]byte, error)
+}
+
+// coverDownloaderCtx is the context-aware cover fetch capability, used by
+// FetchAndSaveCtx so a bulk warm can cancel an in-flight download promptly (user
+// B-press) or bound each cover with a short deadline. *romm.Client satisfies it via
+// DownloadCoverCtx.
+type coverDownloaderCtx interface {
+	DownloadCoverCtx(ctx context.Context, coverPath string) ([]byte, error)
 }
 
 // MediaPath returns the NextUI artwork path for a ROM given its absolute on-disk ROM
@@ -88,6 +97,34 @@ func FetchAndSave(dl coverDownloader, coverPath, romPath string, force bool) (Ou
 	if err != nil {
 		return OutcomeError, fmt.Errorf("download: %w", err)
 	}
+	return saveCover(raw, romPath)
+}
+
+// FetchAndSaveCtx is FetchAndSave with a context threaded into the network fetch, so an
+// in-flight cover download aborts the instant ctx is cancelled (user B-press) or its
+// per-cover deadline fires — the fix for the "Cancelling" hang on the slow Miyoo radio
+// (#26). Identical grace contract: no-cover / skip-existing short-circuit BEFORE any
+// network call, and a cancelled/timed-out download is a per-item OutcomeError the caller
+// counts without aborting the mirror. Callers that want prompt cancel should ALSO check
+// their cancel signal between covers so the whole pass stops, not just the current fetch.
+func FetchAndSaveCtx(ctx context.Context, dl coverDownloaderCtx, coverPath, romPath string, force bool) (Outcome, error) {
+	if coverPath == "" {
+		return OutcomeNoCover, nil
+	}
+	if !force && Exists(romPath) {
+		return OutcomeSkipped, nil
+	}
+	raw, err := dl.DownloadCoverCtx(ctx, coverPath)
+	if err != nil {
+		return OutcomeError, fmt.Errorf("download: %w", err)
+	}
+	return saveCover(raw, romPath)
+}
+
+// saveCover validates, scales, and atomically writes fetched cover bytes to romPath's
+// .media path. Shared tail of FetchAndSave and FetchAndSaveCtx so both apply the
+// identical scale + atomic-write path.
+func saveCover(raw []byte, romPath string) (Outcome, error) {
 	if len(raw) == 0 {
 		return OutcomeError, fmt.Errorf("empty cover body")
 	}

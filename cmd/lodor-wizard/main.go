@@ -939,11 +939,15 @@ func (w *wizard) doSyncNow(draw func(*ui.Canvas), btn func() ui.Button) {
 	}
 	w.working(draw, "Flushing pending saves...")
 	_, e1 := w.runEngine("--push-pending")
+	// Handoff v1: Sync Now must push save STATES too, not just battery saves.
+	w.working(draw, "Pushing save states...")
+	_, es := w.runEngine("--push-all-states")
+	_, _ = w.runEngine("--push-pending-states")
 	w.working(draw, "Pulling latest saves...")
 	_, e2 := w.runEngine("--pull-saves")
 	w.working(draw, "Updating Continue...")
 	_, e3 := w.runEngine("--sync-continue")
-	rc := max(exitCode(e1), max(exitCode(e2), exitCode(e3)))
+	rc := max(exitCode(e1), max(exitCode(es), max(exitCode(e2), exitCode(e3))))
 	w.markPairFlag(rc)
 	if rc == 0 {
 		w.maybeCheckUpdates(draw)
@@ -1310,6 +1314,7 @@ func (w *wizard) screenMirror(draw func(*ui.Canvas)) {
 // rendering an honest progress bar. Returns the engine exit code.
 func (w *wizard) screenMirrorArgs(draw func(*ui.Canvas), args ...string) int {
 	_ = os.Remove("/tmp/dl-progress")
+	_ = os.Remove("/tmp/romm-phase") // clear a stale phase label from a prior op (no-fake-UI)
 	// The select loop already keeps the UI live (polls every 400ms), so the mirror never
 	// freezes the wizard; the context is a wedge-breaker so a hung engine can't hold the
 	// progress screen forever (BUG 2b). engineTimeout is generous — not a tight bound.

@@ -33,6 +33,13 @@ import (
 // record's ServerID belongs to another device's upload, so pull records leave
 // Own false). A refresh-by-MD5 from a pull can clear a prior Own — that errs
 // toward retaining, never toward deleting.
+//
+// Seq is a per-ledger monotonic upload sequence stamped once when the entry
+// first enters the ledger and PRESERVED across every MD5-refresh (#9). It is
+// the stable retention ordering: RecordedAt is reset by a refresh (a re-record
+// of the same bytes stamps "now"), so ordering by RecordedAt can make the
+// NEWEST upload look oldest and pick it as the retention victim — a data-loss
+// bug. Seq never moves once assigned, so "oldest upload" stays oldest.
 type StateLedgerEntry struct {
 	MD5        string    `json:"md5"`
 	Size       int64     `json:"size"`
@@ -40,11 +47,13 @@ type StateLedgerEntry struct {
 	Slot       string    `json:"slot,omitempty"`
 	Origin     string    `json:"origin,omitempty"` // producer tuple (D3)
 	Own        bool      `json:"own,omitempty"`
+	Seq        int64     `json:"seq,omitempty"` // monotonic upload order; stable across MD5-refresh (#9)
 	RecordedAt time.Time `json:"recorded_at"`
 }
 
 type stateLedgerFile struct {
-	Version int                          `json:"version"`
+	Version int                           `json:"version"`
+	NextSeq int64                         `json:"next_seq,omitempty"` // monotonic Seq allocator (#9)
 	Roms    map[string][]StateLedgerEntry `json:"roms"`
 }
 
@@ -88,9 +97,16 @@ func StateLedgerEntries(romID int) []StateLedgerEntry {
 	return lf.Roms[strconv.Itoa(romID)]
 }
 
-// StateKnown reports whether these exact bytes are already recorded for the rom —
-// the dedup-before-upload check and the placement "is the local occupant safe to
-// replace" check (a known hash is, by definition, already on the server).
+// StateKnown reports whether these exact bytes are EVER recorded for the rom —
+// the dedup-before-upload check (a re-upload of known bytes is idempotent, so
+// "ever recorded" is the right, safe gate for push).
+//
+// NOTE: this is NOT the right gate for the placement occupant-preserve decision.
+// StateKnown ignores ServerID, and retention (retireOwnOldStates →
+// ForgetStateServerID) keeps the MD5 entry while zeroing its ServerID after a
+// server-side delete — so bytes that have been DELETED off the server still read
+// as "known" here. Placement must use StateOnServer instead (#23): renaming an
+// occupant to .bak is only safe when its bytes are CURRENTLY on the server.
 func StateKnown(romID int, md5 string) bool {
 	if md5 == "" {
 		return false
@@ -103,8 +119,30 @@ func StateKnown(romID int, md5 string) bool {
 	return false
 }
 
-// RecordState appends (or refreshes, matched by MD5) one entry for the rom.
-// RecordedAt is stamped now when zero.
+// StateOnServer reports whether these exact bytes are CURRENTLY on the server —
+// i.e. some ledger entry for the rom carries this MD5 AND a live (non-zero)
+// ServerID. This is the placement occupant-preserve gate (#23): unlike
+// StateKnown it does not treat a retention-forgotten record (ServerID zeroed
+// after a server-side delete) as safe, so the occupant is re-uploaded before
+// the destructive rename rather than surviving only on disk.
+func StateOnServer(romID int, md5 string) bool {
+	if md5 == "" {
+		return false
+	}
+	for _, e := range StateLedgerEntries(romID) {
+		if e.ServerID != 0 && strings.EqualFold(e.MD5, md5) {
+			return true
+		}
+	}
+	return false
+}
+
+// RecordState appends (or refreshes, matched by the (Slot, ServerID, MD5) identity) one entry for the rom.
+// RecordedAt is stamped now when zero. Seq (the stable retention ordering, #9)
+// is allocated once on first insert from the ledger's monotonic NextSeq and
+// PRESERVED on an MD5-refresh — a refresh must never make an old upload look new
+// (or a new one look old) to retention, so it carries the original entry's Seq
+// forward regardless of what the caller passed.
 func RecordState(romID int, entry StateLedgerEntry) error {
 	if entry.RecordedAt.IsZero() {
 		entry.RecordedAt = time.Now()
@@ -114,13 +152,23 @@ func RecordState(romID int, entry StateLedgerEntry) error {
 	key := strconv.Itoa(romID)
 	replaced := false
 	for i, e := range lf.Roms[key] {
-		if strings.EqualFold(e.MD5, entry.MD5) {
+		// Identity is (Slot, ServerID, MD5) — NOT MD5 alone. Two DISTINCT server
+		// records that happen to carry identical bytes in different slots (or under
+		// different server ids) are distinct artifacts: collapsing them by MD5 alone
+		// orphaned one server id from the ledger, so retention never deleted it (a
+		// server-side leak). A true refresh is a re-record of the SAME logical entry
+		// — same slot AND same server id AND same bytes — and still updates in place,
+		// preserving Seq so retention ordering is stable (#9).
+		if e.Slot == entry.Slot && e.ServerID == entry.ServerID && strings.EqualFold(e.MD5, entry.MD5) {
+			entry.Seq = e.Seq // preserve original upload order across refresh (#9)
 			lf.Roms[key][i] = entry
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
+		lf.NextSeq++ // 1-based; 0 means "never sequenced" (legacy entries)
+		entry.Seq = lf.NextSeq
 		lf.Roms[key] = append(lf.Roms[key], entry)
 	}
 	return writeStateLedger(path, lf)

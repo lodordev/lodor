@@ -62,6 +62,7 @@ func main() {
 		pushStates        string
 		queueState        string
 		pushPendingStates bool
+		pushAllStates     bool
 		listStates        string
 		pullStateRom      string
 		pullStateID       int
@@ -127,6 +128,7 @@ func main() {
 	flag.StringVar(&pushStates, "push-states", "", "Handoff v1: upload this ROM's local save STATES (normalized, deduped vs the state ledger); requires statecores.json in the pak dir, else no-ops honestly; an offline attempt auto-queues into pending-states.txt; prints RESULT pushedstates=<N> skippedstates=<N> failedstates=<N> retiredstates=<N> queuedstate=<0|1> reason=<token>")
 	flag.StringVar(&queueState, "queue-state", "", "Handoff v1: queue this ROM into pending-states.txt (offline, instant, deduplicated) so --push-pending-states retries its state push when online; prints RESULT queuedstate=<0|1>")
 	flag.BoolVar(&pushPendingStates, "push-pending-states", false, "Handoff v1: re-run the state push for every ROM in pending-states.txt (only still-offline roms stay queued); prints PENDINGSTATE lines + RESULT pendingstates=<N> drained=<M> stuck=<K>")
+	flag.BoolVar(&pushAllStates, "push-all-states", false, "Handoff v1: BULK \"Sync Now\" — push the local save STATES of EVERY mirrored ROM in one call (local-first: ROMs with no on-disk state files never hit the network); an offline per-ROM push auto-queues into pending-states.txt; prints PUSHSTATE lines + RESULT pushedstates=<N> skippedstates=<N> failedstates=<N> retiredstates=<N> queuedstates=<N> roms=<N> reason=<tok>")
 	flag.StringVar(&listStates, "list-states", "", "Handoff v1: list server save states for this ROM with compatibility annotations; prints LISTSTATE lines + RESULT")
 	flag.StringVar(&pullStateRom, "pull-state", "", "Handoff v1: place ONE server state locally for this ROM (use with --state-id, optional --state-slot); prints RESULT placedstate=<0|1> reason=<token>")
 	flag.IntVar(&pullStateID, "state-id", 0, "server state id for --pull-state")
@@ -355,6 +357,8 @@ func main() {
 		runQueueState(queueState)
 	case pushPendingStates:
 		runPushPendingStates(client, cfg)
+	case pushAllStates:
+		runPushAllStates(client, cfg)
 	case pushSave != "":
 		requireDevice(host)
 		// HYBRID post-game push: uploads can be large, so use the download timeout
@@ -396,7 +400,7 @@ func main() {
 	case setProps != "":
 		runSetProps(client, cfg, setProps, flag.Args())
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --push-all-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
 		os.Exit(2)
 	}
 }

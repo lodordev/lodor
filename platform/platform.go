@@ -223,7 +223,10 @@ func BIOSFilePaths(fileName, slug string) []string {
 		}
 		return paths
 	}
-	return []string{filepath.Join(BiosDir(), fileName)}
+	// No-tag fallback: base the filename for symmetry with the per-tag branch (and the
+	// other CFW variants), so a server-supplied BIOS name can never carry a directory
+	// component into BiosDir.
+	return []string{filepath.Join(BiosDir(), filepath.Base(fileName))}
 }
 
 // saveArtifactAnchors returns the filename prefixes (anchored with a trailing ".")
@@ -247,12 +250,17 @@ func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string
 	folder := fsSlug
 	if cfg != nil {
 		if m, ok := cfg.DirectoryMappings[fsSlug]; ok {
-			if m.RelativePath != "" {
-				folder = m.RelativePath
-			} else {
-				folder = fsSlug
+			// SECURITY: relative_path comes from config.json, which a co-installed hostile
+			// app can write ("../../../../data/local/tmp"). Only honour it when it is a safe
+			// relative folder under Roms/; a poisoned value is DROPPED and we fall through to
+			// the canonical resolution below, never joining an escape.
+			if m.RelativePath != "" && isSafeRelFolder(m.RelativePath) {
+				return filepath.Join(RomsDir(), m.RelativePath)
 			}
-			return filepath.Join(RomsDir(), folder)
+			if m.RelativePath == "" {
+				return filepath.Join(RomsDir(), fsSlug)
+			}
+			// Unsafe relative_path: fall through to canonical resolution below.
 		}
 	}
 	// No mapping: build the canonical MinUI "Name (TAG)" folder from the primary tag so

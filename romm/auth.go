@@ -51,7 +51,11 @@ func PasswordGrant(baseURL, username, password string, insecure bool) (string, e
 	if insecure {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
-	hc := &http.Client{Timeout: 30 * time.Second, Transport: tr}
+	// SECURITY: this request carries the OAuth password-grant form (username/password),
+	// which Go would REPLAY to a redirect target. Refuse cross-host and scheme-downgrade
+	// redirects so credentials never leave the origin — the same policy the bearer /
+	// CF-Access clients use.
+	hc := &http.Client{Timeout: 30 * time.Second, Transport: tr, CheckRedirect: secureCheckRedirect}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return "", err

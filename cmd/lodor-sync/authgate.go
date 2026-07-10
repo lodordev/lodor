@@ -64,6 +64,16 @@ func notePullResult(r sync.PullResult) {
 	}
 }
 
+// noteStateAuth flags the run when a save-STATE result (push/list/pull) carried
+// AuthExpired. The state modes route their bool through here exactly as the
+// battery-save modes route PushResult/PullResult — a 401 in a state upload/list
+// must surface the SAME PAIRING_EXPIRED contract, never a silent "offline".
+func noteStateAuth(authExpired bool) {
+	if authExpired {
+		pairingExpired = true
+	}
+}
+
 // exitMode ends a RESULT-printing mode: when a pairing expiry was noted it
 // prints the PAIRING_EXPIRED line (AFTER the mode's own RESULT line, which the
 // caller has already printed) and exits 6; otherwise it exits code unchanged.
