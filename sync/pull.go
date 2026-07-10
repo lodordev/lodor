@@ -45,6 +45,15 @@ const (
 	// was overwritten — distinct from PullError so the UI can say "your current save
 	// wasn't safe to overwrite" instead of a generic failure.
 	PullSnapshotFail
+	// PullTombstoned: the local save file is ABSENT because it was DELETED on this
+	// device after a sync — the save ledger (saveledger.go) holds the revision this
+	// device last verifiably synced, and the server's newest is that revision or
+	// older — so the pull is SKIPPED and the deletion sticks (Reason "tombstone").
+	// A strictly newer server revision still pulls (another device advanced the
+	// game), and an explicit restore (RestoreSave) or PullOptions.IncludeDeleted
+	// always bypasses this. Nothing is ever deleted server-side — the tombstone
+	// only stops resurrection on THIS device.
+	PullTombstoned
 )
 
 func (o PullOutcome) String() string {
@@ -63,6 +72,8 @@ func (o PullOutcome) String() string {
 		return "Error"
 	case PullSnapshotFail:
 		return "SnapshotFail"
+	case PullTombstoned:
+		return "Tombstoned"
 	default:
 		return "Unknown"
 	}
@@ -108,7 +119,32 @@ func (r PullResult) Pulled() bool { return r.Outcome == PullWritten }
 // Non-destructive: any overwrite renames the existing local save to "<name>.bak"
 // first (write .tmp → atomic rename), so even a wrong decision can never lose bytes.
 // Ghost records (#63) are excluded before any of this runs.
+//
+// DELETED-SAVE TOMBSTONE: "no local save" is refined by the save ledger
+// (saveledger.go) — when this device has a ledgered synced revision and the
+// server's newest is that revision or OLDER, the absence is a deliberate local
+// delete and the pull is SKIPPED (PullTombstoned, Reason "tombstone") instead of
+// resurrecting the save. A strictly newer server revision still pulls; no ledger
+// row (fresh card / reinstall / pre-tombstone history) pulls exactly as before;
+// the local-file-EXISTS paths never consult the ledger. See PullOptions for the
+// explicit escape hatch.
 func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) PullResult {
+	return PullSaveDirectOpts(client, cfg, romPath, PullOptions{})
+}
+
+// PullOptions tunes PullSaveDirectOpts. The zero value is the default behavior
+// (tombstones honored).
+type PullOptions struct {
+	// IncludeDeleted bypasses the deleted-save tombstone skip: the newest server
+	// save is pulled even when this device's ledger says its local copy was
+	// deliberately deleted after a sync. This is the --include-deleted escape
+	// hatch for bulk pulls; the explicit restore path (RestoreSave) never
+	// consults the tombstone at all and doesn't need it.
+	IncludeDeleted bool
+}
+
+// PullSaveDirectOpts is PullSaveDirect with explicit options (see PullOptions).
+func PullSaveDirectOpts(client *romm.Client, cfg *config.Config, romPath string, opt PullOptions) PullResult {
 	rom, _, fail, ok := resolveRomAndLocalSavePath(client, cfg, romPath, "")
 	if !ok {
 		return fail
@@ -140,11 +176,24 @@ func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) Pul
 	}
 
 	if _, statErr := os.Stat(localPath); statErr != nil {
+		// No local save on the card — but that is NOT always "first play": if the
+		// save ledger shows this device previously SYNCED a revision and the server
+		// holds nothing newer, the file's absence means the user DELETED it, and
+		// pulling would resurrect a deleted save (the Argosy-2.0-tombstone gap).
+		// A strictly newer server revision still pulls (another device advanced
+		// the game); a missing/corrupt ledger reads as no record (pull as always);
+		// explicit restores never come through here (RestoreSave bypasses by design).
+		if !opt.IncludeDeleted && SaveTombstoned(cfg, rom.ID, newest) {
+			return PullResult{Outcome: PullTombstoned, Reason: "tombstone", Ghosts: ghosts}
+		}
 		// No local save yet (first play of this game on this device): pull newest.
 		if res := writeSave(client, cfg, newest.ID, localPath); res.Outcome != PullWritten {
 			res.Ghosts = ghosts
 			return res
 		}
+		// SYNCED MOMENT: the newest revision verifiably landed on the card — it is
+		// the tombstone baseline a later local delete is judged against.
+		recordSyncedSave(cfg, rom.ID, newest, localPath)
 		return PullResult{Outcome: PullWritten, LocalPath: localPath, Reason: "no-local", Ghosts: ghosts}
 	}
 
@@ -159,6 +208,9 @@ func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) Pul
 	}
 
 	if matches(newest) {
+		// SYNCED MOMENT: local == newest is as synced as a pull gets — refresh the
+		// ledger so a later local delete tombstones against exactly this revision.
+		recordSyncedSave(cfg, rom.ID, newest, localPath)
 		return PullResult{Outcome: PullInSync, LocalPath: localPath, Reason: "in-sync", Ghosts: ghosts}
 	}
 	for _, s := range real {
@@ -169,6 +221,8 @@ func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) Pul
 				res.Ghosts = ghosts
 				return res
 			}
+			// SYNCED MOMENT: the newest revision is now the on-card save.
+			recordSyncedSave(cfg, rom.ID, newest, localPath)
 			return PullResult{Outcome: PullWritten, LocalPath: localPath, Reason: "older-lineage", Ghosts: ghosts}
 		}
 	}
@@ -181,6 +235,11 @@ func PullSaveDirect(client *romm.Client, cfg *config.Config, romPath string) Pul
 // save file (BLUEPRINT §2). Unlike PullSaveDirect it applies NO age check — the user
 // explicitly chose this version — but it is equally non-destructive: the existing
 // local save is renamed to .bak, and the new bytes are written .tmp → atomic rename.
+//
+// TOMBSTONE BYPASS (by design): explicit user intent always resurrects — this path
+// never consults the deleted-save tombstone (SaveTombstoned). It DOES refresh the
+// save ledger on success: the restored revision becomes the device's new synced
+// baseline, so a later delete tombstones against what the user actually chose.
 //
 // save carries the chosen record (its FileExtension picks the local filename and its
 // ID names the content endpoint). romPath identifies the ROM for the save directory.
@@ -210,6 +269,10 @@ func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save r
 	if res := writeSave(client, cfg, save.ID, localPath); res.Outcome != PullWritten {
 		return res
 	}
+	// SYNCED MOMENT: the explicitly chosen revision is now the on-card save and the
+	// device's new tombstone baseline (see the TOMBSTONE BYPASS note above). The rom
+	// id comes from the save record — resolveRomAndLocalSavePath already resolved it.
+	recordSyncedSave(cfg, save.RomID, save, localPath)
 	return PullResult{Outcome: PullWritten, LocalPath: localPath}
 }
 

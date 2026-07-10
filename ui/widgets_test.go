@@ -161,3 +161,18 @@ func TestCanvasFillRectBounds(t *testing.T) {
 	}
 	c.FillRect(10, 10, 5, 5, 0xff0000) // fully off-canvas: no panic, no change
 }
+
+// TestKeyboardHint (lodor#40): a Hint line draws without panicking and leaves the
+// typing/cancel behavior untouched (it only shifts the layout down one small line).
+func TestKeyboardHint(t *testing.T) {
+	c := NewCanvas(720, 480)
+	k := &Keyboard{Prompt: "Enter your RomM pairing code:", Hint: "In RomM on your computer: Settings > Devices > Pair"}
+	k.Draw(c, DefaultTheme(), 20, 20, 680, 440)
+	k.row, k.col = 0, 0
+	if k.Handle(BtnConfirm) {
+		t.Fatal("typing must not finish entry")
+	}
+	if k.Text != "1" {
+		t.Fatalf("Text = %q, want \"1\"", k.Text)
+	}
+}

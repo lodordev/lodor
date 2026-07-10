@@ -259,7 +259,7 @@ func TestMergeFixtureUserCardSurvivesEverything(t *testing.T) {
 
 	// ---- Stage 2: collections mirror + refresh (idempotence + V2) ----
 	run("collections", func() {
-		if _, _, _, _, err := catalog.MirrorCollections(client, cfg, nil); err != nil {
+		if _, _, _, _, _, _, _, err := catalog.MirrorCollections(client, cfg, nil); err != nil {
 			t.Fatalf("collections: %v", err)
 		}
 	})
@@ -270,7 +270,7 @@ func TestMergeFixtureUserCardSurvivesEverything(t *testing.T) {
 		if _, _, _, _, _, _, err := catalog.MirrorCatalog(client, cfg, nil, false); err != nil {
 			t.Fatalf("refresh: %v", err)
 		}
-		if _, _, _, _, err := catalog.MirrorCollections(client, cfg, nil); err != nil {
+		if _, _, _, _, _, _, _, err := catalog.MirrorCollections(client, cfg, nil); err != nil {
 			t.Fatalf("refresh collections: %v", err)
 		}
 	})

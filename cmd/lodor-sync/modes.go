@@ -11,6 +11,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -164,13 +165,23 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 	// 128 MB device otherwise (the bug behind the single-file download failures).
 	_ = os.MkdirAll(filepath.Dir(dest), 0o755)
 	tmp := dest + ".tmp"
-	out, oErr := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	// RESUMABLE: if a partial .tmp survives from an interrupted run, resume from its end
+	// via an HTTP Range request instead of re-fetching from byte 0 — a dropped multi-hundred-MB
+	// download no longer restarts at zero. Open WITHOUT O_TRUNC so the partial is preserved;
+	// the resume transport truncates/seeks as the server's 206/200/416 response dictates.
+	var startOffset int64
+	if fi, statErr := os.Stat(tmp); statErr == nil && fi.Size() > 0 {
+		startOffset = fi.Size()
+	}
+	out, oErr := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY, 0o644)
 	if oErr != nil {
 		fmt.Fprintf(os.Stderr, "DLFAIL create rom=%d\n", rom.ID)
 		writeProgress(0)
 		return false
 	}
-	// Real progress bar: report 0→90% as bytes stream (reserve 90→100 for verify).
+	// Real progress bar: report 0→90% as bytes stream (reserve 90→100 for verify). On a
+	// resume the callback's done is primed with startOffset against the full total, so the
+	// bar picks up where it left off rather than jumping backward.
 	lastPct := -1
 	onProg := func(done, total int64) {
 		if total <= 0 {
@@ -182,14 +193,17 @@ func downloadRomCore(client *romm.Client, cfg *config.Config, romPath string) bo
 			writeProgress(pct)
 		}
 	}
-	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out, onProg)
+	n, derr := client.DownloadRomContentResumeTo(rom.ID, rom.FsName, out, startOffset, onProg)
 	// FAT32-durable: fsync streamed ROM bytes before rename (streaming path — too
 	// large to buffer through fsutil). A Sync failure folds into the download gate.
 	syncErr := out.Sync()
 	cErr := out.Close()
 	if derr != nil || syncErr != nil || cErr != nil || n == 0 {
 		noteAuthErr(derr)
-		_ = os.Remove(tmp)
+		// KEEP the partial .tmp on a transfer error so the NEXT --download (or the
+		// download-queue retry) resumes from here instead of restarting at zero. A
+		// corrupt/stale partial is caught later by the hash verify (which deletes the
+		// bad file), so retaining it is safe.
 		fmt.Fprintf(os.Stderr, "DLFAIL download rom=%d\n", rom.ID)
 		writeProgress(0)
 		return false
@@ -1066,6 +1080,9 @@ func entryLanded(results []sync.PushResult) bool {
 //	older-lineage   local matched an OLDER revision → newest pulled (.bak kept)
 //	no-local        no local save existed → newest pulled
 //	unpushed-local  local matched NO revision → never overwritten; push leg uploads it
+//	tombstone       no local save because it was DELETED here after a sync and the
+//	                server has nothing newer than the deleted revision — skipped, the
+//	                deletion sticks (deleted-save tombstone; explicit restore resurrects)
 //	no-server-save  server has no (non-ghost) save for this ROM
 //	offline         the server couldn't be reached — NOT "in sync" (the pre-A2
 //	                0/0 line let the pak claim "already in sync" while offline)
@@ -1106,6 +1123,8 @@ func pullReasonToken(r sync.PullResult) string {
 		return "in-sync"
 	case sync.PullLocalUnpushed:
 		return "unpushed-local"
+	case sync.PullTombstoned:
+		return "tombstone"
 	case sync.PullNoServerSave:
 		return "no-server-save"
 	case sync.PullError:
@@ -1248,7 +1267,7 @@ func runEvict(cfg *config.Config, romPath string) {
 // plus, AFTER the rows, one single-field trailer line (A3 — no tab, so every
 // existing `awk -F'\t' NF>=2` row filter drops it):
 //
-//	LOCAL=<none|current|older|unpushed>
+//	LOCAL=<none|current|older|unpushed|deleted>
 //
 // summarizing how the save THIS LAUNCH WILL LOAD relates to the listed set. STRICT
 // semantics (task #135): the trailer is judged against the launched basename's OWN
@@ -1257,7 +1276,15 @@ func runEvict(cfg *config.Config, romPath string) {
 // name has no local save; current = it matches the newest revision; older = it
 // matches an older revision only; unpushed = it matches no revision — unpushed local
 // progress). The pre-launch hook keys its prompt/pull/silent decision off this
-// trailer. The row-level CURRENT tag keeps the AGGREGATE any-local-file semantics —
+// trailer.
+//
+// deleted (deleted-save tombstone) REFINES none: no local save exists because it was
+// deliberately DELETED on this device after a sync, and the server's newest revision
+// is the one this device last synced (or older) — auto-pull paths must honor the
+// deletion instead of silently restoring the newest revision. The listed rows are
+// still printed in full: an EXPLICIT user restore from this list always resurrects.
+// Hooks written before this value existed fall through their none/current checks to
+// the prompt path — the user decides, which is an acceptable (explicit) degrade. The row-level CURRENT tag keeps the AGGREGATE any-local-file semantics —
 // "these bytes are on this device" is the Game Manager's display truth, possibly via
 // the twin's save file. Different jobs; do not conflate (Smart Pro 2026-07-03: the
 // twin's save matched the newest revision, the aggregate signal read "current", and
@@ -1329,8 +1356,15 @@ func runListSaves(client *romm.Client, cfg *config.Config, romPath string) {
 	// LOCAL= trailer (single field — row parsers drop it; see contract above). STRICT
 	// (task #135): judged against the save file the LAUNCH will load, not any twin's,
 	// and "current" only against the NEWEST revision — see ListSavesLocalState.
-	fmt.Printf("LOCAL=%s\n",
-		sync.ListSavesLocalState(saves, sync.PrimaryLocalSaveFilesForRomPath(client, cfg, romPath)))
+	state := sync.ListSavesLocalState(saves, sync.PrimaryLocalSaveFilesForRomPath(client, cfg, romPath))
+	// TOMBSTONE REFINEMENT (see contract above): "none" that the save ledger can
+	// prove is a post-sync local DELETE — with nothing newer on the server — reads
+	// "deleted", so auto-pull hooks stop resurrecting it (saves[0] is the newest
+	// non-ghost revision; the sort above guarantees it).
+	if state == "none" && sync.SaveTombstoned(cfg, id, saves[0]) {
+		state = "deleted"
+	}
+	fmt.Printf("LOCAL=%s\n", state)
 	exitModeQuiet(0)
 }
 
@@ -1434,12 +1468,25 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 //	<game>\t<YYYY-MM-DD HH:MM>\t<device>
 //
 // game = FileNameNoExt with any trailing 2-5 char rom-ext trimmed; device = the first
-// device sync's DeviceName when present, else empty. Zero saves → print nothing.
+// device sync's DeviceName when present, else empty. Zero saves → print nothing, exit 0.
+// A platform-fetch failure exits 3 (reachability, the --list-saves convention) — before
+// lodor#44 it exited 0 with an empty feed, so "server unreachable" rendered as the
+// launcher's empty state (an honest-UI violation).
+// syncFeedRC maps the feed's platform-fetch outcome to an exit code (lodor#44): a fetch
+// failure is reachability (3, matching --list-saves), never a fake empty feed.
+func syncFeedRC(err error) int {
+	if err != nil {
+		return 3
+	}
+	return 0
+}
+
 func runSyncFeed(client *romm.Client, cfg *config.Config) {
 	platforms, err := mappedPlatforms(client, cfg)
 	if err != nil {
 		noteAuthErr(err)
-		exitModeQuiet(0) // unreachable / no platforms — an empty feed, not a hard error
+		fmt.Fprintf(os.Stderr, "FATAL sync-feed: %s\n", safeErr(err))
+		exitModeQuiet(syncFeedRC(err))
 	}
 
 	var saves []romm.Save
@@ -1569,14 +1616,20 @@ func sdRoot() string {
 // save. Games with no server save are never touched; no catalog mirror is involved.
 // Contract:
 //
-//	RESULT pulled=<N> checked=<M> ghosts=<G>
+//	RESULT pulled=<N> checked=<M> ghosts=<G> pushed=<K> tombstones=<T>
 //
 // checked = candidates on this card that had a server save; pulled = local files
 // actually written (LocalNewer/NoServerSave count as checked, not pulled). No local
 // index yet (fresh device before any Refresh) => pulled=0 checked=0, exit 0 — honest
 // no-op, the seed/Refresh path owns first population. Total platform-list failure is
 // a reachability error: exit 3 like the other net modes.
-func runPullSaves(client *romm.Client, cfg *config.Config) {
+//
+// tombstones= (APPENDED field — earlier fields unchanged for existing parsers)
+// counts games SKIPPED because their save was deliberately deleted on this device
+// after a sync and the server holds nothing newer (reason=tombstone; one host-free
+// stderr line per skip names the game). includeDeleted (--include-deleted) bypasses
+// the tombstones — the explicit "yes, resurrect my deleted saves" escape hatch.
+func runPullSaves(client *romm.Client, cfg *config.Config, includeDeleted bool) {
 	writeProgress(0)
 	writePhase("Checking saves…")
 
@@ -1652,7 +1705,7 @@ func runPullSaves(client *romm.Client, cfg *config.Config) {
 		return cands[i].romID < cands[j].romID
 	})
 
-	pulled, checked, pushed := 0, 0, 0
+	pulled, checked, pushed, tombstones := 0, 0, 0, 0
 	for i, c := range cands {
 		rel := idPath[c.romID]
 		writePhase(fmt.Sprintf("Pulling saves (%d/%d)…", i+1, len(cands)))
@@ -1660,12 +1713,19 @@ func runPullSaves(client *romm.Client, cfg *config.Config) {
 			writeProgress((i + 1) * 100 / len(cands))
 		}
 		p := filepath.Join(sd, rel)
-		res := sync.PullSaveDirect(client, cfg, p)
+		res := sync.PullSaveDirectOpts(client, cfg, p, sync.PullOptions{IncludeDeleted: includeDeleted})
 		notePullResult(res)
 		ghosts += res.Ghosts
 		checked++
 		if res.Pulled() {
 			pulled++
+		}
+		// DELETED-SAVE TOMBSTONE: the save was deliberately deleted on this device
+		// after a sync and the server has nothing newer — skipped, named honestly on
+		// stderr (stdout stays the parsed RESULT contract). --include-deleted pulls it.
+		if res.Outcome == sync.PullTombstoned {
+			tombstones++
+			fmt.Fprintf(os.Stderr, "PULL %s: skipped reason=tombstone (save deleted on this device; server has nothing newer)\n", filepath.Base(p))
 		}
 		// UNPUSHED LOCAL PROGRESS (A2): the local save matches no server revision —
 		// never overwritten. Push it through the verified-upload funnel NOW so the
@@ -1678,8 +1738,9 @@ func runPullSaves(client *romm.Client, cfg *config.Config) {
 	}
 
 	writeProgress(100)
-	// pushed= is APPENDED (A2) — existing parsers key on pulled=/checked=/ghosts=.
-	fmt.Printf("RESULT pulled=%d checked=%d ghosts=%d pushed=%d\n", pulled, checked, ghosts, pushed)
+	// pushed= is APPENDED (A2), tombstones= is APPENDED after it (deleted-save
+	// tombstoning) — existing parsers key on pulled=/checked=/ghosts=.
+	fmt.Printf("RESULT pulled=%d checked=%d ghosts=%d pushed=%d tombstones=%d\n", pulled, checked, ghosts, pushed, tombstones)
 	exitMode(0)
 }
 
@@ -1732,4 +1793,58 @@ func runRACmd(cmd string, recv bool, port int) {
 		os.Exit(4)
 	}
 	os.Exit(0)
+}
+
+// runReportSession reports ONE finished play session to RomM (POST /api/play-sessions)
+// so cross-device Continue / recently-played reflects time played on THIS device. It is
+// pure telemetry and best-effort: it ALWAYS exits 0 (a plain os.Exit, deliberately NOT
+// exitMode — even a noted pairing expiry must not turn a quit-path telemetry call into
+// exit 6 / a persisted fail reason) and never blocks a game quit. The minarch shim
+// brackets each launch and passes the rom path plus the start/end unix epochs; this
+// resolves the rom_id locally, then posts a single-entry batch. Contract:
+// RESULT reported=<0|1>. An older RomM without the endpoint (404) reports 0 silently.
+func runReportSession(client *romm.Client, host config.Host, cfg *config.Config, romPath string, started, ended int64) {
+	if reportSessionCore(client, host, cfg, romPath, started, ended) {
+		fmt.Println("RESULT reported=1")
+	} else {
+		fmt.Println("RESULT reported=0")
+	}
+	os.Exit(0)
+}
+
+// reportSessionCore does the play-session report and returns true iff the server
+// created the session. It prints NO RESULT line and never exits. Every diagnostic is a
+// host-free PSFAIL/PSSKIP token on stderr (no URL, token, or device_id ever echoed).
+// host is the RESOLVED host main dispatched on (multi-user: the ACTIVE profile), so the
+// session is attributed to the active profile's device_id — never a blind Hosts[0].
+func reportSessionCore(client *romm.Client, host config.Host, cfg *config.Config, romPath string, started, ended int64) bool {
+	// The server REJECTS (422) any session whose end_time is not strictly after
+	// start_time, so enforce the window here before spending a request.
+	if started <= 0 || ended <= 0 || ended <= started {
+		fmt.Fprintf(os.Stderr, "PSFAIL window start=%d end=%d\n", started, ended)
+		return false
+	}
+	id, ok := catalog.ResolveRomID(cfg, romPath)
+	if !ok || id == 0 {
+		fmt.Fprintf(os.Stderr, "PSFAIL resolve: %s\n", filepath.Base(romPath))
+		return false
+	}
+	entry := romm.PlaySessionEntry{
+		RomID:      id,
+		StartTime:  time.Unix(started, 0).UTC().Format(time.RFC3339),
+		EndTime:    time.Unix(ended, 0).UTC().Format(time.RFC3339),
+		DurationMs: (ended - started) * 1000,
+	}
+	resp, err := client.ReportPlaySessions(host.DeviceID, []romm.PlaySessionEntry{entry})
+	if err != nil {
+		var se *romm.StatusError
+		if errors.As(err, &se) && se.Code == 404 {
+			// Older RomM without /api/play-sessions — graceful no-op, not a failure.
+			fmt.Fprintln(os.Stderr, "PSSKIP play-sessions unsupported by server")
+			return false
+		}
+		fmt.Fprintf(os.Stderr, "PSFAIL report rom=%d: %s\n", id, safeErr(err))
+		return false
+	}
+	return resp.CreatedCount > 0
 }

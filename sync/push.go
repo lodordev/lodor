@@ -101,7 +101,10 @@ func uploadVerified(client *romm.Client, cfg *config.Config, rom romm.Rom, saveP
 	// identical revision on the timeline (observed: duplicate CIMA rows, Smart Pro
 	// 2026-07-02). A failed check (offline) falls through to the upload, whose own
 	// error handling stays authoritative.
-	if AlreadyOnServer(client, rom.ID, savePath) {
+	if s, ok := serverSaveWithContent(client, rom.ID, savePath); ok {
+		// SYNCED MOMENT: identical bytes verifiably live on both sides even though
+		// nothing moved — ledger this revision as the device's tombstone baseline.
+		recordSyncedSave(cfg, rom.ID, s, savePath)
 		res.Outcome = OutcomeAlreadyOnServer
 		return res
 	}
@@ -132,9 +135,10 @@ func uploadVerified(client *romm.Client, cfg *config.Config, rom romm.Rom, saveP
 		// The upload errored — but the content may ALREADY be on the server (an
 		// earlier attempt landed despite a flaky response, or another path uploaded
 		// it). If so the save is safe; count it done so the banner clears.
-		// AlreadyOnServer requires a NON-GHOST content-hash match, so this is a
-		// verified outcome too.
-		if AlreadyOnServer(client, rom.ID, savePath) {
+		// serverSaveWithContent requires a NON-GHOST content-hash match, so this is
+		// a verified outcome too — and a synced moment for the save ledger.
+		if s, ok := serverSaveWithContent(client, rom.ID, savePath); ok {
+			recordSyncedSave(cfg, rom.ID, s, savePath)
 			res.Outcome = OutcomeAlreadyOnServer
 			return res
 		}
@@ -151,6 +155,9 @@ func uploadVerified(client *romm.Client, cfg *config.Config, rom romm.Rom, saveP
 		if err2 == nil {
 			res.Conflicted = res.Conflicted || conflicted2
 			verr = verifyUploadedSave(client, rom.ID, uploaded2, savePath)
+			if verr == nil {
+				uploaded = uploaded2 // the retry's record is the one that verified — it seeds the ledger below
+			}
 		}
 	}
 	if verr != nil {
@@ -161,6 +168,12 @@ func uploadVerified(client *romm.Client, cfg *config.Config, rom romm.Rom, saveP
 		res.Err = firstLine(verr.Error())
 		return res
 	}
+
+	// SYNCED MOMENT: the upload is server-VERIFIED — ledger the created revision as
+	// this device's tombstone baseline (saveledger.go). Covers the staged-flashback
+	// route too (PushSaveFile funnels here): a queued pre-delete save that uploads
+	// later still advances the baseline, so the tombstone judges against it.
+	recordSyncedSave(cfg, rom.ID, uploaded, savePath)
 
 	// HEAL (task #126): with this push verified under the canonical name, delete any
 	// marker-named duplicates of this ROM whose bytes verifiably survive under a
@@ -196,23 +209,38 @@ func uploadWithConflictRetry(client *romm.Client, q *romm.UploadSaveQuery, saveP
 // GHOST-IMMUNE (#63): a record whose bytes are missing/zero-length never counts —
 // its hash cannot vouch for content the server doesn't hold.
 func AlreadyOnServer(client *romm.Client, romID int, localPath string) bool {
+	_, ok := serverSaveWithContent(client, romID, localPath)
+	return ok
+}
+
+// serverSaveWithContent is AlreadyOnServer returning the matched record: the
+// NEWEST non-ghost server save whose content_hash equals the local file's MD5
+// (newest so a ledger write from a dedup'd push anchors the tombstone against
+// the most recent copy of these bytes). ok is false when the file is unreadable,
+// the server unreachable, or nothing matches.
+func serverSaveWithContent(client *romm.Client, romID int, localPath string) (romm.Save, bool) {
 	local, ok := fileMD5(localPath)
 	if !ok {
-		return false
+		return romm.Save{}, false
 	}
 	saves, err := client.GetSaves(romm.SaveQuery{RomID: romID})
 	if err != nil {
-		return false
+		return romm.Save{}, false
 	}
+	var best romm.Save
+	found := false
 	for _, s := range saves {
 		if IsGhostSave(s) || IsMetaSave(s) {
 			continue // neither a ghost's nor a meta record's hash can vouch for save bytes (#63/#146)
 		}
 		if s.ContentHash != nil && strings.EqualFold(*s.ContentHash, local) {
-			return true
+			if !found || s.UpdatedAt.After(best.UpdatedAt) {
+				best = s
+				found = true
+			}
 		}
 	}
-	return false
+	return best, found
 }
 
 // findLocalSavesForRom returns the save files on the card that belong to this ROM,

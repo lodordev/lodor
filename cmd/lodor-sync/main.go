@@ -52,6 +52,7 @@ func main() {
 		mirrorCollections bool
 		pushPending       bool
 		pullSaves         bool
+		includeDeleted    bool
 		syncContinue      bool
 		downloadBios      bool
 		downloadQueue     bool
@@ -106,6 +107,9 @@ func main() {
 		showVersion       bool
 		checkUpdate       bool
 		fetchUpdate       bool
+		reportSession     string
+		sessionStarted    int64
+		sessionEnded      int64
 	)
 	flag.BoolVar(&mirrorCatalog, "mirror-catalog", false, "stub every not-downloaded RomM game into Roms/ and write catalog-index.json; prints MIRROR created=.. existing=.. skipped=.. multifile=.. covers=..  (UPDATE: only new games + missing covers)")
 	flag.BoolVar(&mirrorFull, "full", false, "with --mirror-catalog: FULL refresh — re-fetch every cover even if already present (default is the fast incremental update)")
@@ -116,14 +120,15 @@ func main() {
 	flag.StringVar(&loginUser, "login-user", "", "with --login-profile: the existing RomM username to sign in as")
 	flag.StringVar(&loginDevice, "login-device", "", "with --login-profile: optional device id to attach to the profile")
 	flag.BoolVar(&pushPending, "push-pending", false, "upload every save in pending-saves.txt; prints RESULT pushed=<N> total=<M> stuck=<K>")
-	flag.BoolVar(&pullSaves, "pull-saves", false, "TARGETED bulk pull (fast 'Sync now' leg): for every on-card game with a real server save, decide by CONTENT-HASH LINEAGE (local==newest: no-op; local==older revision: pull newest, .bak kept; local unknown to server: push it instead — never overwrite; ghosts filtered) — no catalog mirror; prints RESULT pulled=<N> checked=<M> ghosts=<G> pushed=<K>")
+	flag.BoolVar(&pullSaves, "pull-saves", false, "TARGETED bulk pull (fast 'Sync now' leg): for every on-card game with a real server save, decide by CONTENT-HASH LINEAGE (local==newest: no-op; local==older revision: pull newest, .bak kept; local unknown to server: push it instead — never overwrite; ghosts filtered) — no catalog mirror; a save DELETED on this device after a sync is SKIPPED unless the server has a newer revision (deleted-save tombstone; see --include-deleted); prints RESULT pulled=<N> checked=<M> ghosts=<G> pushed=<K> tombstones=<T>")
+	flag.BoolVar(&includeDeleted, "include-deleted", false, "with --pull-saves: bypass deleted-save tombstones — pull a game's newest server save even when this device's save ledger says its local copy was deliberately deleted after a sync (the explicit resurrection escape hatch; per-save explicit restore via --restore-save never needs this)")
 	flag.BoolVar(&syncContinue, "sync-continue", false, "LIGHT Continue refresh (fast 'Sync now' leg): rebuild the cross-device '0) Continue' collection and merge it into the host's native Recently Played from the local index + server saves — no catalog mirror; prints CONTINUE entries=<N> then RECENTS merged=<M> total=<T>")
 	flag.BoolVar(&downloadBios, "download-bios", false, "download BIOS/firmware for every mapped platform; prints RESULT bios=<count>")
 	flag.StringVar(&checkBios, "check-bios", "", "OFFLINE pre-launch BIOS gate: does this ROM's system REQUIRE a BIOS the user must supply, and is it present where the emulator reads it? prints RESULT bios_ok=1, or RESULT bios_ok=0 missing=<f1,f2> system=<name>. System TAG from LODOR_ROM_TAG or the ROM folder; extra search dirs via LODOR_BIOS_DIRS (colon-sep)")
 	flag.BoolVar(&downloadQueue, "download-queue", false, "download every ROM queued in download-queue.txt (resolve, fetch, hash-verify each, reusing the --download path), dropping landed entries and keeping failures for retry; prints RESULT downloaded=<N> failed=<M> remaining=<K>")
 	flag.BoolVar(&syncFeed, "sync-feed", false, "list recent server saves across mapped platforms, newest first, tab-separated")
 	flag.BoolVar(&recent, "recent", false, "print the single most-recently-played game across devices as <localRomPath>\\t<game>\\t<when>\\t<device> (drives the Continue tile); empty if unreachable/none")
-	flag.StringVar(&syncSave, "sync-save", "", "pull-then-push the save for one ROM (content-hash lineage, never clock-based); prints RESULT pulled=<0|1> pushed=<0|1> ghosts=<N> reason=<token> (pushed=1 only after a verified REAL upload; an unchanged save dedups server-side and reports reason=in-sync)")
+	flag.StringVar(&syncSave, "sync-save", "", "pull-then-push the save for one ROM (content-hash lineage, never clock-based); a save deleted on this device after a sync is not re-pulled unless the server has a newer revision (reason=tombstone); prints RESULT pulled=<0|1> pushed=<0|1> ghosts=<N> reason=<token> (pushed=1 only after a verified REAL upload; an unchanged save dedups server-side and reports reason=in-sync)")
 	flag.StringVar(&pushSave, "push-save", "", "HYBRID post-game push for one ROM: push the changed save directly; on a LANDED push write last-synced.txt (the launcher's synced-✓ signal); if it does NOT land, stage the save into pending-saves.txt for later; prints RESULT pushed=<0|1> staged=<N>")
 	flag.StringVar(&pushStates, "push-states", "", "Handoff v1: upload this ROM's local save STATES (normalized, deduped vs the state ledger); requires statecores.json in the pak dir, else no-ops honestly; an offline attempt auto-queues into pending-states.txt; prints RESULT pushedstates=<N> skippedstates=<N> failedstates=<N> retiredstates=<N> queuedstate=<0|1> reason=<token>")
 	flag.StringVar(&queueState, "queue-state", "", "Handoff v1: queue this ROM into pending-states.txt (offline, instant, deduplicated) so --push-pending-states retries its state push when online; prints RESULT queuedstate=<0|1>")
@@ -133,7 +138,7 @@ func main() {
 	flag.StringVar(&pullStateRom, "pull-state", "", "Handoff v1: place ONE server state locally for this ROM (use with --state-id, optional --state-slot); prints RESULT placedstate=<0|1> reason=<token>")
 	flag.IntVar(&pullStateID, "state-id", 0, "server state id for --pull-state")
 	flag.StringVar(&pullStateSlot, "state-slot", "", "override target slot for --pull-state (0-8 or auto)")
-	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated, then a LOCAL=<none|current|older|unpushed> trailer (single field — row parsers drop it); exit 3 when the server is unreachable (empty list + exit 0 always means zero saves)")
+	flag.StringVar(&listSaves, "list-saves", "", "list every server save for one ROM, newest first, tab-separated, then a LOCAL=<none|current|older|unpushed|deleted> trailer (single field — row parsers drop it; deleted = the local save was deliberately removed on this device after a sync and the server has nothing newer, so auto-pull hooks must not resurrect it); exit 3 when the server is unreachable (empty list + exit 0 always means zero saves)")
 	flag.StringVar(&restoreSave, "restore-save", "", "restore a specific server save by id for one ROM (save id is the positional arg); prints RESULT restored=<0|1>")
 	flag.StringVar(&downloadRom, "download", "", "download one ROM's real file (resolve, fetch, hash-verify); prints RESULT downloaded=<0|1>")
 	flag.StringVar(&reconcile, "reconcile", "", "post-launch: flip ONE downloaded ROM's on-disk state marker (✘→✓) to match the bytes now present, carrying its save+cover with the rename; offline, no device; prints RESULT reconciled=<0|1>")
@@ -166,6 +171,9 @@ func main() {
 	flag.BoolVar(&showVersion, "version", false, "print 'lodor-sync <version>' and exit (release builds are stamped via ldflags; anything else says dev)")
 	flag.BoolVar(&checkUpdate, "check-update", false, "SELF-UPDATE: fetch versions.json and compare against this build; prints RESULT update=<0|1> current=<v> latest=<v> channel=<ch> (+ NOTES\\t<line> when newer); exit 3 = manifest unreachable (shell stays silent). Reads update_channel from settings.conf; never writes it. Works unpaired.")
 	flag.BoolVar(&fetchUpdate, "fetch-update", false, "SELF-UPDATE (LodorOS lane): download + sha256-verify + extract this lane's update asset (key from LODOR_UPDATE_ASSET) into ./.update/tree and write the READY marker; the SHELL applies it — this mode never swaps a binary. Prints RESULT fetched=<0|1> version=<v> bytes=<n>; exit 4 = hash mismatch (staging removed).")
+	flag.StringVar(&reportSession, "report-session", "", "report ONE finished play session for the given ROM path to RomM (POST /api/play-sessions), feeding cross-device Continue/recently-played; needs --started/--ended unix epochs; best-effort, always exits 0; prints RESULT reported=<0|1>")
+	flag.Int64Var(&sessionStarted, "started", 0, "unix epoch (seconds) the play session started — used by --report-session")
+	flag.Int64Var(&sessionEnded, "ended", 0, "unix epoch (seconds) the play session ended — used by --report-session")
 	flag.Parse()
 
 	// --version / update modes run before EVERYTHING (config.Load included):
@@ -379,7 +387,7 @@ func main() {
 		requireDevice(host)
 		// Save downloads are file transfers too — the long timeout, like --push-pending.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
-		runPullSaves(dlClient, cfg)
+		runPullSaves(dlClient, cfg, includeDeleted)
 	case syncContinue:
 		runSyncContinue(client, cfg)
 	case syncPlaytime:
@@ -399,8 +407,14 @@ func main() {
 		runSetStatus(client, cfg, setStatus, flag.Arg(0))
 	case setProps != "":
 		runSetProps(client, cfg, setProps, flag.Args())
+	case reportSession != "":
+		// Play-session telemetry is device-keyed like the other net write modes; the
+		// device_id comes from the RESOLVED host (multi-user: the ACTIVE profile's
+		// device — never a blind Hosts[0]).
+		requireDevice(host)
+		runReportSession(client, host, cfg, reportSession, sessionStarted, sessionEnded)
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --push-all-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --push-all-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --report-session --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
 		os.Exit(2)
 	}
 }

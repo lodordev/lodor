@@ -25,7 +25,7 @@ func prunePassEnv(t *testing.T) (colDir string, run func()) {
 	}
 	run = func() {
 		t.Helper()
-		if _, _, _, _, err := MirrorCollections(fake, cfg, nil); err != nil {
+		if _, _, _, _, _, _, _, err := MirrorCollections(fake, cfg, nil); err != nil {
 			t.Fatalf("MirrorCollections: %v", err)
 		}
 	}

@@ -89,6 +89,8 @@ func isNonGameAsset(p string) bool {
 type romClient interface {
 	GetRoms(query romm.GetRomsQuery) (romm.PaginatedRoms, error)
 	GetCollections() ([]romm.Collection, error)
+	GetVirtualCollections(collectionType string) ([]romm.Collection, error)
+	GetSmartCollections() ([]romm.Collection, error)
 	DownloadCover(coverPath string) ([]byte, error)
 	DownloadCoverCtx(ctx context.Context, coverPath string) ([]byte, error)
 }
@@ -530,17 +532,27 @@ func mirrorPct(platformsDone, platformsTotal, doneWork, totalWork int) int {
 
 // MirrorCollections writes one Collections/<sanitized>.txt per RomM collection,
 // listing the SDCARD-relative path of each member ROM that is actually present on
-// the card. Empty collections are skipped. Returns written, empty, and total counts
-// (total = number of collections fetched), plus cont — the entry count of the
+// the card. It covers THREE sources: the user's MANUAL collections
+// (GET /api/collections), the user's SMART collections (saved-filter shelves,
+// GET /api/collections/smart) and RomM's auto-generated VIRTUAL collections
+// (metadata-derived shelves by genre/franchise/etc.,
+// GET /api/collections/virtual?type=all). Empty collections (no on-card members)
+// are skipped, and a smart/virtual name that would clobber an already-written file
+// is skipped (manual wins, then smart, then virtual) so the auto shelves never
+// overwrite a user's manual one. The virtual/smart endpoints are OPTIONAL: an older
+// RomM that lacks them returns 404 and is gracefully treated as "none" rather than
+// failing the mirror. Returns written, empty, and total counts (total = number of
+// collections fetched across all three sources), cont — the entry count of the
 // cross-device "0) Continue" collection written in the same pass (see continue.go;
-// 0 = empty feed, no Continue file). BLUEPRINT §4 + task #37.
-func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total, cont int, err error) {
+// 0 = empty feed, no Continue file) — plus the per-source written breakdown.
+// BLUEPRINT §4 + task #37.
+func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (written, empty, total, cont, manual, virtual, smart int, err error) {
 	rep.percent(0)
 	rep.phase("Reading collections…")
 
 	collections, cerr := client.GetCollections()
 	if cerr != nil {
-		return 0, 0, 0, 0, cerr
+		return 0, 0, 0, 0, 0, 0, 0, cerr
 	}
 	total = len(collections)
 
@@ -555,7 +567,7 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 		sdRoot := sdcardRoot()
 		platforms, perr := getMappedPlatforms(client, cfg)
 		if perr != nil {
-			return 0, 0, total, 0, perr
+			return 0, 0, total, 0, 0, 0, 0, perr
 		}
 		nPlat := len(platforms)
 		for pi2, p := range platforms {
@@ -582,8 +594,16 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 
 	colDir := ContinueDir()
 	if mkErr := os.MkdirAll(colDir, 0o755); mkErr != nil {
-		return 0, 0, total, 0, mkErr
+		return 0, 0, total, 0, 0, 0, 0, mkErr
 	}
+
+	// AUTO shelves are OPTIONAL: pull them up front, but a 404 (endpoint absent on an
+	// older RomM) or any other error degrades to "none" — never fails the whole mirror.
+	smartCols := fetchOptionalCollections(client.GetSmartCollections)
+	virtualCols := fetchOptionalCollections(func() ([]romm.Collection, error) {
+		return client.GetVirtualCollections("all")
+	})
+	total = len(collections) + len(smartCols) + len(virtualCols)
 
 	// Ownership: the mirror-owned manifest (C2 — formalizes the STEP 0b
 	// collections ledger into the ONE mechanism). A legacy card whose ownership
@@ -605,39 +625,64 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 	}
 
 	kept := map[string]bool{}
-	for ci, col := range collections {
-		rep.phase(fmt.Sprintf("Building collections (%d/%d)…", ci+1, total))
-		if total > 0 {
-			rep.percent(50 + (ci+1)*50/total)
-		}
-		var lines []string
-		for _, rid := range col.RomIDs {
-			if rel, ok := idPath[rid]; ok {
-				lines = append(lines, rel)
+	// Track names already written so an auto shelf never clobbers a manual one (and the
+	// two auto sources never clobber each other). Precedence: manual, then smart, then
+	// virtual. Every shelf written here — manual or auto — is recorded in the manifest,
+	// so an auto shelf that later disappears server-side is pruned like any stale file.
+	taken := map[string]bool{}
+
+	writeSet := func(cols []romm.Collection, phaseLabel string, baseDone, span int, optional bool) (w, e int, werr error) {
+		n := len(cols)
+		for ci, col := range cols {
+			rep.phase(fmt.Sprintf("%s (%d/%d)…", phaseLabel, ci+1, n))
+			if n > 0 && span > 0 {
+				rep.percent(baseDone + (ci+1)*span/n)
 			}
+			var lines []string
+			for _, rid := range col.RomIDs {
+				if rel, ok := idPath[rid]; ok {
+					lines = append(lines, rel)
+				}
+			}
+			if len(lines) == 0 {
+				e++
+				continue
+			}
+			name := sanitizeCollectionName(col.Name)
+			if name == "" || taken[strings.ToLower(name)] {
+				continue // unnamed, or would clobber a higher-precedence shelf
+			}
+			if ferr := fsutil.WriteFileAtomicString(filepath.Join(colDir, name+".txt"),
+				strings.Join(lines, "\n")+"\n", 0o644); ferr != nil {
+				if optional {
+					continue // a single bad auto-shelf name must not abort the mirror
+				}
+				return w, e, ferr
+			}
+			taken[strings.ToLower(name)] = true
+			kept[name+".txt"] = true
+			man.Record(filepath.Join(colDir, name+".txt"), platform.ManifestCollection, 0)
+			w++
 		}
-		if len(lines) == 0 {
-			empty++
-			continue
-		}
-		name := sanitizeCollectionName(col.Name)
-		if name == "" {
-			continue
-		}
-		if werr := fsutil.WriteFileAtomicString(filepath.Join(colDir, name+".txt"),
-			strings.Join(lines, "\n")+"\n", 0o644); werr != nil {
-			return written, empty, total, 0, werr
-		}
-		kept[name+".txt"] = true
-		man.Record(filepath.Join(colDir, name+".txt"), platform.ManifestCollection, 0)
-		written++
+		return w, e, nil
 	}
+
+	// Split the 50→95 progress band across the three sources; Continue + prune close it out.
+	var mEmpty, sEmpty, vEmpty int
+	manual, mEmpty, err = writeSet(collections, "Building collections", 50, 15, false)
+	if err != nil {
+		return manual, mEmpty, total, 0, manual, 0, 0, err
+	}
+	smart, sEmpty, _ = writeSet(smartCols, "Building smart shelves", 65, 15, true)
+	virtual, vEmpty, _ = writeSet(virtualCols, "Building auto shelves", 80, 15, true)
+	written = manual + smart + virtual
+	empty = mEmpty + sEmpty + vEmpty
 
 	// Cross-device "Continue" collection (task #37): written in the SAME pass, BEFORE
 	// the prune, and marked kept — otherwise the prune below (correctly) removes any
 	// collection file the server didn't produce. An empty feed writes nothing, so the
 	// prune clears a stale Continue from a previous run. Runs after the collection
-	// loop so a RomM collection that happens to share the name is overwritten.
+	// loops so a RomM collection that happens to share the name is overwritten.
 	rep.phase("Updating Continue…")
 	preContinue := map[string]bool{}
 	for n := range kept {
@@ -657,7 +702,9 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 	// refresh. A file is only removable when the mirror-owned manifest claims it
 	// (kind=collection/continue). No manifest = prune nothing (fail-safe: stale Lodor
 	// collections may linger one refresh; user data is never at risk). map.txt is
-	// hard-excluded regardless of what the manifest says.
+	// hard-excluded regardless of what the manifest says. Auto (smart/virtual) shelves
+	// are manifest-recorded like manual ones, so one that disappears server-side (or is
+	// newly shadowed by a higher-precedence name) is pruned here like any stale file.
 	if entries, derr := os.ReadDir(colDir); derr == nil {
 		for _, e := range entries {
 			n := e.Name()
@@ -685,7 +732,19 @@ func MirrorCollections(client romClient, cfg *config.Config, rep *Reporter) (wri
 	}
 	rep.percent(100)
 	rep.phase(fmt.Sprintf("Collections updated — %d", written))
-	return written, empty, total, cont, nil
+	return written, empty, total, cont, manual, virtual, smart, nil
+}
+
+// fetchOptionalCollections runs an OPTIONAL collection fetch (virtual/smart), returning
+// an empty slice when the server lacks the endpoint (404) or the call otherwise fails.
+// These auto shelves are a bonus on top of the user's manual collections; their absence
+// must never fail --mirror-collections, so every error degrades to "no shelves".
+func fetchOptionalCollections(fetch func() ([]romm.Collection, error)) []romm.Collection {
+	cols, err := fetch()
+	if err != nil {
+		return nil
+	}
+	return cols
 }
 
 // ResolveRomID reverses a local ROM path back to its rom_id using the catalog

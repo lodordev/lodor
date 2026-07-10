@@ -94,6 +94,7 @@ type wizard struct {
 	useTailscale bool           // user chose the Tailscale path at the Connect step
 	tsURL        string         // current Tailscale login URL (shown for the browser sign-in)
 	tsPhase      string         // honest one-line status on the sign-in screen
+	registered   bool           // lodor#39: --register-device outcome, a validate-screen row
 }
 
 // action is what a message screen reports back: advance (A/Start) or back (B). Every
@@ -109,7 +110,7 @@ const wizGlyphH = 8 // mirrors ui.glyphH for layout math
 
 func main() {
 	args := os.Args[1:]
-	w := &wizard{t: ui.DefaultTheme(), device: "RG34XX", server: "https://"}
+	w := &wizard{t: ui.DefaultTheme(), device: defaultDeviceName(), server: "https://"}
 	w.bin = engineBin()
 	w.dataDir = dataDir()
 
@@ -202,6 +203,30 @@ func dataDir() string {
 		return d
 	}
 	return os.Getenv("LODOR_DATA_DIR")
+}
+
+// defaultDeviceName seeds the "Name this device" keyboard (lodor#36) instead of the old
+// hardcoded "RG34XX": board devicetree model — the exact source the shell lib's
+// lodor_ensure_device uses — else hostname, else the historical fallback. The keyboard
+// override always wins; this is only the preset.
+func defaultDeviceName() string {
+	return defaultDeviceNameFrom("/sys/firmware/devicetree/base/model")
+}
+
+// defaultDeviceNameFrom resolves the preset from a devicetree model file (NULs and
+// whitespace trimmed), then hostname, then "RG34XX". Never returns "".
+func defaultDeviceNameFrom(modelPath string) string {
+	if b, err := os.ReadFile(modelPath); err == nil {
+		if s := strings.TrimSpace(strings.ReplaceAll(string(b), "\x00", "")); s != "" {
+			return s
+		}
+	}
+	if h, err := os.Hostname(); err == nil {
+		if s := strings.TrimSpace(h); s != "" {
+			return s
+		}
+	}
+	return "RG34XX"
 }
 
 // ---- startup phase instrumentation (BUG 2a) -------------------------------------------
@@ -323,12 +348,12 @@ func (w *wizard) render(s step, kb *ui.Keyboard) *ui.Canvas {
 	t := w.t
 	switch s {
 	case stepWelcome:
-		t.Message(c, "Welcome", "This sets up Lodor. Your whole library appears in the games menu, each game downloads on first launch, and saves sync automatically around every session.\n\nPress A to begin, or B to exit back to muOS.", t.Text)
+		t.Message(c, "Welcome", "This sets up Lodor. Your whole library appears in the games menu, each game downloads on first launch, and saves sync automatically around every session.\n\nPress A to begin, or B to exit back to "+w.hc().osName+".", t.Text)
 	case stepWifi:
 		if w.wifiUp {
 			t.Message(c, "Wi-Fi connected", "Your handheld is online. Press A to continue, or B to go back.", t.Good)
 		} else {
-			t.Message(c, "Connect Wi-Fi first", "Open muOS Settings, Network, and join your Wi-Fi. Then press A to re-check.\n\nPress B to go back (you can sync later from the Lodor app).", t.Bad)
+			t.Message(c, "Connect Wi-Fi first", w.hc().wifiOpen+" Then press A to re-check.\n\nPress B to go back (you can sync later from the Lodor app).", t.Bad)
 		}
 	case stepServer:
 		x, y, ww, hh := t.Frame(c, "Lodor Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
@@ -340,7 +365,7 @@ func (w *wizard) render(s step, kb *ui.Keyboard) *ui.Canvas {
 		x, y, ww, hh := t.Frame(c, "Lodor Setup", "D-pad: move   A: type   B: delete   BACK: go back   Start: OK")
 		kb.Draw(c, t, x, y, ww, hh)
 	case stepValidate:
-		body := "Server reachable: " + yn(w.reach) + "\nLogin accepted: " + yn(w.auth)
+		body := validateBody(w.reach, w.auth, w.registered)
 		col := t.Good
 		title := "Connected!"
 		if !w.reach || !w.auth {
@@ -386,6 +411,127 @@ func yn(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// ---- host-OS copy + version visibility (lodor#32 / #45) --------------------------------
+// The SAME wizard binary ships on muOS and Knulli, so every string that names the host
+// OS or its menus comes from this table, keyed on LODOR_HOST_OS (each launcher exports
+// its value; unset/unknown degrades to muos, the lane this app shipped on first).
+
+type hostCopy struct {
+	osName      string // what the user exits back to ("muOS" / "Knulli")
+	wifiOpen    string // wifi-down onboarding screen: where Wi-Fi entry lives
+	noWifi      string // requireOnline gate: the same fact as a one-liner
+	updateVenue string // update-badge suffix: where an update installs from
+}
+
+var hostCopyTable = map[string]hostCopy{
+	"muos": {
+		osName:      "muOS",
+		wifiOpen:    "Open muOS Settings, Network, and join your Wi-Fi.",
+		noWifi:      "Connect Wi-Fi in muOS Settings, then try again.",
+		updateVenue: "App Downloader",
+	},
+	"knulli": {
+		osName:      "Knulli",
+		wifiOpen:    "Open the main menu, Network Settings, and join your Wi-Fi.",
+		noWifi:      "Connect Wi-Fi in Network Settings, then try again.",
+		updateVenue: "GitHub zip",
+	},
+}
+
+// hostOS reads LODOR_HOST_OS (launcher-exported; see mux_launch.sh / ports/Lodor.sh).
+func hostOS() string { return os.Getenv("LODOR_HOST_OS") }
+
+// hostCopyFor resolves the copy for a host-OS name, defaulting to muos.
+func hostCopyFor(name string) hostCopy {
+	if c, ok := hostCopyTable[name]; ok {
+		return c
+	}
+	return hostCopyTable["muos"]
+}
+
+// hc is the wizard's resolved host copy (env read per call — cheap, and tests just Setenv).
+func (w *wizard) hc() hostCopy { return hostCopyFor(hostOS()) }
+
+// updateInstructions is the "how do I install it" update body per host OS (lodor#32):
+// muOS installs via the App Downloader / Archive Manager; Knulli extracts the release
+// zip over /userdata (config/pairing live outside the payload, so they are kept).
+func updateInstructions(host, latest, current string) string {
+	if host == "knulli" {
+		return fmt.Sprintf("Lodor %s is out (you have %s).\nDownload Lodor-Knulli-%s.zip from GitHub and extract it onto /userdata over the network share - your pairing is kept.", latest, current, latest)
+	}
+	return fmt.Sprintf("Lodor %s is out (you have %s).\nInstall it with the muOS App Downloader,\nor grab the .muxapp from GitHub and use\nArchive Manager.", latest, current)
+}
+
+// menuTitle carries the running version in the menu header (lodor#45): offline, straight
+// from buildinfo — "Lodor 0.9.7"; a dev build honestly reads "Lodor dev".
+func menuTitle() string { return "Lodor " + buildinfo.Version }
+
+// versionFlash is the one-shot "Updated to <v>" notice (lodor#45): last_seen_version is
+// stamped in settings.conf and only a CHANGE from a previously-seen version announces —
+// a fresh install stays quiet (nothing was updated), dev builds never stamp or flash,
+// and a failed stamp skips the flash rather than repeating it every open. Returns the
+// flash body, "" when there is nothing to show.
+func (w *wizard) versionFlash(v string) string {
+	if v == "" || v == "dev" {
+		return ""
+	}
+	last := w.getSetting("last_seen_version")
+	if last == v {
+		return ""
+	}
+	if err := w.setSetting("last_seen_version", v); err != nil {
+		return ""
+	}
+	if last == "" {
+		return ""
+	}
+	return "Updated to " + v + "."
+}
+
+// validateBody is the validate screen's status block (pure for tests). lodor#39: the
+// register outcome is a first-class row — an unregistered device syncs no saves, and
+// the extra line says so honestly (lodor_ensure_device retries on later launches).
+func validateBody(reach, auth, registered bool) string {
+	body := "Server reachable: " + yn(reach) + "\nLogin accepted: " + yn(auth) + "\nDevice registered: " + yn(registered)
+	if !registered {
+		body += "\nSaves start syncing once this device can register - retried automatically."
+	}
+	return body
+}
+
+// pairCodeHint answers "where do pairing codes come from" (lodor#40), drawn above the
+// prompt on every code-entry keyboard.
+const pairCodeHint = "In RomM on your computer: Settings > Devices > Pair"
+
+// pairFailure maps a failed --pair run to honest copy plus where B should return
+// (lodor#31). The engine exit code is authoritative (runPair: 3 exchange-unreachable,
+// 4 ran-but-errored, 6 pairing-expired) and its PAIRFAIL stderr line carries the real
+// reason. rc=3 NEVER says "generate a fresh code" — the server never saw the code, so
+// the code is not the problem; B goes back to the server step instead.
+func pairFailure(rc int, out string) (msg string, retry step) {
+	switch rc {
+	case 3:
+		return "Couldn't reach your server - check the address and Wi-Fi.", stepServer
+	case 6:
+		return "Pairing expired - generate a fresh code in RomM and try again.", stepCode
+	}
+	if why := pairFailLine(out); why != "" {
+		return "Pairing failed: " + why + "\nGenerate a fresh code in RomM and try again.", stepCode
+	}
+	return "Pairing failed. Generate a fresh code in RomM and try again.", stepCode
+}
+
+// pairFailLine extracts the engine's last PAIRFAIL reason line ("" when absent).
+func pairFailLine(out string) string {
+	why := ""
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "PAIRFAIL ") {
+			why = strings.TrimSpace(strings.TrimPrefix(ln, "PAIRFAIL "))
+		}
+	}
+	return why
 }
 
 // ---- interactive loop -----------------------------------------------------------------
@@ -547,6 +693,7 @@ type menuState struct {
 	coversOn       bool
 	tsAvail        bool
 	updateAvail    string // settings.conf update_available, "" when none/already installed
+	updateVenue    string // host install venue for the update badge (lodor#32/#45)
 }
 
 // buildMenuRows is the PURE menu spine: local state -> ordered rows + their engine action.
@@ -572,9 +719,14 @@ func buildMenuRows(st menuState) []menuRow {
 	add("Download BIOS", actDownloadBios)
 	add("Recent activity", actRecent)
 	if st.updateAvail != "" {
-		// store lane: install happens via muOS App Downloader / Archive Manager, never a
-		// self-swap — selecting the row re-checks and shows what's new + where to get it
-		add(fmt.Sprintf("Update available (%s)", st.updateAvail), actCheckUpdates)
+		// store lane: install happens via the host's own venue (muOS App Downloader /
+		// Knulli GitHub zip), never a self-swap — selecting the row re-checks and shows
+		// what's new + where to get it; the suffix names the venue (lodor#45).
+		label := fmt.Sprintf("Update available (%s)", st.updateAvail)
+		if st.updateVenue != "" {
+			label += " - " + st.updateVenue
+		}
+		add(label, actCheckUpdates)
 	}
 	add(fmt.Sprintf("Switch user (%s)", st.userLabel), actSwitchUser)
 	add("Add profile", actAddProfile)
@@ -600,6 +752,10 @@ func buildMenuRows(st menuState) []menuRow {
 // muOS. State is recomputed each time we return to the menu (a Sync/Delete/Switch changed
 // a count/label), so the conditional rows and labels stay honest.
 func (w *wizard) runMainMenu(draw func(*ui.Canvas), btn func() ui.Button) {
+	// lodor#45: one-shot "Updated to <v>" flash when the installed version changed.
+	if msg := w.versionFlash(buildinfo.Version); msg != "" {
+		w.showMsg("Updated", msg, w.t.Good, draw, btn)
+	}
 	firstPaint := true
 	for {
 		w.phaseMenuBuild()  // last line before menuState() — if the log stops HERE, a menu-build
@@ -635,7 +791,7 @@ func (w *wizard) runMainMenu(draw func(*ui.Canvas), btn func() ui.Button) {
 				return btn()
 			}
 		}
-		sel, ok := w.pickScroll("Lodor", "Up/Down: move   A: select   B: exit", m, mdraw, mbtn)
+		sel, ok := w.pickScroll(menuTitle(), "Up/Down: move   A: select   B: exit", m, mdraw, mbtn)
 		if !ok {
 			return // B on the main menu = clean exit to muOS
 		}
@@ -715,6 +871,7 @@ func (w *wizard) menuState() menuState {
 		coversOn:       w.fetchCoversOn(),
 		tsAvail:        w.tsAvailable(),
 		updateAvail:    w.updateAvailable(),
+		updateVenue:    w.hc().updateVenue,
 	}
 }
 
@@ -900,7 +1057,7 @@ func (w *wizard) requireOnline(draw func(*ui.Canvas), btn func() ui.Button) bool
 	if wifiUp() {
 		return true
 	}
-	w.showMsg("No Wi-Fi", "Connect Wi-Fi in muOS Settings, then try again.", w.t.Bad, draw, btn)
+	w.showMsg("No Wi-Fi", w.hc().noWifi, w.t.Bad, draw, btn)
 	return false
 }
 
@@ -981,7 +1138,7 @@ func (w *wizard) doCheckUpdates(draw func(*ui.Canvas), btn func() ui.Button) {
 		w.showMsg("Updates", fmt.Sprintf("You're up to date (%s).", current), w.t.Good, draw, btn)
 		return
 	}
-	body := fmt.Sprintf("Lodor %s is out (you have %s).\nInstall it with the muOS App Downloader,\nor grab the .muxapp from GitHub and use\nArchive Manager.", latest, current)
+	body := updateInstructions(hostOS(), latest, current)
 	if notes := notesLine(out); notes != "" {
 		body += "\n\nNew: " + notes
 	}
@@ -1113,6 +1270,11 @@ func (w *wizard) doRecent(draw func(*ui.Canvas), btn func() ui.Button) {
 	out, err := w.runEngine("--sync-feed")
 	if rc := exitCode(err); rc != 0 {
 		w.markPairFlag(rc)
+		if rc == 3 {
+			// lodor#44: unreachable is the engine's rc=3 now — say so, never the empty state.
+			w.showMsg("Recent activity", "Couldn't reach RomM - check Wi-Fi and the server, then try again.", w.t.Bad, draw, btn)
+			return
+		}
 		w.showMsg("Problem", w.diagnose(rc, out), w.t.Bad, draw, btn)
 		return
 	}
@@ -1229,7 +1391,7 @@ func (w *wizard) runOnboarding(draw func(*ui.Canvas), btn func() ui.Button) {
 			s = stepCode
 
 		case stepCode:
-			kb := &ui.Keyboard{Prompt: "Enter your RomM pairing code:", Text: code}
+			kb := &ui.Keyboard{Prompt: "Enter your RomM pairing code:", Text: code, Hint: pairCodeHint}
 			w.screenKeyboard(stepCode, kb, draw, btn)
 			if kb.Cancelled {
 				s = stepServer
@@ -1237,10 +1399,18 @@ func (w *wizard) runOnboarding(draw func(*ui.Canvas), btn func() ui.Button) {
 			}
 			code = strings.TrimSpace(kb.Text)
 			w.code = code
-			if out, err := w.runEngine("--pair", code); err != nil || !resultFlag(out, "paired") {
-				w.errMsg = "Pairing failed. Generate a fresh code in RomM and try again."
-				w.retry, s = stepCode, stepError
+			out, err := w.runEngine("--pair", code)
+			if err != nil || !resultFlag(out, "paired") {
+				// lodor#31: the engine exit code is authoritative — an unreachable server
+				// (rc=3) never blames the code, and B walks back to the server step.
+				w.errMsg, w.retry = pairFailure(exitCode(err), out)
+				s = stepError
 				continue
+			}
+			// lodor#38: paired, but the token lacks sync scopes — warn NOW (NextUI
+			// launch.sh parity) instead of letting saves fail confusingly later.
+			if !resultFlag(out, "scopes_ok") {
+				w.showMsg("Paired", "Paired - but the token is missing some sync permissions. Re-generate it in RomM with all scopes.", w.t.Bad, draw, btn)
 			}
 			s = stepDevice
 
@@ -1253,7 +1423,10 @@ func (w *wizard) runOnboarding(draw func(*ui.Canvas), btn func() ui.Button) {
 			}
 			device = strings.TrimSpace(kb.Text)
 			w.device = device
-			_, _ = w.runEngine("--register-device", device) // non-fatal; pulls work unregistered
+			// lodor#39: keep the outcome — the validate screen shows a "Device registered"
+			// row (still non-fatal: pulls work unregistered, the shell lib retries later).
+			rout, rerr := w.runEngine("--register-device", device)
+			w.registered = exitCode(rerr) == 0 && resultFlag(rout, "registered")
 			s = stepValidate
 
 		case stepValidate:
@@ -1700,7 +1873,7 @@ func (w *wizard) loginProfile(label string, draw func(*ui.Canvas), btn func() ui
 
 // doAddProfile pairs a NEW profile with a RomM pairing code (--pair-profile <code>).
 func (w *wizard) doAddProfile(draw func(*ui.Canvas), btn func() ui.Button) {
-	kb := &ui.Keyboard{Prompt: "Enter a RomM pairing code for the new profile:"}
+	kb := &ui.Keyboard{Prompt: "Enter a RomM pairing code for the new profile:", Hint: pairCodeHint}
 	w.screenKeyboardFree(kb, draw, btn)
 	if kb.Cancelled {
 		return
@@ -2465,12 +2638,12 @@ func (w *wizard) capture(dir string) {
 		kb   *ui.Keyboard
 	}
 	w.wifiUp = false
-	w.reach, w.auth = true, true
+	w.reach, w.auth, w.registered = true, true, true
 	shots := []shot{
 		{"01-welcome.png", stepWelcome, nil},
 		{"02-wifi-down.png", stepWifi, nil},
 		{"04-server.png", stepServer, &ui.Keyboard{Prompt: "Enter your RomM server address:", Text: "https://romm.lodor.io"}},
-		{"05-code.png", stepCode, &ui.Keyboard{Prompt: "Enter your RomM pairing code:", Text: "X7K2"}},
+		{"05-code.png", stepCode, &ui.Keyboard{Prompt: "Enter your RomM pairing code:", Text: "X7K2", Hint: pairCodeHint}},
 		{"06-device.png", stepDevice, &ui.Keyboard{Prompt: "Name this device:", Text: "RG34XX"}},
 		{"07-validate.png", stepValidate, nil},
 		{"09-done.png", stepDone, nil},
@@ -2492,7 +2665,7 @@ func (w *wizard) capture(dir string) {
 	// the SAME buildMenuRows spine the interactive loop uses, with representative state so
 	// the conditional rows (pending/queue counts, Tailscale) all appear.
 	mc := ui.NewCanvas(W, H)
-	mx, my, mw, mh := w.t.Frame(mc, "Lodor", "Up/Down: move   A: select   B: exit")
+	mx, my, mw, mh := w.t.Frame(mc, menuTitle(), "Up/Down: move   A: select   B: exit")
 	rows := buildMenuRows(menuState{pendingN: 2, queueN: 3, userLabel: "Default", tsAvail: true})
 	labels := make([]string, len(rows))
 	for i, rw := range rows {
