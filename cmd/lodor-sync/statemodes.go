@@ -31,6 +31,11 @@ func runPushStates(client *romm.Client, cfg *config.Config, romPath string) {
 			queued = 1
 		}
 	}
+	// #43 (states leg): only REAL landed uploads stamp — skips/dedups are local
+	// ledger verdicts, an offline run proves nothing.
+	if res.Pushed > 0 {
+		stampSync(0, res.Pushed)
+	}
 	fmt.Printf("RESULT pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d queuedstate=%d reason=%s\n",
 		res.Pushed, res.Skipped, res.Failed, res.Retired, queued, res.Reason)
 	noteStateAuth(res.AuthExpired) // a rejected token here → PAIRING_EXPIRED + exit 6
@@ -63,8 +68,19 @@ func runPushAllStates(client *romm.Client, cfg *config.Config) {
 			fmt.Printf("PUSHSTATE rom=%q pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d queuedstate=%d reason=%s\n",
 				romPath, pr.Pushed, pr.Skipped, pr.Failed, pr.Retired, queued, pr.Reason)
 		})
-	fmt.Printf("RESULT pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d queuedstates=%d roms=%d reason=%s\n",
-		res.Pushed, res.Skipped, res.Failed, res.Retired, res.Queued, res.RomsWithStates, res.Reason)
+	// #43 (states leg): the sweep stamps only on REAL landed uploads (skips are
+	// local-ledger verdicts; an all-offline sweep proves nothing). A CANCELLED
+	// sweep never stamps — states were deliberately left behind.
+	if res.Pushed > 0 && !res.Cancelled {
+		stampSync(0, res.Pushed)
+	}
+	// cancelled=1 is ADDITIVE (lodor#42) — parsers key on the *states= tokens.
+	cancelSuffix := ""
+	if res.Cancelled {
+		cancelSuffix = " cancelled=1"
+	}
+	fmt.Printf("RESULT pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d queuedstates=%d roms=%d reason=%s%s\n",
+		res.Pushed, res.Skipped, res.Failed, res.Retired, res.Queued, res.RomsWithStates, res.Reason, cancelSuffix)
 	noteStateAuth(res.AuthExpired) // any per-ROM dead pairing → PAIRING_EXPIRED + exit 6
 	exitMode(0)
 }
@@ -105,6 +121,8 @@ func runPullState(client *romm.Client, cfg *config.Config, romPath string, state
 	}
 	res := sync.PullState(client, cfg, romPath, stateID, slot)
 	if res.Placed {
+		// #43 (states leg): a placed state is a verified server download — stamp it.
+		stampSync(0, 1)
 		fmt.Printf("RESULT placedstate=1 reason=ok path=%q\n", res.Path)
 	} else {
 		fmt.Printf("RESULT placedstate=0 reason=%s\n", res.Reason)

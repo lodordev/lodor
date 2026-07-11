@@ -62,13 +62,22 @@ func runQueueState(romPath string) {
 // drainPendingStates re-runs the state push for every queued rom, returning
 // the processed lines and which of them stay queued (still offline). The queue
 // file is rewritten under the lock, preserving any lines enqueued mid-drain.
+// cancelled (lodor#42): the B-press sentinel stopped the drain between entries —
+// every not-yet-attempted entry stays queued (never silently dropped).
 func drainPendingStates(client *romm.Client, cfg *config.Config,
-	report func(romPath string, res sync.PushStatesResult, kept bool)) (total, drained int, stuck []string) {
+	report func(romPath string, res sync.PushStatesResult, kept bool)) (total, drained int, stuck []string, cancelled bool) {
 	queued := pendingReadFile(pendingStatesPath())
 	if len(queued) == 0 {
-		return 0, 0, nil
+		return 0, 0, nil, false
 	}
-	for _, romPath := range queued {
+	for i, romPath := range queued {
+		// REAL CANCEL, checked BETWEEN entries: what drained is drained; the rest
+		// rides the rewritten queue to the next drain. Never mid-upload.
+		if client != nil && client.CancelCheck != nil && client.CancelCheck() {
+			cancelled = true
+			stuck = append(stuck, queued[i:]...) // kept in the queue rewrite below
+			break
+		}
 		res := sync.PushStates(client, cfg, romPath)
 		kept := res.Reason == "offline"
 		if kept {
@@ -99,7 +108,7 @@ func drainPendingStates(client *romm.Client, cfg *config.Config,
 	// drain and the ledger dedups every already-landed upload to a skip.
 	_ = pendingWriteFile(pendingStatesPath(), final)
 	release()
-	return len(queued), drained, stuck
+	return len(queued), drained, stuck, cancelled
 }
 
 // runPushPendingStates drains the states queue. Contract:
@@ -109,11 +118,24 @@ func drainPendingStates(client *romm.Client, cfg *config.Config,
 //
 // Exit 0 always — draining is best-effort background work.
 func runPushPendingStates(client *romm.Client, cfg *config.Config) {
-	total, drained, stuck := drainPendingStates(client, cfg,
+	pushedN := 0 // #43: real landed state uploads across the drain
+	total, drained, stuck, cancelled := drainPendingStates(client, cfg,
 		func(romPath string, res sync.PushStatesResult, kept bool) {
+			pushedN += res.Pushed
 			fmt.Printf("PENDINGSTATE rom=%q pushedstates=%d skippedstates=%d failedstates=%d retiredstates=%d reason=%s kept=%d\n",
 				romPath, res.Pushed, res.Skipped, res.Failed, res.Retired, res.Reason, b2i(kept))
 		})
-	fmt.Printf("RESULT pendingstates=%d drained=%d stuck=%d\n", total, drained, len(stuck))
+	// #43 (states leg): stamp only on REAL landed uploads — a drain that merely
+	// retired local-only entries (no-states/resolve) or stayed offline never
+	// stamps, nor does a CANCELLED drain (states deliberately left behind).
+	if pushedN > 0 && !cancelled {
+		stampSync(0, pushedN)
+	}
+	// cancelled=1 is ADDITIVE (lodor#42) — parsers key on pendingstates=/drained=.
+	cancelSuffix := ""
+	if cancelled {
+		cancelSuffix = " cancelled=1"
+	}
+	fmt.Printf("RESULT pendingstates=%d drained=%d stuck=%d%s\n", total, drained, len(stuck), cancelSuffix)
 	exitMode(0)
 }

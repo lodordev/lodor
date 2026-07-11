@@ -23,7 +23,9 @@ import (
 	"time"
 
 	"lodor/buildinfo"
+	"lodor/covercancel"
 	"lodor/fsutil"
+	"lodor/syncstamp"
 	"lodor/ui"
 )
 
@@ -424,6 +426,7 @@ type hostCopy struct {
 	wifiOpen    string // wifi-down onboarding screen: where Wi-Fi entry lives
 	noWifi      string // requireOnline gate: the same fact as a one-liner
 	updateVenue string // update-badge suffix: where an update installs from
+	removeDone  string // post-uninstall step: what's left for the user to delete
 }
 
 var hostCopyTable = map[string]hostCopy{
@@ -432,12 +435,21 @@ var hostCopyTable = map[string]hostCopy{
 		wifiOpen:    "Open muOS Settings, Network, and join your Wi-Fi.",
 		noWifi:      "Connect Wi-Fi in muOS Settings, then try again.",
 		updateVenue: "App Downloader",
+		removeDone:  "Delete the Lodor app to finish.",
 	},
 	"knulli": {
 		osName:      "Knulli",
 		wifiOpen:    "Open the main menu, Network Settings, and join your Wi-Fi.",
 		noWifi:      "Connect Wi-Fi in Network Settings, then try again.",
 		updateVenue: "GitHub zip",
+		// knulli#2: there is no "Lodor app" to delete on Knulli — the install is four
+		// concrete paths under /userdata (see integrations/knulli/userdata). Name them,
+		// or the uninstall dead-ends at a muOS-shaped instruction.
+		removeDone: "To finish, delete these from /userdata (over the network share):\n" +
+			"  system/lodor\n" +
+			"  system/scripts/lodor-hook.sh\n" +
+			"  system/services/lodor\n" +
+			"  roms/ports/Lodor.sh",
 	},
 }
 
@@ -781,6 +793,7 @@ type menuState struct {
 	tsAvail        bool
 	updateAvail    string // settings.conf update_available, "" when none/already installed
 	updateVenue    string // host install venue for the update badge (lodor#32/#45)
+	lastSync       string // #43: relative age of the engine's last-sync stamp, "" = never
 }
 
 // buildMenuRows is the PURE menu spine: local state -> ordered rows + their engine action.
@@ -793,8 +806,16 @@ func buildMenuRows(st menuState) []menuRow {
 		add("! Pairing expired - re-pair", actRepair)
 	}
 	add("Sync now", actSyncNow)
+	if st.lastSync != "" {
+		// #43: the cheap answer to "did my saves make it up?" — the engine's
+		// last-sync stamp, rendered right under the action that refreshes it.
+		// Selecting it opens Recent activity (the natural drill-down: what
+		// synced, when, from which device). Absent until a first verified sync.
+		add("Last synced: "+st.lastSync, actRecent)
+	}
 	if st.pendingN > 0 {
-		add(fmt.Sprintf("Pending saves (%d) - upload", st.pendingN), actPushPending)
+		// lodor#60: "upload now" is the cross-lane canon label (NextUI shipped it first).
+		add(fmt.Sprintf("Pending saves (%d) - upload now", st.pendingN), actPushPending)
 	}
 	add("Refresh library (update)", actRefreshUpdate)
 	add("Refresh library (full)", actRefreshFull)
@@ -959,7 +980,19 @@ func (w *wizard) menuState() menuState {
 		tsAvail:        w.tsAvailable(),
 		updateAvail:    w.updateAvailable(),
 		updateVenue:    w.hc().updateVenue,
+		lastSync:       w.lastSyncAge(),
 	}
+}
+
+// lastSyncAge reads the engine's #43 stamp (dataDir/last-sync.txt) and renders its
+// relative age ("2h ago"); "" when never synced / unreadable — the menu then shows
+// no row rather than a guessed age. Local file read only, recomputed per menu loop.
+func (w *wizard) lastSyncAge() string {
+	st, ok := syncstamp.Read(w.dataDir)
+	if !ok {
+		return ""
+	}
+	return st.Age(time.Now().Unix())
 }
 
 // updateAvailable reads the update_available stamp (written by doCheckUpdates, cleared when a
@@ -1177,22 +1210,49 @@ func (w *wizard) confirmScreen(subtitle, yes, no string, draw func(*ui.Canvas), 
 
 // doSyncNow is the FAST sync (fix for the 0.9.x "Sync now == full mirror" mistake): push
 // pending saves, pull newer saves, refresh Continue. NO catalog mirror (that is Refresh).
+// lodor#42: every leg runs through the background+poll loop — live phase from the
+// engine's side-channels instead of a frozen "Working" frame, and B is a REAL cancel
+// (sentinel → the engine stops between items; remaining legs are skipped).
 func (w *wizard) doSyncNow(draw func(*ui.Canvas), btn func() ui.Button) {
 	if !w.requireOnline(draw, btn) {
 		return
 	}
-	w.working(draw, "Flushing pending saves...")
-	_, e1 := w.runEngine("--push-pending")
-	// Handoff v1: Sync Now must push save STATES too, not just battery saves.
-	w.working(draw, "Pushing save states...")
-	_, es := w.runEngine("--push-all-states")
-	_, _ = w.runEngine("--push-pending-states")
-	w.working(draw, "Pulling latest saves...")
-	_, e2 := w.runEngine("--pull-saves")
-	w.working(draw, "Updating Continue...")
-	_, e3 := w.runEngine("--sync-continue")
-	rc := max(exitCode(e1), max(exitCode(es), max(exitCode(e2), exitCode(e3))))
-	w.markPairFlag(rc)
+	legs := []struct {
+		phase    string
+		ignoreRC bool // --push-pending-states' rc was always advisory here (pre-#42 parity)
+		args     []string
+	}{
+		{"Flushing pending saves...", false, []string{"--push-pending"}},
+		// Handoff v1: Sync Now must push save STATES too, not just battery saves.
+		{"Pushing save states...", false, []string{"--push-all-states"}},
+		{"Pushing save states...", true, []string{"--push-pending-states"}},
+		{"Pulling latest saves...", false, []string{"--pull-saves"}},
+		{"Updating Continue...", false, []string{"--sync-continue"}},
+	}
+	rc := 0
+	cancelled := false
+	for _, leg := range legs {
+		_, lrc, lcan := w.runEngineCancellable("Sync now", leg.phase, draw, leg.args...)
+		if !leg.ignoreRC && lrc > rc {
+			rc = lrc
+		}
+		if lcan {
+			cancelled = true
+			break // the user said stop — never start the next leg
+		}
+	}
+	// A cancelled run proves nothing about the pairing — it may clear the expired
+	// banner only via a real success; rc=6 (expiry outranks cancel in exitMode)
+	// still flags honestly.
+	if !cancelled || rc == 6 {
+		w.markPairFlag(rc)
+	}
+	if cancelled {
+		// Honest outcome: legs already finished are synced, the stopped leg kept its
+		// queue/partials — running Sync now again picks up exactly where this ended.
+		w.showMsg("Stopped", "Sync stopped - run Sync now again to finish.", w.t.Text, draw, btn)
+		return
+	}
 	if rc == 0 {
 		w.maybeCheckUpdates(draw)
 		w.showMsg("Done", "Sync complete.", w.t.Good, draw, btn)
@@ -1273,10 +1333,16 @@ func (w *wizard) doPushPending(draw func(*ui.Canvas), btn func() ui.Button) {
 	if !w.requireOnline(draw, btn) {
 		return
 	}
-	w.working(draw, "Uploading pending saves...")
-	out, err := w.runEngine("--push-pending")
-	rc := exitCode(err)
-	w.markPairFlag(rc)
+	// lodor#42: background+poll with B-cancel — landed saves are dequeued, the
+	// rest stay queued for the next run.
+	out, rc, cancelled := w.runEngineCancellable("Pending saves", "Uploading pending saves...", draw, "--push-pending")
+	if !cancelled || rc == 6 { // a cancel must not clear the pairing banner
+		w.markPairFlag(rc)
+	}
+	if cancelled {
+		w.showMsg("Stopped", "Upload stopped - saves not yet sent stay queued. Run again to finish.", w.t.Text, draw, btn)
+		return
+	}
 	if rc != 0 {
 		w.showMsg("Problem", w.diagnose(rc, out), w.t.Bad, draw, btn)
 		return
@@ -1319,10 +1385,17 @@ func (w *wizard) doDownloadQueue(draw func(*ui.Canvas), btn func() ui.Button) {
 	if !w.requireOnline(draw, btn) {
 		return
 	}
-	w.working(draw, "Downloading queued games...")
-	out, err := w.runEngine("--download-queue")
-	rc := exitCode(err)
-	w.markPairFlag(rc)
+	// lodor#42: the heaviest menu op (multiple large ROMs) — background+poll with
+	// B-cancel; a mid-transfer cancel keeps the partial .tmp for a Range resume.
+	out, rc, cancelled := w.runEngineCancellable("Download queue", "Downloading queued games...", draw, "--download-queue")
+	if !cancelled || rc == 6 { // a cancel must not clear the pairing banner
+		w.markPairFlag(rc)
+	}
+	if cancelled {
+		dn := nz(ui.ResultToken(out, "downloaded"))
+		w.showMsg("Stopped", fmt.Sprintf("Download stopped - %s finished, the rest stay queued. Run again to finish.", dn), w.t.Text, draw, btn)
+		return
+	}
 	if rc != 0 {
 		w.showMsg("Problem", w.diagnose(rc, out), w.t.Bad, draw, btn)
 		return
@@ -1337,10 +1410,16 @@ func (w *wizard) doDownloadBios(draw func(*ui.Canvas), btn func() ui.Button) {
 	if !w.requireOnline(draw, btn) {
 		return
 	}
-	w.working(draw, "Downloading BIOS files...")
-	out, err := w.runEngine("--download-bios")
-	rc := exitCode(err)
-	w.markPairFlag(rc)
+	// lodor#42: background+poll with B-cancel — BIOS already written stays,
+	// skip-if-present makes the re-run cheap.
+	out, rc, cancelled := w.runEngineCancellable("Download BIOS", "Downloading BIOS files...", draw, "--download-bios")
+	if !cancelled || rc == 6 { // a cancel must not clear the pairing banner
+		w.markPairFlag(rc)
+	}
+	if cancelled {
+		w.showMsg("Stopped", "BIOS download stopped - run again to finish.", w.t.Text, draw, btn)
+		return
+	}
 	if rc != 0 {
 		w.showMsg("Problem", w.diagnose(rc, out), w.t.Bad, draw, btn)
 		return
@@ -1605,6 +1684,96 @@ func runAndWait(cmd *exec.Cmd) error {
 		return err
 	}
 	return cmd.Wait()
+}
+
+// runEngineCancellable runs ONE long engine mode in the BACKGROUND under the same
+// poll loop screenMirrorArgs uses (lodor#42), with two additions:
+//
+//   - CANCELABLE: the engine is invoked with --cancellable (arming its B-press
+//     sentinel contract, romm.Client.CancelCheck), and the loop watches the input
+//     channel — the FIRST B writes the covercancel sentinel and keeps waiting. The
+//     ENGINE decides when to stop (between items / between chunks): nothing is
+//     killed, landed work is kept/dequeued, partial downloads keep their .tmp for
+//     resume, unattempted work stays queued. The screen flips to "Stopping..." the
+//     moment B lands (honest: a stop was requested, the engine is finishing its
+//     in-flight item).
+//   - CAPTURED: combined output is captured (runCaptured's temp-file shape — no
+//     pipe copier goroutine, so a grandchild can never defeat the timeout) because
+//     the callers parse RESULT tokens.
+//
+// phase0 seeds the phase line until the engine's own /tmp/romm-phase appears (the
+// engine writes it per item — no fake progress, just the op's honest name). Returns
+// captured output, exit code, and whether a cancel was REQUESTED (the caller shows
+// "Stopped - run again to finish" instead of parsing the leg's outcome).
+func (w *wizard) runEngineCancellable(title, phase0 string, draw func(*ui.Canvas), args ...string) (string, int, bool) {
+	_ = os.Remove("/tmp/dl-progress")
+	_ = os.Remove("/tmp/romm-phase") // clear a stale phase label from a prior op (no-fake-UI)
+	covercancel.Clear()              // a leftover sentinel must not instantly cancel this run
+	args = append(args, "--cancellable")
+
+	ctx, cancel := context.WithTimeout(context.Background(), engineTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, w.bin, args...)
+	cmd.Dir = w.dataDir
+	// Output capture, runCaptured-style: a real temp file dup'd to the child, no
+	// copier goroutine. Fall back to discarding output (op still runs, tokens lost)
+	// rather than CombinedOutput's wedge risk inside a select loop.
+	var tf *os.File
+	if f, ferr := os.CreateTemp("", "lodor-engine-*.out"); ferr == nil {
+		tf = f
+		cmd.Stdout, cmd.Stderr = tf, tf
+		defer os.Remove(tf.Name())
+		defer tf.Close()
+	}
+	done := make(chan error, 1)
+	go func() { done <- runAndWait(cmd) }()
+
+	// Off-hardware unit paths may run without an input source; a nil channel just
+	// never fires in the select (no cancel affordance, everything else identical).
+	var buttons <-chan ui.Button
+	if w.in != nil {
+		buttons = w.in.Buttons()
+	}
+	cancelled := false
+	paint := func() {
+		phase := readPhase()
+		if phase == "" {
+			phase = phase0
+		}
+		c := ui.NewCanvas(W, H)
+		if cancelled {
+			w.t.ProgressHint(c, title, "Stopping...", readPct(), "stopping - finishing current item")
+		} else {
+			w.t.ProgressHint(c, title, phase, readPct(), "B: stop")
+		}
+		draw(c)
+	}
+	paint() // first frame immediately — never a beat of stale screen
+	for {
+		select {
+		case err := <-done:
+			rc := exitCode(err)
+			if cancelled {
+				covercancel.Clear() // consumed — must not leak into the next op
+			}
+			out := ""
+			if tf != nil {
+				_ = tf.Sync()
+				if b, rerr := os.ReadFile(tf.Name()); rerr == nil {
+					out = string(b)
+				}
+			}
+			return out, rc, cancelled
+		case b := <-buttons:
+			if b == ui.BtnBack && !cancelled {
+				cancelled = true
+				_ = covercancel.Request() // the engine's CancelCheck sees this between items/chunks
+				paint()
+			}
+		case <-time.After(400 * time.Millisecond):
+			paint()
+		}
+	}
 }
 
 func readPct() int {
@@ -2690,7 +2859,7 @@ func (w *wizard) doRemoveLodor(draw func(*ui.Canvas), btn func() ui.Button) {
 	w.working(draw, "Removing Lodor files...")
 	out, _ := w.runEngine(args...)
 	if ui.ResultToken(out, "uninstalled") == "1" {
-		w.showMsg("Removed", fmt.Sprintf("Removed %s Lodor file(s). Delete the Lodor app to finish.", nz(ui.ResultToken(out, "removed"))), w.t.Good, draw, btn)
+		w.showMsg("Removed", fmt.Sprintf("Removed %s Lodor file(s). %s", nz(ui.ResultToken(out, "removed")), w.hc().removeDone), w.t.Good, draw, btn)
 	} else {
 		w.showMsg("Remove Lodor", "Nothing removed - Lodor's file records were missing. Run Refresh library once, then retry.", w.t.Bad, draw, btn)
 	}

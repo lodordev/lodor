@@ -15,18 +15,28 @@
 //	--fetch-update  RESULT fetched=<0|1> version=<v> bytes=<n>
 //	                exit 0 ok / 2 no LODOR_UPDATE_ASSET / 3 unreachable or no
 //	                asset for this lane / 4 hash mismatch (staging removed)
+//	                An interrupted transfer keeps its partial zip beside the
+//	                staging (.update.partial, with an asset-identity file); the
+//	                next --fetch-update for the SAME asset Range-resumes it
+//	                (lodor#46). With --cancellable, a B-press cancel stops the
+//	                transfer, keeps the partial, and reports the ADDITIVE
+//	                "cancelled=1" on the RESULT line with exit 0 (the lodor#42
+//	                convention — an honest stop, not an error). Parsers must key
+//	                on fetched=1, never on the exit code alone.
 //
 // A "dev" build reports update=0 and never fetches: a binary not stamped by
 // release.sh must not nag or self-clobber.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"lodor/buildinfo"
+	"lodor/covercancel"
 	"lodor/update"
 )
 
@@ -68,7 +78,7 @@ func runCheckUpdate() {
 	os.Exit(0)
 }
 
-func runFetchUpdate() {
+func runFetchUpdate(cancellable bool) {
 	channel := updateChannel()
 	if buildinfo.Version == "dev" {
 		fmt.Fprintln(os.Stderr, "fetch-update: refusing on a dev build (no stamped version)")
@@ -95,14 +105,29 @@ func runFetchUpdate() {
 			writeProgress(pct)
 		}
 	}
-	err := update.Stage(asset, update.StageDirName, ch.Version, fetchUpdateTimeout, prog)
+	// lodor#42 pattern (armDownloadCancel), adapted: the update modes run before
+	// any romm.Client exists, so the B-press sentinel is polled directly. Only an
+	// INTERACTIVE caller (--cancellable) arms it — a daemon's fetch never polls
+	// the shared sentinel, so a foreground B-press can't kill a background fetch.
+	var cancel func() bool
+	if cancellable {
+		covercancel.Clear()
+		cancel = covercancel.Requested
+	}
+	err := update.Stage(asset, update.StageDirName, ch.Version, fetchUpdateTimeout, prog, cancel)
 	if err == update.ErrHashMismatch {
 		fmt.Fprintln(os.Stderr, "fetch-update: artifact hash mismatch — staging removed, nothing applied")
 		fmt.Printf("RESULT fetched=0 version=%s bytes=0\n", ch.Version)
 		os.Exit(4)
 	}
+	if errors.Is(err, update.ErrCancelled) {
+		// An honest user stop: nothing staged, partial kept for a Range resume.
+		fmt.Fprintln(os.Stderr, "fetch-update: cancelled — partial download kept, the next attempt resumes")
+		fmt.Printf("RESULT fetched=0 version=%s bytes=0 cancelled=1\n", ch.Version)
+		os.Exit(0)
+	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "fetch-update: %v\n", err)
+		fmt.Fprintf(os.Stderr, "fetch-update: %v (any partial download is kept — the next attempt resumes)\n", err)
 		os.Exit(3)
 	}
 	fmt.Printf("RESULT fetched=1 version=%s bytes=%d\n", ch.Version, asset.Size)
