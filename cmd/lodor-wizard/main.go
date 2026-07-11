@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"lodor/buildinfo"
+	"lodor/fsutil"
 	"lodor/ui"
 )
 
@@ -1907,7 +1908,10 @@ func (w *wizard) doSwitchUser(draw func(*ui.Canvas), btn func() ui.Button) {
 	}
 	p := profs[sel]
 	if p.hasTok {
-		if err := os.WriteFile(filepath.Join(w.dataDir, "active-profile.txt"), []byte(p.label+"\n"), 0o644); err != nil {
+		// FAT32-durable (fsutil): active-profile.txt names WHO is signed in. A plain
+		// WriteFile zeroed by a power-yank silently falls the card back to the admin
+		// identity (empty/missing file = hosts[0]) — atomic temp+fsync+rename+dir-fsync.
+		if err := fsutil.WriteFileAtomicString(filepath.Join(w.dataDir, "active-profile.txt"), p.label+"\n", 0o644); err != nil {
 			w.showMsg("Switch user", "Couldn't switch profile - check the SD card.", w.t.Bad, draw, btn)
 			return
 		}
@@ -1939,7 +1943,8 @@ func (w *wizard) loginProfile(label string, draw func(*ui.Canvas), btn func() ui
 	out, err := w.runEngineStdin(kbp.Text, "--login-profile", label, "--login-user", user)
 	rc := exitCode(err)
 	if rc == 0 && ui.ResultToken(out, "logged_in") == "1" {
-		_ = os.WriteFile(filepath.Join(w.dataDir, "active-profile.txt"), []byte(label+"\n"), 0o644)
+		// FAT32-durable (fsutil): same power-yank guarantee as the Switch-user write.
+		_ = fsutil.WriteFileAtomicString(filepath.Join(w.dataDir, "active-profile.txt"), label+"\n", 0o644)
 		w.showMsg("Signed in", "Signed in and switched to "+label+".", w.t.Good, draw, btn)
 	} else {
 		w.showMsg("Sign in", w.diagnose(rc, out)+"\nCheck the username and password.", w.t.Bad, draw, btn)
@@ -2646,7 +2651,9 @@ func (w *wizard) fetchCoversOn() bool {
 		strings.Contains(readFileString(filepath.Join(w.dataDir, "config.json")), "\"fetch_covers\":true")
 }
 
-// setSetting writes key=value into settings.conf (atomic temp+rename; other keys preserved).
+// setSetting writes key=value into settings.conf (other keys preserved). FAT32-durable
+// via fsutil: temp + fsync + rename + parent-dir fsync — a bare temp+rename leaves the
+// rename pointing at unflushed blocks on a power-yank, zeroing every setting.
 func (w *wizard) setSetting(key, value string) error {
 	path := filepath.Join(w.dataDir, "settings.conf")
 	var lines []string
@@ -2662,12 +2669,7 @@ func (w *wizard) setSetting(key, value string) error {
 	if !found {
 		lines = append(lines, key+"="+value)
 	}
-	body := strings.Join(lines, "\n") + "\n"
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFileAtomicString(path, strings.Join(lines, "\n")+"\n", 0o644)
 }
 
 // doRemoveLodor: confirm (keep vs also remove downloads) -> --uninstall-mirror. Offline.

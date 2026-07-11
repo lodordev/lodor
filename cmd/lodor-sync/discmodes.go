@@ -141,7 +141,9 @@ func runFetchDiscs(client *romm.Client, cfg *config.Config, romPath string, budg
 // prints the census and exits without touching network or card, so a daemon can
 // decide whether the cycle is worth the radio. Quiet by design: per-game PREFETCH
 // lines go to stderr (the daemons' log), never stdout. Exit: 0, or 4 when any game
-// failed (the documented ran-but-errored code).
+// failed (the documented ran-but-errored code). A game evicted between the census
+// and its turn in the fetch loop (its .m3u back to a 0-byte stub) is skipped, not
+// refilled — and not counted as failed (there is nothing left to complete).
 func runPrefetchDiscs(client *romm.Client, cfg *config.Config, dry bool) {
 	inc := catalog.IncompleteMultiDiscDownloads()
 	missing := 0
@@ -154,6 +156,13 @@ func runPrefetchDiscs(client *romm.Client, cfg *config.Config, dry bool) {
 	}
 	fetched, failed := 0, 0
 	for _, g := range inc {
+		// Re-stat before spending network on this game: the census ran at cycle start,
+		// and a "Delete from card" since then flipped the .m3u back to a 0-byte stub.
+		// Prefetching it now would silently UNDO the user's eviction.
+		if !prefetchStillWanted(g.Path) {
+			fmt.Fprintf(os.Stderr, "PREFETCH skip (evicted since census): %s\n", filepath.Base(g.Path))
+			continue
+		}
 		id, ok := catalog.ResolveRomID(cfg, g.Path)
 		if !ok || id == 0 {
 			fmt.Fprintf(os.Stderr, "PREFETCH skip (unresolved): %s\n", filepath.Base(g.Path))
@@ -195,4 +204,13 @@ func runPrefetchDiscs(client *romm.Client, cfg *config.Config, dry bool) {
 		exitMode(4)
 	}
 	exitMode(0)
+}
+
+// prefetchStillWanted re-stats a censused .m3u immediately before its network work:
+// only a still-real (non-stub, non-dir, still-present) playlist wants completion. A
+// 0-byte size means EvictToStub ran mid-cycle — the mirror's stub shape — so the
+// game must NOT be refilled behind the user's back.
+func prefetchStillWanted(m3uPath string) bool {
+	fi, err := os.Stat(m3uPath)
+	return err == nil && !fi.IsDir() && fi.Size() > 0
 }

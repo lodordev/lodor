@@ -713,14 +713,27 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		writePhase(fmt.Sprintf("Downloading %s — disc %d/%d…", romName, i+1, total))
 
 		tmp := p.dest + ".tmp"
-		out, cErr := os.Create(tmp)
+		// RESUMABLE (parity with the single-file path): a partial .tmp from an
+		// interrupted run resumes from its end via an HTTP Range request instead of
+		// restarting at byte 0 — a dropped multi-hundred-MB disc no longer costs the
+		// whole transfer again. Open WITHOUT O_TRUNC so the partial is preserved; the
+		// resume transport truncates/seeks as the server's 206/200/416 response
+		// dictates (a server that can't compose file_ids with Range answers 200 and
+		// the disc is rewritten clean from byte 0).
+		var discStart int64
+		if dfi, statErr := os.Stat(tmp); statErr == nil && dfi.Size() > 0 {
+			discStart = dfi.Size()
+		}
+		out, cErr := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY, 0o644)
 		if cErr != nil {
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc create rom=%d disc=%d\n", rom.ID, i+1)
 			writeProgress(0)
 			return false
 		}
 		// Real progress: this transfer spans [fetched/toFetch, (fetched+1)/toFetch] of
-		// the overall bar; move smoothly within that band as its bytes stream.
+		// the overall bar; move smoothly within that band as its bytes stream. On a
+		// resume, done is primed with the on-disk offset against the full total, so
+		// the bar picks up where it left off rather than jumping backward.
 		discBase := fetched * 100 / toFetch
 		discSpan := (fetched+1)*100/toFetch - discBase
 		lastPct := -1
@@ -734,7 +747,7 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 				writeProgress(pct)
 			}
 		}
-		n, dErr := client.DownloadRomFileTo(rom.ID, rom.FsName, p.file.ID, out, onProg)
+		n, dErr := client.DownloadRomFileResumeTo(rom.ID, rom.FsName, p.file.ID, out, discStart, onProg)
 		// FAT32-durable: fsync the streamed disc bytes before rename so a power-yank
 		// can't zero a "renamed-in" .chd (streaming path — too large to buffer through
 		// fsutil, so we fsync in place). A Sync error folds into the download-failed gate.
@@ -743,7 +756,10 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		if dErr != nil || syncErr != nil || cerr2 != nil || n == 0 {
 			noteAuthErr(dErr)
 			fmt.Fprintf(os.Stderr, "DLFAIL multidisc download rom=%d disc=%d: %s\n", rom.ID, i+1, safeErr(dErr))
-			_ = os.Remove(tmp)
+			// KEEP the partial .tmp so the next run resumes this disc from here
+			// instead of restarting at zero — same contract as the single-file path.
+			// A stale/corrupt partial self-heals via the resume transport's 416
+			// handling and the per-disc hash verify (which deletes a bad disc).
 			// Previously-verified discs STAY (a partial multi-disc is a valid on-card
 			// state under disc-1-first); a still-stub .m3u is left for the hook to re-tap.
 			writeProgress(0)
@@ -1286,8 +1302,17 @@ func runPushSave(client *romm.Client, cfg *config.Config, romPath string) {
 	// no per-file list to stage — fall back to a bare-path queue entry so a changed save
 	// is NEVER silently dropped and the pending badge still counts it (--push-pending
 	// resolves+uploads the live save when WiFi returns).
+	files := sync.LocalSaveFilesForRom(client, cfg, romPath)
+	if len(files) == 0 {
+		// No save exists on the card at all: nothing to stage OR queue. A bare
+		// queue entry here is a phantom (drains forever, surfaces as a false
+		// "save queued" in every lane). reason=no-save lets frontends say the
+		// honest thing (bughunt 2026-07-10 M2).
+		fmt.Printf("RESULT pushed=0 staged=0 reason=no-save\n")
+		exitMode(0)
+	}
 	staged := 0
-	for _, f := range sync.LocalSaveFilesForRom(client, cfg, romPath) {
+	for _, f := range files {
 		sp, serr := stageSaveFile(f)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "push-save: WARN couldn't stage save: %s\n", safeErr(serr))
