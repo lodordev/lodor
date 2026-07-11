@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -44,6 +45,69 @@ type Client struct {
 	// empty" (heartbeat answered but omitted a version) from "never fetched".
 	serverVer    string
 	serverVerSet bool
+
+	// CancelCheck, when non-nil, is polled BETWEEN CHUNKS of the streaming download
+	// copy loops (doRawStreamTo / doRawStreamResumeTo) — the ROM/disc transfers a
+	// user can sit behind. When it reports true the in-flight copy stops and the
+	// stream call returns ErrCancelled (wrapped): the caller keeps its partial .tmp
+	// (the resume contract) and reports the cancel honestly. nil (the default, and
+	// every non-interactive caller) = never polled, zero behavior change. The
+	// launcher's B-press sentinel (covercancel) is the production check; polling is
+	// time-gated inside the copy loop so a fast link never pays a stat per chunk.
+	CancelCheck func() bool
+}
+
+// ErrCancelled is returned (wrapped) by the streaming download paths when the
+// client's CancelCheck reported a user cancel mid-transfer. Detect with
+// errors.Is. The partial .tmp on disk is deliberately KEPT — a later run resumes
+// from it via the HTTP Range contract.
+var ErrCancelled = errors.New("download cancelled by user")
+
+// cancelPollInterval rate-limits CancelCheck from the copy loops: one sentinel
+// stat per interval, not per 32 KB chunk. Matches covercancel's own poll cadence
+// (well under the "reads as a hang" threshold on the slow Miyoo radio).
+const cancelPollInterval = 200 * time.Millisecond
+
+// copyStream is the copy loop behind every streamed download. With no CancelCheck
+// on the client it is io.Copy, byte-identical behavior. With one, it checks the
+// sentinel between chunks (time-gated) and stops with ErrCancelled the moment a
+// cancel is seen — bytes already written stay where they are (the caller keeps
+// the partial for resume).
+func (c *Client) copyStream(dst io.Writer, src io.Reader) (int64, error) {
+	if c.CancelCheck == nil {
+		return io.Copy(dst, src)
+	}
+	if c.CancelCheck() {
+		return 0, ErrCancelled
+	}
+	var written int64
+	buf := make([]byte, 32*1024)
+	next := time.Now().Add(cancelPollInterval)
+	for {
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			nw, werr := dst.Write(buf[:nr])
+			written += int64(nw)
+			if werr != nil {
+				return written, werr
+			}
+			if nw < nr {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return written, nil
+			}
+			return written, rerr
+		}
+		if now := time.Now(); now.After(next) {
+			if c.CancelCheck() {
+				return written, ErrCancelled
+			}
+			next = now.Add(cancelPollInterval)
+		}
+	}
 }
 
 // hostTransport builds the *http.Transport for a host, or returns nil to let the
@@ -375,7 +439,7 @@ func (c *Client) doRawStreamTo(path string, dst io.Writer, onProgress func(done,
 	if onProgress != nil {
 		w = &progressCountWriter{dst: dst, total: resp.ContentLength, cb: onProgress}
 	}
-	n, err := io.Copy(w, resp.Body)
+	n, err := c.copyStream(w, resp.Body)
 	if err != nil {
 		return n, fmt.Errorf("stream response body: %w", err)
 	}
@@ -462,7 +526,7 @@ func (c *Client) doRawStreamResumeTo(path string, f *os.File, startOffset int64,
 		if onProgress != nil {
 			w = &progressCountWriter{dst: f, done: startOffset, total: total, cb: onProgress}
 		}
-		n, cErr := io.Copy(w, resp.Body)
+		n, cErr := c.copyStream(w, resp.Body)
 		if cErr != nil {
 			return startOffset + n, fmt.Errorf("stream response body: %w", cErr)
 		}
@@ -502,7 +566,7 @@ func (c *Client) doRawStreamResumeTo(path string, f *os.File, startOffset int64,
 		if onProgress != nil {
 			w = &progressCountWriter{dst: f, total: resp.ContentLength, cb: onProgress}
 		}
-		n, cErr := io.Copy(w, resp.Body)
+		n, cErr := c.copyStream(w, resp.Body)
 		if cErr != nil {
 			return n, fmt.Errorf("stream response body: %w", cErr)
 		}

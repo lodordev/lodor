@@ -30,18 +30,94 @@ import (
 
 	"lodor/catalog"
 	"lodor/config"
+	"lodor/fsutil"
 	"lodor/platform"
 	"lodor/romm"
 )
+
+// migrateLegacyM3U normalizes a legacy FULL-LIST .m3u — one that still references
+// missing/0-byte stub discs, the pre-local-only shape the shipped LodorOS launcher
+// refuses to launch — to the local-only contract, entirely OFFLINE:
+//
+//  1. seed the manifest's canonical disc list from the old playlist when the
+//     record has none (on a legacy card the playlist IS the full set), then
+//  2. atomically rewrite the .m3u to list only discs with real bytes (old order
+//     kept — it is the canonical order the engine wrote).
+//
+// Runs at the top of the fetch modes BEFORE any network work, so a
+// partially-downloaded legacy card (e.g. 3 of 4 discs on card) becomes launchable
+// on its present discs even when the fetch itself fails (no Wi-Fi). THE ONE RULE:
+// only a manifest-owned playlist is ever rewritten — a user's own .m3u (merge
+// mode, manifest-less card) is never touched. Zero present discs rewrites to a
+// 0-byte playlist — the stub shape the launch path already owns. Best-effort:
+// any failure leaves the card as found (the old full-list shape still censuses
+// correctly via the m3u-refs fallback).
+func migrateLegacyM3U(romPath string) {
+	if !strings.EqualFold(filepath.Ext(romPath), ".m3u") {
+		return
+	}
+	fi, err := os.Stat(romPath)
+	if err != nil || fi.IsDir() || fi.Size() == 0 {
+		return // absent or a 0-byte stub — the download path owns those
+	}
+	lines := catalog.M3UDiscLines(romPath)
+	if len(lines) == 0 {
+		return // references nothing usable — broken, not ours to rewrite offline
+	}
+	man := platform.LoadManifest()
+	if !man.Owns(romPath) {
+		return // never rewrite a playlist the mirror didn't create
+	}
+	dir := filepath.Dir(romPath)
+	var local []string
+	for _, l := range lines {
+		if dfi, derr := os.Stat(filepath.Join(dir, l)); derr == nil && !dfi.IsDir() && dfi.Size() > 0 {
+			local = append(local, l)
+		}
+	}
+	if len(local) == len(lines) {
+		// Already local-only (every listed disc has bytes). Seed the canonical list
+		// if missing — free, and it keeps the census manifest-first from here on.
+		if e, _ := man.Entry(romPath); len(e.Discs) == 0 {
+			man.SetDiscs(romPath, lines)
+			if serr := man.Save(); serr != nil {
+				fmt.Fprintf(os.Stderr, "MANIFEST save failed (m3u migrate seed): %v\n", serr)
+			}
+		}
+		return
+	}
+	if e, _ := man.Entry(romPath); len(e.Discs) == 0 {
+		man.SetDiscs(romPath, lines) // the old full list is the canonical set
+	}
+	content := ""
+	if len(local) > 0 {
+		content = strings.Join(local, "\n") + "\n"
+	}
+	if werr := fsutil.WriteFileAtomicString(romPath, content, 0o644); werr != nil {
+		// Leave the manifest unsaved too: the card still carries the old full-list
+		// playlist, and the m3u-refs fallback census remains correct for it.
+		fmt.Fprintf(os.Stderr, "M3UMIGRATE rewrite failed: %s\n", filepath.Base(romPath))
+		return
+	}
+	if serr := man.Save(); serr != nil {
+		fmt.Fprintf(os.Stderr, "MANIFEST save failed (m3u migrate): %v\n", serr)
+	}
+	fmt.Fprintf(os.Stderr, "M3UMIGRATE local-only: %s (%d/%d discs on card)\n",
+		filepath.Base(romPath), len(local), len(lines))
+}
 
 // runCheckRom is the OFFLINE pre-launch completeness gate. Contract:
 //
 //	RESULT complete=<0|1> [discs_total=<N> discs_present=<M>] [reason=<missing|stub|empty-m3u>]
 //
-// complete=1 = the ROM is fully present (single-file: non-empty; multi-disc: a real
-// .m3u whose every referenced disc has real bytes). Pure filesystem — a hook can key
-// "should I re-trigger a fetch?" off this without config or network. Always exits 0:
-// the caller's fail-open convention (an unparseable answer must launch as before).
+// complete=1 = the ROM is fully present (single-file: non-empty; multi-disc: every
+// canonical disc has real bytes). Multi-disc census is MANIFEST-FIRST (local-only
+// .m3u, lodor#7): the playlist lists only present discs, so the full set comes from
+// the mirror manifest's canonical disc list; a legacy record without one censuses
+// by the m3u's own refs (on such a card those ARE the full list). Filesystem +
+// local manifest only — still offline and pre-config, so a hook can key "should I
+// re-trigger a fetch?" off this without config or network. Always exits 0: the
+// caller's fail-open convention (an unparseable answer must launch as before).
 func runCheckRom(path string) {
 	fi, err := os.Stat(path)
 	if err != nil || fi.IsDir() {
@@ -56,7 +132,7 @@ func runCheckRom(path string) {
 		fmt.Println("RESULT complete=1")
 		os.Exit(0)
 	}
-	total, present := catalog.M3UCompleteness(path)
+	total, present := catalog.RomDiscCompleteness(platform.LoadManifest(), path)
 	if total == 0 {
 		// A real .m3u that references nothing usable is broken, not complete.
 		fmt.Println("RESULT complete=0 discs_total=0 discs_present=0 reason=empty-m3u")
@@ -80,6 +156,10 @@ func runCheckRom(path string) {
 // Exit 0 either way (RESULT is the signal); pairing-expiry exits 6 via exitMode.
 func runFetchDiscs(client *romm.Client, cfg *config.Config, romPath string, budget int) {
 	writeProgress(0)
+	// Legacy full-list .m3u → local-only, BEFORE any network work: even if the
+	// fetch below fails (no Wi-Fi, server down), the game must leave this run
+	// launchable on the discs it already has.
+	migrateLegacyM3U(romPath)
 	id, ok := catalog.ResolveRomID(cfg, romPath)
 	if !ok || id == 0 {
 		fmt.Fprintf(os.Stderr, "DLFAIL resolve: %s\n", filepath.Base(romPath))
@@ -123,8 +203,14 @@ func runFetchDiscs(client *romm.Client, cfg *config.Config, romPath string, budg
 		fmt.Println("RESULT fetched=0 complete=0 reason=refused")
 		exitMode(0)
 	}
-	fmt.Printf("RESULT fetched=%d complete=%d discs_total=%d discs_present=%d\n",
-		st.fetched, b2i(st.complete()), st.total, st.present)
+	// "cancelled=1" is ADDITIVE: the user's B-press stopped the transfer loop —
+	// verified discs stay listed, the partial .tmp stays for resume.
+	cancelSuffix := ""
+	if st.cancelled {
+		cancelSuffix = " cancelled=1"
+	}
+	fmt.Printf("RESULT fetched=%d complete=%d discs_total=%d discs_present=%d%s\n",
+		st.fetched, b2i(st.complete()), st.total, st.present, cancelSuffix)
 	exitMode(0)
 }
 

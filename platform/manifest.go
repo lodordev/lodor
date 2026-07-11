@@ -73,6 +73,15 @@ type ManifestEntry struct {
 	Kind      string `json:"kind"`
 	RomID     int    `json:"rom_id,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
+	// Discs is the CANONICAL full disc list of a multi-disc game (lodor#7,
+	// local-only .m3u): the m3u-relative "<Game>/<disc>" lines in server (natural
+	// disc) order, recorded at first download. The on-card .m3u lists only discs
+	// with real bytes (the shipped launcher refuses to launch past a listed stub),
+	// so THIS list — not the playlist — is the full-set truth that --check-rom,
+	// the prefetch census, and the evict/uninstall sweeps key off. Empty for
+	// single-file entries and for legacy records (census then falls back to the
+	// .m3u's own refs, which on a legacy full-list card are the full set).
+	Discs []string `json:"discs,omitempty"`
 }
 
 // Manifest is the mirror's ownership ledger. Zero value is unusable; obtain one
@@ -174,6 +183,38 @@ func (m *Manifest) Record(path, kind string, romID int) {
 	if romID != 0 {
 		e.RomID = romID
 	}
+	m.Entries[rel] = e
+	m.dirty = true
+}
+
+// SetDiscs records a multi-disc game's CANONICAL full disc list (m3u-relative
+// lines, server order) on an EXISTING entry — the .m3u's stub/download record.
+// The list survives kind flips in place (stub→download on fill, download→stub on
+// evict) and rides RenamePath, so completeness stays knowable across the game's
+// whole lifecycle. No entry → no-op (ownership is never invented here; Record
+// first). Setting an equal list doesn't dirty the manifest.
+func (m *Manifest) SetDiscs(path string, discs []string) {
+	if m == nil || path == "" {
+		return
+	}
+	rel := manifestRel(path)
+	e, ok := m.Entries[rel]
+	if !ok {
+		return
+	}
+	if len(e.Discs) == len(discs) {
+		same := true
+		for i := range discs {
+			if e.Discs[i] != discs[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return
+		}
+	}
+	e.Discs = append([]string(nil), discs...)
 	m.Entries[rel] = e
 	m.dirty = true
 }

@@ -5,19 +5,23 @@ package main
 // Multi-disc folder-rom download coverage — DISC-1-FIRST (lodor#7 hybrid) plus the
 // original task #49/#74 shapes. Proofs against a fake RomM:
 //
-//   1. LAUNCH PATH (budget=1): a fresh N-disc game downloads ONLY disc 1, writes the
-//      FULL .m3u, and leaves discs 2..N as honest 0-byte stubs (fast time-to-play,
-//      card space paid per disc reached).
+//   1. LAUNCH PATH (budget=1): a fresh N-disc game downloads ONLY disc 1, writes a
+//      LOCAL-ONLY .m3u (just the discs with real bytes — the shipped LodorOS
+//      launcher refuses to launch past a listed stub), persists the FULL canonical
+//      disc list on the manifest record, and leaves discs 2..N as honest 0-byte
+//      stubs in the folder (never in the playlist).
 //   2. NEXT-DISC ORDERING: with disc 1 present, the next budget=1 run fetches disc 2
-//      (m3u order), never re-pulling a verified disc (idempotent per-disc resume —
-//      asserted by counting server hits).
+//      (canonical order), never re-pulling a verified disc (idempotent per-disc
+//      resume — asserted by counting server hits), and APPENDS it to the .m3u.
 //   3. FETCH-ALL (budget<0, --fetch-discs / daemon prefetch): completes the whole
 //      set; from fresh it downloads every disc (the pre-#7 behavior, still needed).
 //   4. RESUME AFTER INTERRUPT: a failed disc-2 transfer KEEPS the landed disc 1
-//      (pre-#7 the whole folder was RemoveAll'd) and a later run completes the set
-//      without re-downloading disc 1.
-//   5. OFFLINE COMPLETENESS CENSUS: catalog.M3UCompleteness + the manifest walk
-//      (IncompleteMultiDiscDownloads) that --check-rom and --prefetch-discs ride.
+//      (pre-#7 the whole folder was RemoveAll'd), which is ALREADY listed in the
+//      local-only .m3u (playable now), and a later run completes the set without
+//      re-downloading disc 1.
+//   5. OFFLINE COMPLETENESS CENSUS: catalog.RomDiscCompleteness (manifest-first) +
+//      the manifest walk (IncompleteMultiDiscDownloads) that --check-rom and
+//      --prefetch-discs ride — a local-only .m3u alone can no longer answer this.
 //   6. EVICT ON PARTIAL: "Delete from card" on a disc-1-only game removes the real
 //      disc AND the stubs, leaving the canonical 0-byte cloud stub shape.
 
@@ -193,6 +197,32 @@ const fullM3U = "Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 1).chd\n"
 	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 2).chd\n" +
 	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 3).chd\n"
 
+// canonDiscLines is the manifest-recorded canonical disc list (m3u-relative,
+// server order) downloadMultiDiscCore must persist at first download.
+var canonDiscLines = []string{
+	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 1).chd",
+	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 2).chd",
+	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 3).chd",
+}
+
+// assertCanonDiscs asserts the .m3u's manifest entry carries the full canonical
+// disc list (re-loaded from disk — the persisted truth, not the in-memory copy).
+func assertCanonDiscs(t *testing.T, m3u string) {
+	t.Helper()
+	e, ok := platform.LoadManifest().Entry(m3u)
+	if !ok {
+		t.Fatalf("no manifest entry for %s", m3u)
+	}
+	if len(e.Discs) != len(canonDiscLines) {
+		t.Fatalf("manifest discs = %v, want %v", e.Discs, canonDiscLines)
+	}
+	for i := range canonDiscLines {
+		if e.Discs[i] != canonDiscLines[i] {
+			t.Fatalf("manifest discs[%d] = %q, want %q", i, e.Discs[i], canonDiscLines[i])
+		}
+	}
+}
+
 // assertDisc checks one disc file's exact state: "real" (fixture bytes), "stub"
 // (exists, 0 bytes) or "absent".
 func assertDisc(t *testing.T, discDir string, rom romm.Rom, i int, want string) {
@@ -221,8 +251,11 @@ func assertDisc(t *testing.T, discDir string, rom romm.Rom, i int, want string) 
 }
 
 // TestDownloadMultiDiscCore_Disc1FirstLaunch is the lodor#7 core proof: the launch
-// path (budget=1) on a fresh game lands ONLY disc 1, writes the FULL .m3u, stubs
-// discs 2/3, and reports honest total/present/fetched accounting.
+// path (budget=1) on a fresh game lands ONLY disc 1, writes the LOCAL-ONLY .m3u
+// (disc 1 alone — the shipped launcher parses the playlist pre-launch and refuses
+// to launch past a listed stub; the full-list shape was the hardware-verified
+// never-launches regression), persists the canonical 3-disc list on the manifest,
+// stubs discs 2/3 in the folder, and reports honest total/present/fetched.
 func TestDownloadMultiDiscCore_Disc1FirstLaunch(t *testing.T) {
 	ms := multiDiscServer(t)
 	defer ms.srv.Close()
@@ -247,9 +280,11 @@ func TestDownloadMultiDiscCore_Disc1FirstLaunch(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("m3u not written: %v", rerr)
 	}
-	if string(data) != fullM3U {
-		t.Errorf("m3u contents:\n%q\nwant FULL playlist:\n%q", string(data), fullM3U)
+	wantM3U := canonDiscLines[0] + "\n"
+	if string(data) != wantM3U {
+		t.Errorf("m3u contents:\n%q\nwant LOCAL-ONLY playlist (disc 1 alone):\n%q", string(data), wantM3U)
 	}
+	assertCanonDiscs(t, m3u)
 	if st.total != 3 || st.present != 1 || st.fetched != 1 || !st.multi {
 		t.Errorf("stats = %+v, want {multi:true total:3 present:1 fetched:1}", st)
 	}
@@ -296,6 +331,12 @@ func TestDownloadMultiDiscCore_NextDiscOrdering(t *testing.T) {
 	assertDisc(t, discDir, rom, 2, "stub")
 	if st2.present != 2 || st2.fetched != 1 {
 		t.Errorf("launch 2 stats = %+v, want present:2 fetched:1", st2)
+	}
+	// The verified disc 2 was APPENDED to the local-only playlist (canonical order);
+	// still-stub disc 3 stays unlisted.
+	_, _, m3u := mdPaths(base)
+	if data, _ := os.ReadFile(m3u); string(data) != canonDiscLines[0]+"\n"+canonDiscLines[1]+"\n" {
+		t.Errorf("m3u after launch 2:\n%q\nwant discs 1+2 only", string(data))
 	}
 	// Launch 3: disc 3 completes the set.
 	man = platform.LoadManifest()
@@ -374,9 +415,12 @@ func TestDownloadMultiDiscCore_ResumeAfterInterrupt(t *testing.T) {
 		t.Fatalf("fetch-all with a failing disc reported success")
 	}
 	assertDisc(t, discDir, rom, 0, "real") // the landed disc STAYS
-	if _, serr := os.Stat(m3u); serr == nil {
-		t.Errorf("m3u written despite the failed run (no stub existed before)")
+	// The playlist was rewritten AS disc 1 verified (before disc 2 failed), so the
+	// game is playable on the discs it has RIGHT NOW — local-only, disc 1 alone.
+	if data, rerr := os.ReadFile(m3u); rerr != nil || string(data) != canonDiscLines[0]+"\n" {
+		t.Errorf("m3u after interrupted run = %q (err %v), want disc 1 alone", string(data), rerr)
 	}
+	assertCanonDiscs(t, m3u) // the canonical full list survived the failed run
 	if st.present != 1 || st.fetched != 1 {
 		t.Errorf("interrupted stats = %+v, want present:1 fetched:1", st)
 	}
@@ -400,8 +444,9 @@ func TestDownloadMultiDiscCore_ResumeAfterInterrupt(t *testing.T) {
 }
 
 // TestMultiDiscCompletenessCensus: the OFFLINE detection the hooks (--check-rom) and
-// daemons (--prefetch-discs) ride — M3UCompleteness on the file shape, and the
-// manifest walk finding exactly the downloaded-but-incomplete games.
+// daemons (--prefetch-discs) ride — RomDiscCompleteness (manifest-first: the
+// local-only .m3u lists only present discs, so its own refs always read "complete"),
+// and the manifest walk finding exactly the downloaded-but-incomplete games.
 func TestMultiDiscCompletenessCensus(t *testing.T) {
 	ms := multiDiscServer(t)
 	defer ms.srv.Close()
@@ -430,9 +475,15 @@ func TestMultiDiscCompletenessCensus(t *testing.T) {
 	if ok := downloadMultiDiscCore(client, cfg, rom, rom.Name, man, 1, &st); !ok {
 		t.Fatalf("launch download failed")
 	}
-	total, present := catalog.M3UCompleteness(m3u)
+	total, present := catalog.RomDiscCompleteness(platform.LoadManifest(), m3u)
 	if total != 3 || present != 1 {
-		t.Errorf("M3UCompleteness = %d/%d, want 1/3 present", present, total)
+		t.Errorf("RomDiscCompleteness = %d/%d, want 1/3 present", present, total)
+	}
+	// The local-only playlist ITSELF reads complete by its own refs — the exact
+	// launcher-side property that fixes the never-launches regression; the census
+	// above must come from the manifest, never the playlist.
+	if mTot, mPres := catalog.M3UCompleteness(m3u); mTot != 1 || mPres != 1 {
+		t.Errorf("local-only m3u refs census = %d/%d, want 1/1 (only present discs listed)", mPres, mTot)
 	}
 	inc := catalog.IncompleteMultiDiscDownloads()
 	if len(inc) != 1 || inc[0].Total != 3 || inc[0].Present != 1 || inc[0].Path != m3u {
@@ -453,9 +504,11 @@ func TestMultiDiscCompletenessCensus(t *testing.T) {
 }
 
 // TestEvictPartialMultiDisc: "Delete from card" on a disc-1-only game removes the
-// real disc AND the 0-byte stubs, drops the per-game folder, and leaves the m3u as
-// the canonical 0-byte cloud stub — the disc-1-first partial state must never wedge
-// the evict path (evictDiscFiles reads the m3u, which lists ALL discs).
+// real disc AND the 0-byte stubs AND an interrupted .tmp partial, drops the
+// per-game folder, and leaves the m3u as the canonical 0-byte cloud stub. Under
+// the local-only .m3u the playlist lists ONLY disc 1 — the stubs and the partial
+// are unlisted, so this is the manifest-canonical-refs + owned-folder sweep's
+// regression guard (m3u refs alone would strand them forever).
 func TestEvictPartialMultiDisc(t *testing.T) {
 	ms := multiDiscServer(t)
 	defer ms.srv.Close()
@@ -472,13 +525,23 @@ func TestEvictPartialMultiDisc(t *testing.T) {
 	}
 	_, discDir, m3u := mdPaths(base)
 
+	// An interrupted disc-2 transfer's partial — unlisted anywhere; only the
+	// owned-folder sweep can reclaim it.
+	tmpPartial := filepath.Join(discDir, rom.Files[1].FileName+".tmp")
+	if werr := os.WriteFile(tmpPartial, []byte("PARTIAL"), 0o644); werr != nil {
+		t.Fatal(werr)
+	}
+
 	evicted, reason := catalog.EvictToStub(cfg, m3u)
 	if !evicted {
 		t.Fatalf("evict of a partial multi-disc failed: reason=%s", reason)
 	}
-	// Every disc file (real + stubs) is gone and the folder fell with them.
+	// Every disc file (real + stubs + the .tmp partial) is gone and the folder fell.
 	for i := range rom.Files {
 		assertDisc(t, discDir, rom, i, "absent")
+	}
+	if _, serr := os.Stat(tmpPartial); serr == nil {
+		t.Errorf(".tmp partial survived the evict sweep")
 	}
 	if _, serr := os.Stat(discDir); serr == nil {
 		t.Errorf("disc folder still present after evict")

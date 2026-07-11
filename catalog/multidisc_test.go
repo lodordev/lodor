@@ -107,6 +107,71 @@ func TestMirrorToleratesPartialMultiDisc(t *testing.T) {
 	}
 }
 
+// TestMirrorNeverRestoresFullListM3U (local-only .m3u regression guard): the card
+// holds the NEW shape — a real .m3u listing ONLY the present disc, the full
+// canonical list on the manifest record, a 0-byte stub disc in the folder. A
+// mirror refresh must leave the playlist byte-identical (the shipped launcher
+// refuses to launch past a listed stub, so "restoring" the full list would
+// reintroduce the never-launches regression) and must keep the manifest's
+// canonical disc list intact.
+func TestMirrorNeverRestoresFullListM3U(t *testing.T) {
+	if platform.HostShowsStateNatively() {
+		t.Skip("marker-less host (hard-true build tag): marked-name expectations do not apply")
+	}
+	base := mergeTestEnv(t)
+	mkdirAll(t, base, ".system/tg5040/paks/Emus/PS.pak")
+
+	rom := mdCatalogRom()
+	cfg := &config.Config{
+		MirrorMode: config.MirrorModeMerge,
+		DirectoryMappings: map[string]config.DirMapping{
+			"psx": {Slug: "psx", RelativePath: "PlayStation (PS)"},
+		},
+	}
+
+	// LOCAL-ONLY playlist: disc 1 alone; disc 2 exists only as a folder stub.
+	localBody := "Chrono Cross (USA)/Chrono Cross (USA) (Disc 1).chd\n"
+	canon := []string{
+		"Chrono Cross (USA)/Chrono Cross (USA) (Disc 1).chd",
+		"Chrono Cross (USA)/Chrono Cross (USA) (Disc 2).chd",
+	}
+	marked := writeCard(t, base, "Roms/PlayStation (PS)/"+platform.MarkerOnDevice+"Chrono Cross (USA).m3u", []byte(localBody))
+	disc1 := writeCard(t, base, "Roms/PlayStation (PS)/Chrono Cross (USA)/Chrono Cross (USA) (Disc 1).chd", []byte("DISC1"))
+	writeCard(t, base, "Roms/PlayStation (PS)/Chrono Cross (USA)/Chrono Cross (USA) (Disc 2).chd", nil) // unlisted stub
+
+	man := platform.LoadManifest()
+	man.Record(marked, platform.ManifestDownload, rom.ID)
+	man.Record(filepath.Dir(disc1), platform.ManifestFolder, rom.ID)
+	man.SetDiscs(marked, canon)
+	if err := man.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &mergeFake{
+		platforms: []romm.Platform{{ID: 9, FsSlug: "psx", Name: "PlayStation", RomCount: 1}},
+		roms:      map[int][]romm.Rom{9: {rom}},
+	}
+	if _, _, _, _, _, _, err := MirrorCatalog(fake, cfg, nil, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, rerr := os.ReadFile(marked); rerr != nil || string(got) != localBody {
+		t.Errorf("mirror rewrote the local-only m3u: err=%v content=%q (must stay disc-1-only)", rerr, string(got))
+	}
+	man = platform.LoadManifest()
+	e, ok := man.Entry(marked)
+	if !ok || e.Kind != platform.ManifestDownload {
+		t.Fatalf("manifest entry lost/rekinded by mirror: %+v ok=%v", e, ok)
+	}
+	if len(e.Discs) != 2 || e.Discs[0] != canon[0] || e.Discs[1] != canon[1] {
+		t.Errorf("canonical disc list disturbed by mirror: %v", e.Discs)
+	}
+	// The offline census still sees the honest 1-of-2 state through the manifest.
+	if total, present := RomDiscCompleteness(man, marked); total != 2 || present != 1 {
+		t.Errorf("census after mirror = %d/%d, want 1/2", present, total)
+	}
+}
+
 // TestReconcileToleratesStubDiscs: the post-launch ✘→✓ flip must promote a real
 // (populated) .m3u whose later discs are still 0-byte stubs — the m3u itself has
 // bytes, so the game is "on device" the moment disc 1 landed.
