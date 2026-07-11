@@ -55,7 +55,7 @@ func TestStageHappyPath(t *testing.T) {
 	srv := serveBytes(t, zipBytes)
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)), SHA256: sum(zipBytes)}
-	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err != nil {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil, nil); err != nil {
 		t.Fatalf("Stage: %v", err)
 	}
 	for _, p := range []string{
@@ -91,7 +91,7 @@ func TestStageReportsRealProgress(t *testing.T) {
 		phases = append(phases, phase)
 		pcts = append(pcts, pct)
 	}
-	if err := Stage(asset, dir, "0.9.9", time.Minute, prog); err != nil {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, prog, nil); err != nil {
 		t.Fatalf("Stage: %v", err)
 	}
 	if len(pcts) == 0 {
@@ -132,7 +132,7 @@ func TestStageHashMismatchRemovesStaging(t *testing.T) {
 	srv := serveBytes(t, zipBytes)
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)), SHA256: sum([]byte("something else"))}
-	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err != ErrHashMismatch {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil, nil); err != ErrHashMismatch {
 		t.Fatalf("Stage = %v, want ErrHashMismatch", err)
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
@@ -145,7 +145,7 @@ func TestStageSizeMismatchIsHashMismatch(t *testing.T) {
 	srv := serveBytes(t, zipBytes)
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)) + 5, SHA256: sum(zipBytes)}
-	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err != ErrHashMismatch {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil, nil); err != ErrHashMismatch {
 		t.Fatalf("Stage = %v, want ErrHashMismatch on size mismatch", err)
 	}
 }
@@ -166,7 +166,7 @@ func TestStageZipSlipRejected(t *testing.T) {
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "inner", StageDirName)
 	asset := Asset{URL: srv.URL, Size: int64(len(zipBytes)), SHA256: sum(zipBytes)}
-	if err := Stage(asset, dir, "0.9.9", time.Minute, nil); err == nil {
+	if err := Stage(asset, dir, "0.9.9", time.Minute, nil, nil); err == nil {
 		t.Fatal("Stage accepted a zip-slip archive")
 	}
 	if _, err := os.Stat(filepath.Join(parent, "inner", "evil.sh")); !os.IsNotExist(err) {
@@ -180,7 +180,7 @@ func TestStageZipSlipRejected(t *testing.T) {
 func TestStageUnreachableHost(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), StageDirName)
 	asset := Asset{URL: "http://127.0.0.1:1/nope.zip", Size: 1, SHA256: "00"}
-	if err := Stage(asset, dir, "0.9.9", 2*time.Second, nil); err == nil {
+	if err := Stage(asset, dir, "0.9.9", 2*time.Second, nil, nil); err == nil {
 		t.Fatal("Stage succeeded against a dead host")
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {

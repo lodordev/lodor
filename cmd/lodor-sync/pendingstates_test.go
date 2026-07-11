@@ -108,12 +108,12 @@ func TestDrainPendingStatesPushesAndEmpties(t *testing.T) {
 		t.Fatal(err)
 	}
 	var lines []string
-	total, drained, stuck := drainPendingStates(client, cfg,
+	total, drained, stuck, cancelled := drainPendingStates(client, cfg,
 		func(rp string, res sync.PushStatesResult, kept bool) {
 			lines = append(lines, fmt.Sprintf("%s|%s|kept=%v|pushed=%d", filepath.Base(rp), res.Reason, kept, res.Pushed))
 		})
-	if total != 1 || drained != 1 || len(stuck) != 0 {
-		t.Fatalf("drain: total=%d drained=%d stuck=%v (%v)", total, drained, stuck, lines)
+	if total != 1 || drained != 1 || len(stuck) != 0 || cancelled {
+		t.Fatalf("drain: total=%d drained=%d stuck=%v cancelled=%v (%v)", total, drained, stuck, cancelled, lines)
 	}
 	if uploads != 1 {
 		t.Fatalf("uploads = %d, want 1", uploads)
@@ -129,7 +129,7 @@ func TestDrainPendingStatesKeepsOfflineRom(t *testing.T) {
 	if _, err := enqueuePendingState(romPath); err != nil {
 		t.Fatal(err)
 	}
-	total, drained, stuck := drainPendingStates(client, cfg, nil)
+	total, drained, stuck, _ := drainPendingStates(client, cfg, nil)
 	if total != 1 || drained != 0 || len(stuck) != 1 {
 		t.Fatalf("offline drain: total=%d drained=%d stuck=%v", total, drained, stuck)
 	}
@@ -148,7 +148,7 @@ func TestDrainPendingStatesDropsWhenDark(t *testing.T) {
 	if _, err := enqueuePendingState(romPath); err != nil {
 		t.Fatal(err)
 	}
-	total, drained, stuck := drainPendingStates(client, cfg, nil)
+	total, drained, stuck, _ := drainPendingStates(client, cfg, nil)
 	if total != 1 || drained != 1 || len(stuck) != 0 {
 		t.Fatalf("dark drain: total=%d drained=%d stuck=%v", total, drained, stuck)
 	}
@@ -191,5 +191,47 @@ func TestPushAllStatesOfflineEnqueues(t *testing.T) {
 	queued := pendingReadFile(pendingStatesPath())
 	if len(queued) != 1 || queued[0] != romPath {
 		t.Fatalf("pending-states.txt = %v, want exactly [%s] (only the ROM with local states)", queued, romPath)
+	}
+}
+
+// TestDrainPendingStatesCancelKeepsQueue (lodor#42): a cancel BETWEEN entries
+// stops the drain, reports cancelled=true, and keeps every not-yet-attempted
+// entry queued — a B-press must never silently drop a parked state.
+func TestDrainPendingStatesCancelKeepsQueue(t *testing.T) {
+	client, cfg, romPath := pendingStatesEnv(t, "http://127.0.0.1:9")
+	if _, err := enqueuePendingState(romPath); err != nil {
+		t.Fatal(err)
+	}
+	client.CancelCheck = func() bool { return true } // sentinel already down
+	reported := 0
+	total, drained, stuck, cancelled := drainPendingStates(client, cfg,
+		func(string, sync.PushStatesResult, bool) { reported++ })
+	if !cancelled || total != 1 || drained != 0 || len(stuck) != 1 || reported != 0 {
+		t.Fatalf("cancelled drain: total=%d drained=%d stuck=%v cancelled=%v reported=%d",
+			total, drained, stuck, cancelled, reported)
+	}
+	if left := pendingReadFile(pendingStatesPath()); len(left) != 1 || left[0] != romPath {
+		t.Fatalf("cancelled entry must stay queued: %v", left)
+	}
+}
+
+// TestPushAllStatesCancelStopsSweep (lodor#42): the bulk sweep honors the
+// sentinel BETWEEN ROMs — Cancelled reported, no per-ROM push attempted.
+func TestPushAllStatesCancelStopsSweep(t *testing.T) {
+	client, cfg, _ := pendingStatesEnv(t, "http://127.0.0.1:9")
+	// pendingStatesEnv's index has an empty by_id; the sweep walks by_id, so give
+	// it one mapped ROM (same shape as TestPushAllStatesOfflineEnqueues).
+	idx := `{"version":1,"platforms":{"gamegear":{` +
+		`"by_basename":{"Woody Pop (USA, Europe, Brazil) (En)":9752},` +
+		`"by_fsname":{"Woody Pop (USA, Europe, Brazil) (En).gg":9752},` +
+		`"by_id":{"9752":"Roms/Sega Game Gear/Woody Pop (USA, Europe, Brazil) (En).gg"}}}}`
+	if err := os.WriteFile(filepath.Join(os.Getenv("LODOR_PAK_DIR"), "catalog-index.json"), []byte(idx), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	client.CancelCheck = func() bool { return true }
+	called := 0
+	res := sync.PushAllLocalStates(client, cfg, func(string, sync.PushStatesResult) { called++ })
+	if !res.Cancelled || res.Pushed != 0 || called != 0 {
+		t.Fatalf("cancelled sweep: %+v called=%d", res, called)
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"lodor/buildinfo"
+	"lodor/covercancel"
+	"lodor/syncstamp"
 	"lodor/ui"
 )
 
@@ -196,6 +198,108 @@ func TestMenuConditionalRows(t *testing.T) {
 	// dynamic labels reflect state.
 	if findRow(full, "Switch user (Neo)") != actSwitchUser {
 		t.Error("Switch user label must carry the active profile")
+	}
+}
+
+// TestMenuLastSyncedRow (#43): the "Last synced" row appears ONLY once a verified
+// sync stamped the record, renders the relative age, and drills into Recent
+// activity. Never synced = no row (no fake freshness).
+func TestMenuLastSyncedRow(t *testing.T) {
+	base := buildMenuRows(menuState{userLabel: "Default"})
+	if findRow(base, "Last synced") != menuAct(-1) {
+		t.Error("Last synced row must be absent before any verified sync")
+	}
+	rows := buildMenuRows(menuState{userLabel: "Default", lastSync: "2h ago"})
+	if findRow(rows, "Last synced: 2h ago") != actRecent {
+		t.Error("Last synced row missing or not mapped to Recent activity")
+	}
+	// It sits directly under Sync now — freshness beside the action that refreshes it.
+	for i, r := range rows {
+		if r.label == "Sync now" {
+			if i+1 >= len(rows) || !strings.HasPrefix(rows[i+1].label, "Last synced:") {
+				t.Error("Last synced row must directly follow Sync now")
+			}
+			break
+		}
+	}
+}
+
+// TestLastSyncAgeReadsStamp (#43): the wizard's menu-state reader renders the
+// engine's stamp as a relative age, and "" when the stamp is missing.
+func TestLastSyncAgeReadsStamp(t *testing.T) {
+	dir := t.TempDir()
+	w := &wizard{t: ui.DefaultTheme(), dataDir: dir}
+	if got := w.lastSyncAge(); got != "" {
+		t.Fatalf("lastSyncAge with no stamp = %q, want \"\"", got)
+	}
+	if err := syncstamp.WriteAt(dir, time.Now().Unix()-7200, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.lastSyncAge(); got != "2h ago" {
+		t.Fatalf("lastSyncAge = %q, want \"2h ago\"", got)
+	}
+}
+
+// ── lodor#42: cancelable background ops ──────────────────────────────────────
+
+// writeFakeEngine writes a shell script standing in for lodor-sync.
+func writeFakeEngine(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "fake-engine.sh")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestRunEngineCancellableBCancels: B during a long op writes the cancel sentinel
+// (the engine's --cancellable contract), the run reports cancelled, the engine's
+// argv carried --cancellable, and the sentinel never leaks past the run.
+func TestRunEngineCancellableBCancels(t *testing.T) {
+	covercancel.Clear()
+	argsFile := filepath.Join(t.TempDir(), "args.txt")
+	// Fake engine: record argv, then behave like a real armed mode — poll the
+	// sentinel between "items" and exit 0 the moment it appears; 7 = never saw it.
+	bin := writeFakeEngine(t, `echo "$@" > `+argsFile+`
+i=0
+while [ $i -lt 100 ]; do
+	[ -f /tmp/lodor-cover-cancel ] && { echo "RESULT pushed=1 total=3 stuck=2 cancelled=1"; exit 0; }
+	i=$((i+1)); sleep 0.1
+done
+exit 7`)
+	w := &wizard{t: ui.DefaultTheme(), dataDir: t.TempDir(), bin: bin}
+	w.in = ui.NewScriptedSource([]ui.Button{ui.BtnBack})
+	out, rc, cancelled := w.runEngineCancellable("Sync now", "phase", func(*ui.Canvas) {}, "--push-pending")
+	if !cancelled || rc != 0 {
+		t.Fatalf("cancelled run: rc=%d cancelled=%v out=%q", rc, cancelled, out)
+	}
+	if !strings.Contains(out, "cancelled=1") {
+		t.Fatalf("engine output not captured: %q", out)
+	}
+	args, _ := os.ReadFile(argsFile)
+	if !strings.Contains(string(args), "--cancellable") {
+		t.Fatalf("engine must be invoked with --cancellable, got argv: %q", args)
+	}
+	if covercancel.Requested() {
+		t.Fatal("sentinel must be cleared after a cancelled run (must not leak into the next op)")
+	}
+}
+
+// TestRunEngineCancellableCompletes: no B — output captured, rc honest, not cancelled.
+// Also covers the nil-input path (off-hardware callers without an input source).
+func TestRunEngineCancellableCompletes(t *testing.T) {
+	covercancel.Clear()
+	bin := writeFakeEngine(t, `echo "RESULT pushed=2 total=2 stuck=0"; exit 0`)
+	w := &wizard{t: ui.DefaultTheme(), dataDir: t.TempDir(), bin: bin}
+	out, rc, cancelled := w.runEngineCancellable("Sync now", "phase", func(*ui.Canvas) {}, "--push-pending")
+	if cancelled || rc != 0 || !strings.Contains(out, "RESULT pushed=2") {
+		t.Fatalf("clean run: rc=%d cancelled=%v out=%q", rc, cancelled, out)
+	}
+	bin = writeFakeEngine(t, `exit 4`)
+	w = &wizard{t: ui.DefaultTheme(), dataDir: t.TempDir(), bin: bin}
+	_, rc, cancelled = w.runEngineCancellable("Sync now", "phase", func(*ui.Canvas) {}, "--pull-saves")
+	if cancelled || rc != 4 {
+		t.Fatalf("failing run: rc=%d cancelled=%v, want rc=4 uncancelled", rc, cancelled)
 	}
 }
 
@@ -656,6 +760,29 @@ func TestHostCopyTable(t *testing.T) {
 	}
 	if kn.updateVenue != "GitHub zip" {
 		t.Fatalf("knulli venue = %q", kn.updateVenue)
+	}
+}
+
+// knulli#2: the uninstall finish copy must name Knulli's four real install paths — there
+// is no "Lodor app" to delete on that host; muOS keeps the app-delete instruction.
+func TestRemoveDoneCopyPerHost(t *testing.T) {
+	mu, kn := hostCopyFor("muos"), hostCopyFor("knulli")
+	if !strings.Contains(mu.removeDone, "Delete the Lodor app") {
+		t.Fatalf("muos removeDone lost the app-delete instruction: %q", mu.removeDone)
+	}
+	for _, want := range []string{
+		"system/lodor",
+		"system/scripts/lodor-hook.sh",
+		"system/services/lodor",
+		"roms/ports/Lodor.sh",
+		"/userdata",
+	} {
+		if !strings.Contains(kn.removeDone, want) {
+			t.Fatalf("knulli removeDone missing %q: %q", want, kn.removeDone)
+		}
+	}
+	if strings.Contains(kn.removeDone, "Lodor app") {
+		t.Fatalf("knulli removeDone still tells the user to delete an app: %q", kn.removeDone)
 	}
 }
 

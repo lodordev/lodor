@@ -94,12 +94,28 @@ func runDownloadQueue(client *romm.Client, cfg *config.Config) {
 	landed := make(map[string]bool, total)
 	downloaded := 0
 	failed := 0
+	cancelledRun := false
 	for i, line := range queue {
+		// REAL CANCEL (lodor#42, B-press sentinel via --cancellable), checked BETWEEN
+		// items before committing to the next transfer: games already landed are
+		// verified and dropped from the queue; the rest stay queued for next run.
+		if client.CancelCheck != nil && client.CancelCheck() {
+			cancelledRun = true
+			fmt.Fprintf(os.Stderr, "CANCEL download-queue before item %d/%d\n", i+1, total)
+			break
+		}
 		name := strings.TrimSuffix(platform.StripLeadingMarker(filepath.Base(line)), filepath.Ext(line))
 		writePhase(fmt.Sprintf("Downloading %d/%d — %s…", i+1, total, name))
-		if downloadRomCore(client, cfg, queueAbsPath(line)) {
+		ok, st := downloadRomCoreStats(client, cfg, queueAbsPath(line))
+		if ok {
 			landed[line] = true
 			downloaded++
+		} else if st.cancelled {
+			// A mid-transfer B-press is a CANCEL, not a failure: the partial .tmp is
+			// kept for resume and the entry stays queued. Stop the batch here.
+			cancelledRun = true
+			fmt.Fprintf(os.Stderr, "CANCEL download-queue during item %d/%d\n", i+1, total)
+			break
 		} else {
 			failed++
 		}
@@ -123,9 +139,15 @@ func runDownloadQueue(client *romm.Client, cfg *config.Config) {
 	release()
 
 	writeProgress(100)
-	fmt.Printf("RESULT downloaded=%d failed=%d remaining=%d\n", downloaded, failed, remaining)
+	// cancelled=1 is ADDITIVE (lodor#42) — parsers key on downloaded=/failed=/remaining=.
+	cancelSuffix := ""
+	if cancelledRun {
+		cancelSuffix = " cancelled=1"
+	}
+	fmt.Printf("RESULT downloaded=%d failed=%d remaining=%d%s\n", downloaded, failed, remaining, cancelSuffix)
 	if failed > 0 {
 		exitMode(4) // ran but one or more items errored (matches the documented exit map)
 	}
+	// A cancel with no real failures exits 0: an honest stop, not an error.
 	exitMode(0)
 }

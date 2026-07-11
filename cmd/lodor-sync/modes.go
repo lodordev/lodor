@@ -1133,12 +1133,24 @@ func runDownloadBios(client *romm.Client, cfg *config.Config) {
 	}
 
 	count := 0
+	cancelledRun := false
 	for _, p := range platforms {
+		if cancelledRun {
+			break
+		}
 		fw, ferr := client.GetFirmware(p.ID)
 		if ferr != nil || len(fw) == 0 {
 			continue // no BIOS on the server for this platform
 		}
 		for _, f := range fw {
+			// REAL CANCEL (lodor#42, B-press sentinel via --cancellable), checked
+			// BETWEEN files: BIOS already written is verified and kept; the rest
+			// re-fetches next run (skip-if-present makes the retry cheap).
+			if client.CancelCheck != nil && client.CancelCheck() {
+				cancelledRun = true
+				fmt.Fprintln(os.Stderr, "CANCEL download-bios between files")
+				break
+			}
 			dests := platform.BIOSFilePaths(f.FileName, p.FsSlug)
 			if len(dests) == 0 {
 				continue
@@ -1177,7 +1189,12 @@ func runDownloadBios(client *romm.Client, cfg *config.Config) {
 			}
 		}
 	}
-	fmt.Printf("RESULT bios=%d\n", count)
+	// cancelled=1 is ADDITIVE (lodor#42) — existing parsers key on the bios= token.
+	if cancelledRun {
+		fmt.Printf("RESULT bios=%d cancelled=1\n", count)
+	} else {
+		fmt.Printf("RESULT bios=%d\n", count)
+	}
 	exitMode(0)
 }
 
@@ -1206,7 +1223,19 @@ func runPushPending(client *romm.Client, cfg *config.Config) {
 	var remaining []string   // entries to keep in the queue (not landed)
 	var stuckLines []string  // human "STUCK\t<game>\t<why>" lines for the launcher (stdout)
 
+	cancelledRun := false
 	for i, line := range pending {
+		// REAL CANCEL (lodor#42, B-press sentinel via --cancellable), checked BETWEEN
+		// entries before committing to the next upload: everything already landed is
+		// verified and dropped from the queue, everything not yet attempted stays
+		// queued verbatim for the next run. Never interrupts an in-flight upload —
+		// a half-sent save is worse than a short wait.
+		if client.CancelCheck != nil && client.CancelCheck() {
+			cancelledRun = true
+			fmt.Fprintf(os.Stderr, "CANCEL push-pending before item %d/%d\n", i+1, total)
+			remaining = append(remaining, pending[i:]...)
+			break
+		}
 		romPath, stagedPath, emu, isStaged := parseQueueLine(line)
 		writePhase(fmt.Sprintf("Uploading %s (%d/%d)…", filepath.Base(romPath), i+1, total))
 		if total > 0 {
@@ -1265,7 +1294,21 @@ func runPushPending(client *romm.Client, cfg *config.Config) {
 	}
 
 	notePushResults(allResults)
-	fmt.Printf("RESULT pushed=%d total=%d stuck=%d\n", pushed, len(allResults), stuck)
+	// #43: a drain that verifiably reached the server stamps the last-sync record —
+	// real uploads landed (pushed>0), or a non-empty queue fully landed (stuck==0
+	// means every save file verified on the server this run, including
+	// already-on-server dedups). An empty queue, an all-stuck (offline) run, or a
+	// CANCELLED run (saves deliberately left behind) proves nothing and never
+	// stamps — "Last synced: just now" must not paper over an unfinished drain.
+	if !cancelledRun && (pushed > 0 || (len(allResults) > 0 && stuck == 0)) {
+		stampSync(pushed, 0)
+	}
+	// cancelled=1 is ADDITIVE (lodor#42) — existing parsers key on pushed=/stuck=.
+	cancelSuffix := ""
+	if cancelledRun {
+		cancelSuffix = " cancelled=1"
+	}
+	fmt.Printf("RESULT pushed=%d total=%d stuck=%d%s\n", pushed, len(allResults), stuck, cancelSuffix)
 	for _, s := range stuckLines {
 		fmt.Println(s)
 	}
@@ -1345,6 +1388,12 @@ func runSyncSave(client *romm.Client, cfg *config.Config, romPath string) {
 	uploaded := sync.Uploaded(pushResults)
 
 	writeProgress(100)
+	// #43: stamp when the server verifiably answered — a real upload landed, or the
+	// pull leg's outcome required a server listing (pullSawServer). An offline /
+	// resolve-failed run never stamps.
+	if uploaded >= 1 || pullSawServer(pull) {
+		stampSync(b2i(pull.Pulled())+uploaded, 0)
+	}
 	fmt.Printf("RESULT pulled=%d pushed=%d ghosts=%d reason=%s\n",
 		b2i(pull.Pulled()), b2i(uploaded >= 1), pull.Ghosts, pullReasonToken(pull))
 	exitMode(0)
@@ -1403,6 +1452,9 @@ func runPushSave(client *romm.Client, cfg *config.Config, romPath string) {
 		if err := writeLastSynced(romPath, pushed); err != nil {
 			fmt.Fprintf(os.Stderr, "push-save: WARN couldn't write synced signal: %s\n", safeErr(err))
 		}
+		// #43: the landed, hash-verified push is exactly the "last synced" moment —
+		// stamp the generalized record beside the launcher's one-shot ✓ signal.
+		stampSync(pushed, 0)
 		// Cross-device sidecars (#146/#149): with the save landed (radio warm,
 		// server reachable), push this ROM's compact .lodortime record and its
 		// newest preview alongside it. BEST-EFFORT: never changes this mode's
@@ -1700,6 +1752,8 @@ func runRestoreSave(client *romm.Client, cfg *config.Config, romPath, saveIDArg 
 		// auto-load it over the freshly-restored save. Best-effort, fail-safe
 		// (only retires after a clean state push); never blocks the restore.
 		retired, _ := sync.RetireAutoStateAfterRestore(client, cfg, romPath)
+		// #43: a landed flashback restore is a verified server transfer — stamp it.
+		stampSync(1, 0)
 		fmt.Printf("RESULT restored=1 staged=%d retiredauto=%d\n", staged, b2i(retired))
 	} else {
 		reason := "download"
@@ -1910,12 +1964,14 @@ func runPullSaves(client *romm.Client, cfg *config.Config, includeDeleted bool) 
 	}
 	newest := map[int]time.Time{}
 	ghosts := 0
+	listedOK := false // #43: at least one saves listing answered — server contact proven
 	for _, p := range platforms {
 		saves, gerr := client.GetSaves(romm.SaveQuery{PlatformID: p.ID})
 		if gerr != nil {
 			noteAuthErr(gerr)
 			continue
 		}
+		listedOK = true
 		for _, s := range saves {
 			if sync.IsMetaSave(s) {
 				continue // meta sidecar (#146): not a save — never counted, never pulled here
@@ -1955,7 +2011,17 @@ func runPullSaves(client *romm.Client, cfg *config.Config, includeDeleted bool) 
 	})
 
 	pulled, checked, pushed, tombstones := 0, 0, 0, 0
+	perItemFail := false
+	cancelledRun := false
 	for i, c := range cands {
+		// REAL CANCEL (lodor#42, B-press sentinel via --cancellable), checked BETWEEN
+		// candidates: every save already pulled/pushed is verified and stays; the
+		// rest simply wait for the next sync. Never interrupts an in-flight item.
+		if client.CancelCheck != nil && client.CancelCheck() {
+			cancelledRun = true
+			fmt.Fprintf(os.Stderr, "CANCEL pull-saves before item %d/%d\n", i+1, len(cands))
+			break
+		}
 		rel := idPath[c.romID]
 		writePhase(fmt.Sprintf("Pulling saves (%d/%d)…", i+1, len(cands)))
 		if len(cands) > 0 {
@@ -1964,6 +2030,9 @@ func runPullSaves(client *romm.Client, cfg *config.Config, includeDeleted bool) 
 		p := filepath.Join(sd, rel)
 		res := sync.PullSaveDirectOpts(client, cfg, p, sync.PullOptions{IncludeDeleted: includeDeleted})
 		notePullResult(res)
+		if !pullSawServer(res) {
+			perItemFail = true // #43: a transport/resolve failure taints the run's stamp
+		}
 		ghosts += res.Ghosts
 		checked++
 		if res.Pulled() {
@@ -1987,9 +2056,22 @@ func runPullSaves(client *romm.Client, cfg *config.Config, includeDeleted bool) 
 	}
 
 	writeProgress(100)
-	// pushed= is APPENDED (A2), tombstones= is APPENDED after it (deleted-save
-	// tombstoning) — existing parsers key on pulled=/checked=/ghosts=.
-	fmt.Printf("RESULT pulled=%d checked=%d ghosts=%d pushed=%d tombstones=%d\n", pulled, checked, ghosts, pushed, tombstones)
+	// #43: stamp when the bulk pull VERIFIABLY synced against the server — a saves
+	// listing answered (server contact) and no candidate died on transport/resolve.
+	// checked==0 with a good listing is a verified "nothing to pull" and stamps too;
+	// moved counts are honest (may be 0). A partial-failure or CANCELLED run never
+	// stamps: the user must not read "Last synced: just now" over saves that
+	// didn't travel.
+	if listedOK && !perItemFail && !cancelledRun {
+		stampSync(pulled+pushed, 0)
+	}
+	// pushed= is APPENDED (A2), tombstones= after it, cancelled=1 after that
+	// (lodor#42) — all ADDITIVE; existing parsers key on pulled=/checked=/ghosts=.
+	cancelSuffix := ""
+	if cancelledRun {
+		cancelSuffix = " cancelled=1"
+	}
+	fmt.Printf("RESULT pulled=%d checked=%d ghosts=%d pushed=%d tombstones=%d%s\n", pulled, checked, ghosts, pushed, tombstones, cancelSuffix)
 	exitMode(0)
 }
 

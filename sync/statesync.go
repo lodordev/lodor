@@ -288,6 +288,7 @@ type PushAllLocalStatesResult struct {
 	RomsWithStates  int
 	Reason          string // ok | no-manifest
 	AuthExpired     bool   // any per-ROM push hit a rejected token (PAIRING_EXPIRED)
+	Cancelled       bool   // lodor#42: the B-press sentinel stopped the sweep between ROMs
 }
 
 // sdcardRootForStates mirrors catalog's sdcardRoot / the cmd sdRoot(): the
@@ -355,6 +356,14 @@ func PushAllLocalStates(client *romm.Client, cfg *config.Config,
 		}
 		sort.Ints(ids)
 		for _, id := range ids {
+			// REAL CANCEL (lodor#42, B-press sentinel via the client's CancelCheck —
+			// armed only for --cancellable interactive runs), checked BETWEEN ROMs:
+			// states already pushed are verified and retained server-side; the rest
+			// simply wait for the next sweep. Never interrupts an in-flight upload.
+			if client != nil && client.CancelCheck != nil && client.CancelCheck() {
+				res.Cancelled = true
+				return res
+			}
 			rel := byID[id]
 			if rel == "" {
 				continue

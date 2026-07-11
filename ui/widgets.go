@@ -378,7 +378,14 @@ func (t Theme) DrawTextWrappedAt(c *Canvas, x, y, w int, s string, col Color, sc
 // Progress draws a labeled progress bar (0..100) plus a phase line. Used during mirror/
 // download. pct<0 renders an indeterminate (full-dim) bar.
 func (t Theme) Progress(c *Canvas, title, phase string, pct int) {
-	x, y, w, _ := t.Frame(c, "Lodor Setup", "please wait...")
+	t.ProgressHint(c, title, phase, pct, "please wait...")
+}
+
+// ProgressHint is Progress with a caller-supplied hint line (lodor#42: the wizard's
+// cancelable long-op screens show "B: stop" — an honest affordance — instead of the
+// passive "please wait..."). Rendering is otherwise byte-identical to Progress.
+func (t Theme) ProgressHint(c *Canvas, title, phase string, pct int, hint string) {
+	x, y, w, _ := t.Frame(c, "Lodor Setup", hint)
 	c.DrawText(x, y+10, title, t.Text, t.BodyScale)
 	by := y + 10 + glyphH*t.BodyScale + 24
 	barH := 28

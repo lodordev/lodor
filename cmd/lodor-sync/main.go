@@ -75,6 +75,7 @@ func main() {
 		fetchDiscs        string
 		prefetchDiscs     bool
 		prefetchDry       bool
+		cancellable       bool
 		checkRom          string
 		reconcile         string
 		evict             string
@@ -150,6 +151,7 @@ func main() {
 	flag.StringVar(&fetchDiscs, "fetch-discs", "", "MULTI-DISC (lodor#7): fetch EVERY missing disc of this game (same per-disc verify/resume as --download); prints RESULT fetched=<N> complete=<0|1> discs_total=<T> discs_present=<P> [reason=<tok>]")
 	flag.BoolVar(&prefetchDiscs, "prefetch-discs", false, "MULTI-DISC (lodor#7) daemon leg: complete the disc set of EVERY downloaded (non-stub) .m3u game with missing discs (mirror-manifest walk); prints RESULT prefetch_roms=<N> discs_missing=<M> fetched=<F> failed=<K>; exit 4 = some game(s) failed")
 	flag.BoolVar(&prefetchDry, "dry", false, "with --prefetch-discs: OFFLINE census only — report the pending disc work without touching network or card (runs pre-config, any pairing state)")
+	flag.BoolVar(&cancellable, "cancellable", false, "INTERACTIVE runs only (lodor#42): arm the launcher's B-press cancel sentinel (/tmp/lodor-cover-cancel) for this run — batch sweeps stop between items and streaming transfers between chunks (partials kept for resume); RESULT lines gain an ADDITIVE cancelled=1 when a run stopped early. Daemons must never pass this: the sentinel is shared, so an armed background run could be killed by a foreground B-press.")
 	flag.StringVar(&checkRom, "check-rom", "", "OFFLINE pre-launch completeness gate: is this ROM fully present on the card? (multi-disc: real .m3u + every referenced disc non-empty). Filesystem-only, no config/host/device; prints RESULT complete=<0|1> [discs_total=<N> discs_present=<M>] [reason=<tok>]")
 	flag.StringVar(&reconcile, "reconcile", "", "post-launch: flip ONE downloaded ROM's on-disk state marker (✘→✓) to match the bytes now present, carrying its save+cover with the rename; offline, no device; prints RESULT reconciled=<0|1>")
 	flag.StringVar(&evict, "evict", "", "delete ONE downloaded ROM's bytes from the card and re-create its 0-byte cloud stub (✓→✘), carrying its save+cover with the rename — saves are NEVER deleted; multi-disc .m3u deletes its disc files too; offline, no device; prints RESULT evicted=<0|1> [reason=…]")
@@ -180,7 +182,7 @@ func main() {
 	flag.StringVar(&setProps, "set-props", "", "WRITE-BACK (#167): set several rom_user props at once from key=val positional args (rating,difficulty [0-10]; completion [0-100]; status; backlogged,now_playing,hidden,is_main_sibling [bool]); only the given keys are written. Prints RESULT props_set=<0|1> reason=<token>")
 	flag.BoolVar(&showVersion, "version", false, "print 'lodor-sync <version>' and exit (release builds are stamped via ldflags; anything else says dev)")
 	flag.BoolVar(&checkUpdate, "check-update", false, "SELF-UPDATE: fetch versions.json and compare against this build; prints RESULT update=<0|1> current=<v> latest=<v> channel=<ch> (+ NOTES\\t<line> when newer); exit 3 = manifest unreachable (shell stays silent). Reads update_channel from settings.conf; never writes it. Works unpaired.")
-	flag.BoolVar(&fetchUpdate, "fetch-update", false, "SELF-UPDATE (LodorOS lane): download + sha256-verify + extract this lane's update asset (key from LODOR_UPDATE_ASSET) into ./.update/tree and write the READY marker; the SHELL applies it — this mode never swaps a binary. Prints RESULT fetched=<0|1> version=<v> bytes=<n>; exit 4 = hash mismatch (staging removed).")
+	flag.BoolVar(&fetchUpdate, "fetch-update", false, "SELF-UPDATE (LodorOS lane): download + sha256-verify + extract this lane's update asset (key from LODOR_UPDATE_ASSET) into ./.update/tree and write the READY marker; the SHELL applies it — this mode never swaps a binary. An interrupted transfer keeps its partial in ./.update.partial and the next run Range-resumes it (lodor#46); with --cancellable a B-press stops the transfer honestly (RESULT gains cancelled=1, partial kept). Prints RESULT fetched=<0|1> version=<v> bytes=<n>; exit 4 = hash mismatch (staging AND partial removed).")
 	flag.StringVar(&reportSession, "report-session", "", "report ONE finished play session for the given ROM path to RomM (POST /api/play-sessions), feeding cross-device Continue/recently-played; needs --started/--ended unix epochs; best-effort, always exits 0; prints RESULT reported=<0|1>")
 	flag.Int64Var(&sessionStarted, "started", 0, "unix epoch (seconds) the play session started — used by --report-session")
 	flag.Int64Var(&sessionEnded, "ended", 0, "unix epoch (seconds) the play session ended — used by --report-session")
@@ -199,7 +201,7 @@ func main() {
 		return // always exits; defensive
 	}
 	if fetchUpdate {
-		runFetchUpdate()
+		runFetchUpdate(cancellable)
 		return // always exits; defensive
 	}
 
@@ -338,6 +340,16 @@ func main() {
 	}
 	apiTimeout := time.Duration(cfg.ApiTimeout.Int()) * time.Second
 	client := romm.NewClient(host, apiTimeout)
+	// lodor#42: an INTERACTIVE caller (--cancellable, e.g. the Go wizard's
+	// background+poll screens) arms the B-press sentinel on the shared client so
+	// batch sweeps stop between items and streamed transfers between chunks.
+	// Modes that rebuild a long-timeout dlClient below re-arm it there. Without
+	// the flag nothing changes — a daemon's run never polls the shared sentinel,
+	// so a foreground B-press can't kill a background drain (the armDownloadCancel
+	// doc's invariant, now flag-scoped instead of mode-scoped).
+	if cancellable {
+		armDownloadCancel(client)
+	}
 
 	switch {
 	case validate:
@@ -381,11 +393,17 @@ func main() {
 	case downloadBios:
 		// BIOS fetches are file transfers too — give them the download timeout.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		if cancellable {
+			armDownloadCancel(dlClient)
+		}
 		runDownloadBios(dlClient, cfg)
 	case downloadQueue:
 		// Each queued ROM is a (possibly large) file transfer — use the long download
 		// timeout, same as the single --download path it reuses.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		if cancellable {
+			armDownloadCancel(dlClient)
+		}
 		runDownloadQueue(dlClient, cfg)
 	case syncFeed:
 		runSyncFeed(client, cfg)
