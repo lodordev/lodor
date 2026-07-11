@@ -333,6 +333,20 @@ func (c *Client) DownloadRomFileTo(romID int, fsName string, fileID int, dst io.
 	return c.doRawStreamTo(path, dst, onProgress)
 }
 
+// DownloadRomFileResumeTo is DownloadRomFileTo's resumable form: it streams ONE
+// constituent file (single file_ids selector — raw bytes, real Content-Length) into
+// the open file f, RESUMING from startOffset via an HTTP Range request — the same
+// 206/200/416 contract the single-file DownloadRomContentResumeTo rides
+// (doRawStreamResumeTo). A server or proxy that can't compose file_ids with Range
+// simply answers 200 and the file is rewritten clean from byte 0, so resume is an
+// optimization, never a correctness risk. Pass startOffset=0 for a fresh download.
+// The caller owns f (open WITHOUT O_TRUNC, sync/close); the returned count is the
+// TOTAL bytes now on disk, and the final hash verify remains the ultimate gate.
+func (c *Client) DownloadRomFileResumeTo(romID int, fsName string, fileID int, f *os.File, startOffset int64, onProgress func(done, total int64)) (int64, error) {
+	path := fmt.Sprintf("/api/roms/%d/content/%s?file_ids=%d", romID, fsName, fileID)
+	return c.doRawStreamResumeTo(path, f, startOffset, onProgress)
+}
+
 // DownloadFirmwareContent fetches a BIOS/firmware file's bytes
 // (GET /api/firmware/{id}/content/{file_name}).
 func (c *Client) DownloadFirmwareContent(fwID int, fileName string) ([]byte, error) {

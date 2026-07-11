@@ -44,13 +44,16 @@ func discBytes(disc int) []byte {
 	return []byte(strings.Repeat(fmt.Sprintf("D%d-", disc), 64))
 }
 
-// mdServer wraps the fake RomM so tests can count per-disc content requests and
-// force per-disc transfer failures.
+// mdServer wraps the fake RomM so tests can count per-disc content requests,
+// force per-disc transfer failures (500 or a mid-stream cut), and inspect the
+// Range headers the engine sent (the per-disc resume contract).
 type mdServer struct {
-	srv  *httptest.Server
-	mu   sync.Mutex
-	hits map[string]int  // file_ids selector -> content request count
-	fail map[string]bool // file_ids selector -> serve a 500
+	srv    *httptest.Server
+	mu     sync.Mutex
+	hits   map[string]int      // file_ids selector -> content request count
+	fail   map[string]bool     // file_ids selector -> serve a 500
+	cut    map[string]bool     // file_ids selector -> send half the body, then abort
+	ranges map[string][]string // file_ids selector -> Range header per request ("" = none)
 }
 
 func (m *mdServer) hitCount(fileID string) int {
@@ -63,6 +66,18 @@ func (m *mdServer) setFail(fileID string, fail bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.fail[fileID] = fail
+}
+
+func (m *mdServer) setCut(fileID string, cut bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cut[fileID] = cut
+}
+
+func (m *mdServer) rangeHeaders(fileID string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.ranges[fileID]...)
 }
 
 // multiDiscServer serves one folder-rom (id 900, 3 CHD discs) — GetRom + per-disc
@@ -87,7 +102,7 @@ func multiDiscServer(t *testing.T) *mdServer {
 	byFileID := map[string][]byte{
 		"9001": discBytes(1), "9002": discBytes(2), "9003": discBytes(3),
 	}
-	ms := &mdServer{hits: map[string]int{}, fail: map[string]bool{}}
+	ms := &mdServer{hits: map[string]int{}, fail: map[string]bool{}, cut: map[string]bool{}, ranges: map[string][]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/roms/900", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -102,11 +117,40 @@ func multiDiscServer(t *testing.T) *mdServer {
 		}
 		ms.mu.Lock()
 		ms.hits[ids]++
+		ms.ranges[ids] = append(ms.ranges[ids], r.Header.Get("Range"))
 		failNow := ms.fail[ids]
+		cutNow := ms.cut[ids]
 		ms.mu.Unlock()
 		if failNow {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
+		}
+		if cutNow {
+			// Mid-stream interrupt: promise the full length, send half (flushed past
+			// the server's buffer so the client really receives it), then abort the
+			// connection — the client's io.Copy errors with a partial on disk.
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			_, _ = w.Write(body[:len(body)/2])
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		// Honor a single "bytes=N-" range like RomM's FileResponse: 206 with the
+		// remainder. An at/past-EOF offset is a 416; anything unparseable falls back
+		// to the full 200 body (the shape doRawStreamResumeTo self-heals around).
+		if rng := r.Header.Get("Range"); rng != "" {
+			var off int
+			if n, _ := fmt.Sscanf(rng, "bytes=%d-", &off); n == 1 && off >= 0 {
+				if off >= len(body) {
+					w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+				w.Header().Set("Content-Length", fmt.Sprint(len(body)-off))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(body[off:])
+				return
+			}
 		}
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body)

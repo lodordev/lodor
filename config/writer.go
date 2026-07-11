@@ -29,10 +29,15 @@ const configFileName = "config.json"
 
 // WriteProfileHost adds or updates a MULTI-USER profile in config.json's hosts array:
 // it finds the host whose profile_label matches (case-insensitive) and updates its
-// token/username/device_id/scopes, or APPENDS a new host (copying root_uri/port/
-// insecure_skip_verify from hosts[0] so the new profile points at the same server).
-// Unknown keys are preserved (map-based, like WriteHostUpdate). Password is never
-// stored (token-only at rest). label/token are required by the caller.
+// token/username/device_id/scopes, or APPENDS a new host (copying the FULL endpoint
+// from hosts[0] so the new profile points at the same server the same way). The seed
+// copy carries root_uri/port/insecure_skip_verify AND the transport fields
+// socks5_proxy/cf_access/tier/device_name: ResolveHost returns a profile host
+// VERBATIM (endpoint fields are never inherited from hosts[0] — see tiers.go), so a
+// profile seeded without its server's SOCKS5 proxy or Cloudflare Access headers
+// could never reach a Tailscale/CF-Access RomM. Unknown keys are preserved
+// (map-based, like WriteHostUpdate). Password is never stored (token-only at rest).
+// label/token are required by the caller.
 func WriteProfileHost(label, username, token, deviceID string, scopes []string) error {
 	path := configFileName
 	var root map[string]any
@@ -65,10 +70,15 @@ func WriteProfileHost(label, username, token, deviceID string, scopes []string) 
 		}
 	}
 	if target == nil {
-		// New profile: seed server fields from hosts[0] so it points at the same RomM.
+		// New profile: seed the FULL endpoint from hosts[0] so it points at the same
+		// RomM the same way. Transport fields ride along (a profile host is returned
+		// verbatim by ResolveHost — nothing is inherited later): socks5_proxy (Tailscale
+		// MagicDNS via local SOCKS5), cf_access (Cloudflare Access service token), tier
+		// (keeps single-user tier ordering stable — an untiered profile host would sort
+		// AHEAD of a tier-1 hosts[0]), device_name (same physical device).
 		target = map[string]any{}
 		if base := firstHostMap(root); base != nil {
-			for _, k := range []string{"root_uri", "port", "insecure_skip_verify"} {
+			for _, k := range []string{"root_uri", "port", "insecure_skip_verify", "socks5_proxy", "cf_access", "tier", "device_name"} {
 				if v, ok := base[k]; ok {
 					target[k] = v
 				}
@@ -158,6 +168,9 @@ func (u *HostUpdate) SetToken(token, name, expiresAt string, scopes []string) *H
 // preserves every other key (known or not), then writes via a 0600 temp file
 // renamed into place. A missing/blank/invalid hosts array is repaired into a
 // single-host array so a freshly-dropped or partial config can still be paired.
+// A server update (SetServer) also moves same-server hosts — multi-user profile
+// hosts that still carry hosts[0]'s PREVIOUS root_uri — to the new endpoint,
+// preserving their per-profile identity fields.
 //
 // NEVER logs or returns the token/host/device_id; errors name the failing step only.
 func WriteHostUpdate(u HostUpdate) error {
@@ -182,6 +195,12 @@ func WriteHostUpdate(u HostUpdate) error {
 	host := firstHostMap(root)
 
 	if u.setServer {
+		// Captured BEFORE the update: any OTHER host still carrying this root_uri is a
+		// same-server host (a multi-user profile seeded from hosts[0]) and must move
+		// with it — profile hosts are returned verbatim by ResolveHost, so one left on
+		// the old endpoint/verify setting keeps failing after the server moves.
+		prevRoot, _ := host["root_uri"].(string)
+
 		// root_uri is the one required host field — always written (no omit). port and
 		// insecure_skip_verify are written authoritatively: a 0 port removes the key
 		// (URL() treats 0 as "no port"); verify-on (false) removes insecure_skip_verify
@@ -196,6 +215,42 @@ func WriteHostUpdate(u HostUpdate) error {
 			host["insecure_skip_verify"] = true
 		} else {
 			delete(host, "insecure_skip_verify")
+		}
+
+		// Propagate the endpoint to same-server hosts: root_uri/port/insecure exactly
+		// as written to hosts[0], plus hosts[0]'s transport fields (socks5_proxy/
+		// cf_access/tier — endpoint-axis fields the profile was seeded with and that
+		// must stay in lockstep). Identity fields (token/username/device_id/
+		// profile_label/scopes/device_name) are per-profile and never touched. A host
+		// on a DIFFERENT root_uri (e.g. a genuine second-tier endpoint) is left alone.
+		if hostsArr, ok := root["hosts"].([]any); ok && prevRoot != "" {
+			for i := 1; i < len(hostsArr); i++ {
+				hm, ok := hostsArr[i].(map[string]any)
+				if !ok {
+					continue
+				}
+				if hr, _ := hm["root_uri"].(string); !strings.EqualFold(hr, prevRoot) {
+					continue
+				}
+				hm["root_uri"] = u.RootURI
+				if u.Port != 0 {
+					hm["port"] = u.Port
+				} else {
+					delete(hm, "port")
+				}
+				if u.InsecureSkipVerify {
+					hm["insecure_skip_verify"] = true
+				} else {
+					delete(hm, "insecure_skip_verify")
+				}
+				for _, k := range []string{"socks5_proxy", "cf_access", "tier"} {
+					if v, present := host[k]; present {
+						hm[k] = v
+					} else {
+						delete(hm, k)
+					}
+				}
+			}
 		}
 	}
 

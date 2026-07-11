@@ -48,6 +48,23 @@ func isCertErr(err error) bool {
 	return strings.Contains(err.Error(), "x509:")
 }
 
+// emitCertFail names a certificate-verification failure host-free on stderr and
+// prints the caller's reason=tls-tagged RESULT line, returning true when err
+// classifies as one (isCertErr) — else it prints nothing and returns false. Shared
+// by --pair and --pair-profile so profile-level cert failures carry the same
+// machine-readable token the wizard's trust offer keys on, instead of a generic
+// failure. The token is ADDITIVE: grep-based launchers keyed on paired=1 / PAIRFAIL
+// are unaffected. Exit is the caller's (3 — never-reached-RomM: the pairing code
+// was NOT consumed, so the SAME code survives for the trust retry).
+func emitCertFail(err error, resultLine string) bool {
+	if !isCertErr(err) {
+		return false
+	}
+	fmt.Fprintln(os.Stderr, "PAIRFAIL exchange: server certificate could not be verified")
+	fmt.Println(resultLine)
+	return true
+}
+
 // runSetServer persists the wizard's server URL (scheme+host), optional port, and
 // the HTTPS skip-verify toggle to config.json BEFORE pairing — the engine's --pair
 // reads root_uri from the config, so the address must land first. It creates
@@ -141,14 +158,9 @@ func runPair(cfg *config.Config, code string) {
 		// lodor#35: a certificate-verification failure is deterministic — retrying
 		// cannot fix it, and the generic "network error" copy misleads (the server IS
 		// answering; its certificate just can't be verified — the normal state of a
-		// self-signed home server). Name it host-free on stderr and tag the RESULT
-		// line (an ADDITIVE token: grep-based launchers keyed on paired=1 / PAIRFAIL
-		// are unaffected) so wizards can offer the skip-verify trust path. Exit stays
-		// 3 (never-reached-RomM class — the code was NOT consumed, so the SAME code
-		// survives for the trust retry).
-		if isCertErr(err) {
-			fmt.Fprintln(os.Stderr, "PAIRFAIL exchange: server certificate could not be verified")
-			fmt.Println("RESULT paired=0 scopes_ok=0 reason=tls")
+		// self-signed home server). emitCertFail names it host-free and tags the
+		// RESULT line so wizards can offer the skip-verify trust path.
+		if emitCertFail(err, "RESULT paired=0 scopes_ok=0 reason=tls") {
 			os.Exit(3)
 		}
 		// A network error scrubs to "network error" via safeErr; anything else is a

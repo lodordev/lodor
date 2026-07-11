@@ -51,6 +51,14 @@ func EvictToStub(cfg *config.Config, romPath string) (evicted bool, reason strin
 		return false, "missing"
 	}
 	if fi.IsDir() || fi.Size() == 0 {
+		// Stranded multi-disc bytes: an interrupted multi-disc download can leave the
+		// .m3u a 0-byte stub while fetched discs sit in the per-game folder — bytes
+		// the "stub" refusal would otherwise make unreclaimable forever. When the
+		// manifest owns that folder (record-intent-then-act wrote it before any disc
+		// landed), sweep it; the refusal token is unchanged (the .m3u IS a stub).
+		if !fi.IsDir() && strings.EqualFold(filepath.Ext(romPath), ".m3u") {
+			sweepStrandedDiscDir(romPath)
+		}
 		return false, "stub"
 	}
 	slug, ok := slugForRomPath(cfg, romPath)
@@ -147,4 +155,33 @@ func evictDiscFiles(m3uPath string) {
 	for d := range discDirs {
 		_ = os.Remove(d)
 	}
+}
+
+// sweepStrandedDiscDir reclaims fetched disc bytes stranded behind a 0-byte stub
+// .m3u (an interrupted multi-disc download: the mirror stubs the playlist first,
+// discs land in the per-game folder, and the full .m3u is only written at the end).
+// A stub references nothing, so evictDiscFiles cannot find the bytes — instead the
+// per-game folder is derived the way the download derives it (the playlist's
+// marker-stripped stem beside it) and removed WHOLE, but ONLY when the mirror-owned
+// manifest claims the folder (downloadMultiDiscCore records it before any disc
+// lands — record-intent-then-act). An unowned same-named folder — the user's own
+// files in merge mode, or any manifest-less card — is refused untouched, the same
+// V3 gate the real-evict path applies. Best-effort: RemoveAll mirrors the download
+// path's own failure cleanup for exactly this manifest-owned folder.
+func sweepStrandedDiscDir(m3uPath string) {
+	base := platform.StripLeadingMarker(filepath.Base(m3uPath))
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	if stem == "" {
+		return
+	}
+	discDir := filepath.Join(filepath.Dir(m3uPath), stem)
+	fi, err := os.Stat(discDir)
+	if err != nil || !fi.IsDir() {
+		return
+	}
+	man := platform.LoadManifest()
+	if !man.OwnsKind(discDir, platform.ManifestFolder) {
+		return
+	}
+	_ = os.RemoveAll(discDir)
 }

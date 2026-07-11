@@ -41,6 +41,14 @@ func runPairProfile(cfg *config.Config, code string) {
 	// Exchange the pairing code for a client-token (PRE-token: base URL + TLS flag only).
 	exch, err := romm.ExchangeToken(base, code)
 	if err != nil {
+		// lodor#35 parity with --pair: a certificate-verification failure is
+		// deterministic and would otherwise scrub to the misleading generic copy.
+		// emitCertFail tags the RESULT line (ADDITIVE reason=tls token) so the wizard
+		// can offer the skip-verify trust path for profile pairing too; exit 3 — the
+		// code was NOT consumed, so the SAME code survives the trust retry.
+		if emitCertFail(err, "RESULT paired=0 username= reason=tls") {
+			os.Exit(3)
+		}
 		msg := safeErr(err)
 		fmt.Fprintf(os.Stderr, "PAIRFAIL exchange: %s\n", msg)
 		fmt.Println("RESULT paired=0 username=")
