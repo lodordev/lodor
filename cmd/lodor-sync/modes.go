@@ -599,9 +599,13 @@ func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string, man *p
 //     ALREADY in the playlist (rewritten as each disc landed), so the game plays
 //     on the discs it has; the next run fetches only what's still missing.
 //
-// Discs land in <Roms>/<system>/<FsNameNoExt>/<disc>.chd; the .m3u (at <FsNameNoExt>.m3u
-// beside that folder) lists "<FsNameNoExt>/<disc>" lines, resolved relative to the m3u
-// dir by both the launcher (getFirstDisc) and the emulator's m3u loader.
+// Discs land in <Roms>/<system>/.<FsNameNoExt>/<disc>.chd — the per-game folder is
+// DOT-HIDDEN (DiscFolderName, lodor#7 UX fix: MinUI's hide() keeps it out of the game
+// list, so the .m3u is the game's only visible entry). The .m3u (at <FsNameNoExt>.m3u
+// beside that folder) lists ".<FsNameNoExt>/<disc>" lines, resolved relative to the m3u
+// dir by both the launcher (getFirstDisc) and the emulator's m3u loader — a dot dir
+// stats/opens like any other. Legacy non-dot cards converge via migrateLegacyM3U's
+// dot-folder leg, which every fetch mode runs before reaching here.
 //
 // ok=true means the game is LAUNCHABLE: every disc BEFORE the first fetched one was
 // already present, so on success disc 1 always has real bytes. st (optional) carries
@@ -618,7 +622,7 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 	}
 
 	m3uPath := platform.LocalRomPath(cfg, rom) // <…>/<FsNameNoExt>.m3u
-	discDir := platform.MultiDiscDir(cfg, rom) // <…>/<FsNameNoExt>/
+	discDir := platform.MultiDiscDir(cfg, rom) // <…>/.<FsNameNoExt>/ (dot-hidden)
 	if m3uPath == "" || discDir == "" {
 		fmt.Fprintf(os.Stderr, "DLFAIL multidisc dest-empty rom=%d\n", rom.ID)
 		return false
@@ -669,7 +673,7 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		return false
 	}
 
-	folderName := filepath.Base(discDir) // == rom.FsNameNoExt; the m3u-relative prefix
+	folderName := filepath.Base(discDir) // == DiscFolderName(rom.FsNameNoExt), dot-hidden; the m3u-relative prefix
 
 	// Defensive disc ordering: RomM is expected to return Files in disc order, but
 	// don't trust it — a wrong order would boot "Disc 2" first and desync saves.

@@ -113,8 +113,10 @@ func EvictToStub(cfg *config.Config, romPath string) (evicted bool, reason strin
 }
 
 // M3UDiscRefs returns the absolute on-card paths of the disc files a real .m3u
-// references (the engine's own multi-disc download writes "<FsNameNoExt>/<disc>"
-// lines resolved relative to the m3u's directory). Defensive: blank/comment lines,
+// references (the engine's own multi-disc download writes ".<FsNameNoExt>/<disc>"
+// lines — dot-hidden folder, lodor#7 UX fix; legacy cards carry non-dot
+// "<FsNameNoExt>/<disc>" lines — resolved relative to the m3u's directory, so BOTH
+// shapes follow the playlist automatically). Defensive: blank/comment lines,
 // absolute lines, and any ".." component are skipped, so a hand-edited m3u can never
 // point a caller outside the game's folder. Filesystem-read only, never mutates.
 // Shared by evict/uninstall (delete the referenced discs) and the disc-1-first
@@ -199,20 +201,28 @@ func evictDiscFiles(m3uPath string) {
 // files in merge mode, or any manifest-less card — is refused untouched, the same
 // V3 gate the real-evict path applies. Best-effort: RemoveAll mirrors the download
 // path's own failure cleanup for exactly this manifest-owned folder.
+//
+// BOTH layouts are swept: the dot-hidden folder the engine writes now
+// (DiscFolderName, lodor#7 UX fix) and the legacy non-dot folder a pre-dot card may
+// still carry (migrateLegacyM3U converges those, but an evict can arrive first) —
+// each under its own ownership gate, so a user's same-named folder in either shape
+// is still refused.
 func sweepStrandedDiscDir(m3uPath string) {
 	base := platform.StripLeadingMarker(filepath.Base(m3uPath))
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	if stem == "" {
 		return
 	}
-	discDir := filepath.Join(filepath.Dir(m3uPath), stem)
-	fi, err := os.Stat(discDir)
-	if err != nil || !fi.IsDir() {
-		return
-	}
 	man := platform.LoadManifest()
-	if !man.OwnsKind(discDir, platform.ManifestFolder) {
-		return
+	for _, name := range []string{platform.DiscFolderName(stem), stem} {
+		discDir := filepath.Join(filepath.Dir(m3uPath), name)
+		fi, err := os.Stat(discDir)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		if !man.OwnsKind(discDir, platform.ManifestFolder) {
+			continue
+		}
+		_ = os.RemoveAll(discDir)
 	}
-	_ = os.RemoveAll(discDir)
 }

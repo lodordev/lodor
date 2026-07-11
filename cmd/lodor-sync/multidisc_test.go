@@ -185,24 +185,27 @@ func newMultiDiscEnv(t *testing.T, srv *httptest.Server) (*config.Config, *romm.
 	return cfg, client, base
 }
 
-// mdPaths returns the canonical card paths for the fixture game.
+// mdPaths returns the canonical card paths for the fixture game. The per-game
+// disc folder is DOT-HIDDEN (DiscFolderName, lodor#7 UX fix) — the layout the
+// engine writes now; legacy non-dot fixtures are built explicitly where a test
+// covers the migration.
 func mdPaths(base string) (psDir, discDir, m3u string) {
 	psDir = filepath.Join(base, "Roms", "PlayStation (PS)")
-	discDir = filepath.Join(psDir, "Final Fantasy VII (USA)")
+	discDir = filepath.Join(psDir, ".Final Fantasy VII (USA)")
 	m3u = filepath.Join(psDir, "Final Fantasy VII (USA).m3u")
 	return
 }
 
-const fullM3U = "Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 1).chd\n" +
-	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 2).chd\n" +
-	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 3).chd\n"
+const fullM3U = ".Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 1).chd\n" +
+	".Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 2).chd\n" +
+	".Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 3).chd\n"
 
 // canonDiscLines is the manifest-recorded canonical disc list (m3u-relative,
 // server order) downloadMultiDiscCore must persist at first download.
 var canonDiscLines = []string{
-	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 1).chd",
-	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 2).chd",
-	"Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 3).chd",
+	".Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 1).chd",
+	".Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 2).chd",
+	".Final Fantasy VII (USA)/Final Fantasy VII (USA) (Disc 3).chd",
 }
 
 // assertCanonDiscs asserts the .m3u's manifest entry carries the full canonical

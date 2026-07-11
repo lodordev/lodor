@@ -366,18 +366,22 @@ func onDiskExt(rom romm.Rom) string {
 }
 
 // MultiDiscDir returns the per-game subfolder a multi-file ROM's discs are written
-// into: <RomsDir>/<mapped folder>/<FsNameNoExt>/. The .m3u (from LocalRomPath) sits
-// one level up, beside this folder, and references each disc as "<FsNameNoExt>/<disc
-// filename>" — relative to the .m3u's own directory, which is exactly how the MinUI
-// launcher's getFirstDisc and the emulator's m3u loader resolve disc paths. This
-// mirrors RomM's own folder-per-game layout and keeps the system folder to one .m3u +
-// one subfolder per multi-disc game. Returns "" when the ROM has no platform slug.
+// into: <RomsDir>/<mapped folder>/.<FsNameNoExt>/ — DOT-HIDDEN via DiscFolderName
+// (lodor#7 UX fix: MinUI's hide() keeps the folder out of the game list, so the
+// launchable .m3u is the game's ONLY visible entry). The .m3u (from LocalRomPath)
+// sits one level up, beside this folder, and references each disc as
+// ".<FsNameNoExt>/<disc filename>" — relative to the .m3u's own directory, which is
+// exactly how the MinUI launcher's getFirstDisc and the emulator's m3u loader
+// resolve disc paths (a dot dir stats/opens like any other). This keeps the system
+// folder to one .m3u + one hidden subfolder per multi-disc game. Returns "" when
+// the ROM has no platform slug. Legacy NON-dot folders on existing cards converge
+// via migrateLegacyM3U's dot-folder leg on the next fetch-mode touch.
 func MultiDiscDir(cfg *config.Config, rom romm.Rom) string {
 	if rom.PlatformFsSlug == "" {
 		return ""
 	}
 	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
-	return filepath.Join(romDir, rom.FsNameNoExt)
+	return filepath.Join(romDir, DiscFolderName(rom.FsNameNoExt))
 }
 
 // PrimaryTag returns the canonical MinUI emulator tag for a RomM filesystem slug —
