@@ -35,14 +35,19 @@ import (
 	"lodor/romm"
 )
 
-// migrateLegacyM3U normalizes a legacy FULL-LIST .m3u — one that still references
-// missing/0-byte stub discs, the pre-local-only shape the shipped LodorOS launcher
-// refuses to launch — to the local-only contract, entirely OFFLINE:
+// migrateLegacyM3U normalizes a legacy multi-disc game to the current on-card
+// contract, entirely OFFLINE — two legs, dot-folder first:
 //
+//  0. DOT-HIDE the per-game disc folder (migrateLegacyDiscDir, lodor#7 UX fix):
+//     rename a legacy non-dot "<Game>/" to ".<Game>/" and rewrite the playlist's +
+//     manifest's "<Game>/…" lines to ".<Game>/…" in lockstep, so MinUI's hide()
+//     stops listing the folder as a second, browsable entry beside the .m3u.
 //  1. seed the manifest's canonical disc list from the old playlist when the
 //     record has none (on a legacy card the playlist IS the full set), then
 //  2. atomically rewrite the .m3u to list only discs with real bytes (old order
-//     kept — it is the canonical order the engine wrote).
+//     kept — it is the canonical order the engine wrote), the local-only shape
+//     the shipped LodorOS launcher requires (it refuses to launch past a listed
+//     stub — the pre-local-only never-launches regression).
 //
 // Runs at the top of the fetch modes BEFORE any network work, so a
 // partially-downloaded legacy card (e.g. 3 of 4 discs on card) becomes launchable
@@ -52,10 +57,24 @@ import (
 // 0-byte playlist — the stub shape the launch path already owns. Best-effort:
 // any failure leaves the card as found (the old full-list shape still censuses
 // correctly via the m3u-refs fallback).
+//
+// CONVERGENCE ON A LIVE LEGACY CARD (e.g. the 3-of-4-disc Dragoon card): the
+// SHIPPED launcher's own pre-launch playlist check is unrebuildable from here — on
+// the next launch it still reads the OLD m3u and routes through --download / the
+// hooks' --fetch-next-disc; THAT run lands here first, dot-migrates the folder +
+// playlist + manifest, then completes the missing disc and writes the local-only
+// dot m3u. So one launch on such a card still shows the old visible folder;
+// every subsequent list shows a single entry and launches clean. Acceptable,
+// documented.
 func migrateLegacyM3U(romPath string) {
 	if !strings.EqualFold(filepath.Ext(romPath), ".m3u") {
 		return
 	}
+	// Dot-folder leg runs even for a 0-byte stub .m3u: an interrupted legacy
+	// download leaves real discs in the old visible folder, and the coming
+	// downloadMultiDiscCore must find them at the DOT path (or it would re-pull
+	// every disc and strand the old folder visible forever).
+	migrateLegacyDiscDir(romPath)
 	fi, err := os.Stat(romPath)
 	if err != nil || fi.IsDir() || fi.Size() == 0 {
 		return // absent or a 0-byte stub — the download path owns those
@@ -104,6 +123,102 @@ func migrateLegacyM3U(romPath string) {
 	}
 	fmt.Fprintf(os.Stderr, "M3UMIGRATE local-only: %s (%d/%d discs on card)\n",
 		filepath.Base(romPath), len(local), len(lines))
+}
+
+// migrateLegacyDiscDir converges one legacy multi-disc game onto the dot-hidden
+// per-game folder layout (lodor#7 UX fix — MultiDiscDir/DiscFolderName): rename a
+// NON-dot "<Game>/" beside the .m3u to ".<Game>/", then rewrite the playlist's and
+// the manifest canonical disc list's "<Game>/…" lines to ".<Game>/…". Offline,
+// idempotent (second touch finds no non-dot folder and no non-dot lines), and
+// best-effort throughout. Ownership gates mirror the rest of the mirror's
+// destructive paths:
+//
+//   - the FOLDER is renamed only when the manifest owns it as a mirror folder
+//     (downloadMultiDiscCore records it before any disc lands) — a user's own
+//     same-named folder is never moved;
+//   - lines are rewritten only for a manifest-owned playlist (THE ONE RULE) and
+//     only once the dot folder actually EXISTS (renamed now, or previously — a
+//     crash between rename and rewrite heals on the next touch); lines must never
+//     point at a folder that isn't there;
+//   - both-layouts-exist (a fresh dot download beside a stale legacy folder, or
+//     that same crash window) MERGES, dot copy wins: move only what the dot folder
+//     lacks, then sweep the manifest-owned remainder.
+//
+// The disc BASENAMES never change — only the folder component — so per-disc hash
+// state, saves (keyed to the .m3u stem), and box art (.media/<stem>.png, anchored
+// to the .m3u) are all untouched.
+func migrateLegacyDiscDir(romPath string) {
+	base := platform.StripLeadingMarker(filepath.Base(romPath))
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	if stem == "" || strings.HasPrefix(stem, ".") {
+		return // no stem, or an already-hidden name (DiscFolderName leaves it alone)
+	}
+	dir := filepath.Dir(romPath)
+	oldDir := filepath.Join(dir, stem)
+	newDir := filepath.Join(dir, platform.DiscFolderName(stem))
+	man := platform.LoadManifest()
+
+	if fi, err := os.Stat(oldDir); err == nil && fi.IsDir() && man.OwnsKind(oldDir, platform.ManifestFolder) {
+		renamed := false
+		if _, derr := os.Stat(newDir); derr != nil {
+			renamed = os.Rename(oldDir, newDir) == nil // atomic: the discs move as one
+		} else if ents, rerr := os.ReadDir(oldDir); rerr == nil {
+			for _, en := range ents {
+				dst := filepath.Join(newDir, en.Name())
+				if _, serr := os.Stat(dst); serr != nil {
+					_ = os.Rename(filepath.Join(oldDir, en.Name()), dst)
+				}
+			}
+			renamed = os.RemoveAll(oldDir) == nil
+		}
+		if renamed {
+			man.RenamePath(oldDir, newDir)
+			fsutil.SyncDir(dir) // FAT32: persist the folder rename
+			fmt.Fprintf(os.Stderr, "M3UMIGRATE dot-folder: %s\n", filepath.Base(newDir))
+		}
+	}
+
+	// Line rewrite — only against an existing dot folder, only on owned records.
+	if fi, err := os.Stat(newDir); err != nil || !fi.IsDir() || !man.Owns(romPath) {
+		if serr := man.Save(); serr != nil { // persist a rename even if lines wait
+			fmt.Fprintf(os.Stderr, "MANIFEST save failed (dot-folder migrate): %v\n", serr)
+		}
+		return
+	}
+	oldPrefix := stem + "/"
+	newPrefix := platform.DiscFolderName(stem) + "/"
+	if fi, err := os.Stat(romPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
+		if data, rerr := os.ReadFile(romPath); rerr == nil {
+			rawLines := strings.Split(string(data), "\n")
+			changed := false
+			for i, l := range rawLines {
+				t := strings.TrimSuffix(l, "\r")
+				if strings.HasPrefix(t, oldPrefix) {
+					rawLines[i] = newPrefix + strings.TrimPrefix(t, oldPrefix)
+					changed = true
+				}
+			}
+			if changed {
+				if werr := fsutil.WriteFileAtomicString(romPath, strings.Join(rawLines, "\n"), 0o644); werr != nil {
+					fmt.Fprintf(os.Stderr, "M3UMIGRATE dot-rewrite failed: %s\n", filepath.Base(romPath))
+				}
+			}
+		}
+	}
+	if e, ok := man.Entry(romPath); ok && len(e.Discs) > 0 {
+		out := make([]string, len(e.Discs))
+		for i, l := range e.Discs {
+			if strings.HasPrefix(l, oldPrefix) {
+				out[i] = newPrefix + strings.TrimPrefix(l, oldPrefix)
+			} else {
+				out[i] = l
+			}
+		}
+		man.SetDiscs(romPath, out)
+	}
+	if serr := man.Save(); serr != nil {
+		fmt.Fprintf(os.Stderr, "MANIFEST save failed (dot-folder migrate): %v\n", serr)
+	}
 }
 
 // runCheckRom is the OFFLINE pre-launch completeness gate. Contract:

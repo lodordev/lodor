@@ -458,11 +458,13 @@ func LocalRomPath(cfg *config.Config, rom romm.Rom) string {
 }
 
 // MultiDiscDir returns the per-game subfolder a multi-file ROM's discs are written into:
-// <RomsDir>/<mapped folder>/<FsNameNoExt>/. Returns "" when the ROM has no platform slug.
+// <RomsDir>/<mapped folder>/.<FsNameNoExt>/ — dot-hidden via DiscFolderName (lodor#7 UX
+// fix; EmulationStation skips hidden paths, and the launch path resolves discs via the
+// .m3u's relative lines written in lockstep). Returns "" when the ROM has no platform slug.
 func MultiDiscDir(cfg *config.Config, rom romm.Rom) string {
 	if rom.PlatformFsSlug == "" {
 		return ""
 	}
 	romDir := platformRomDirectory(cfg, rom.PlatformFsSlug, rom.PlatformDisplayName)
-	return filepath.Join(romDir, rom.FsNameNoExt)
+	return filepath.Join(romDir, DiscFolderName(rom.FsNameNoExt))
 }

@@ -109,6 +109,15 @@ func TestPathWithinRoms(t *testing.T) {
 	if PathWithinRoms(filepath.Join(roms, "..", ".system", "bin", "lodor-sync")) {
 		t.Error("PathWithinRoms accepted an escaping dest")
 	}
+	// Dot-hidden multi-disc folder (lodor#7 UX fix): a leading-dot COMPONENT is a
+	// plain directory name, not traversal — containment must accept it (both the
+	// folder itself and a disc inside it).
+	if !PathWithinRoms(filepath.Join(roms, "Sony PlayStation (PS)", ".Final Fantasy VII (USA)")) {
+		t.Error("PathWithinRoms rejected the dot-hidden disc folder")
+	}
+	if !PathWithinRoms(filepath.Join(roms, "Sony PlayStation (PS)", ".Final Fantasy VII (USA)", "Disc 1.chd")) {
+		t.Error("PathWithinRoms rejected a disc inside the dot-hidden folder")
+	}
 }
 
 func TestValidateRomNames(t *testing.T) {
