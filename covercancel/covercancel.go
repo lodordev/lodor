@@ -1,7 +1,11 @@
-// Package covercancel is the tiny cross-process cancel signal for the box-art cover
-// fetch — the ONLY thing it governs. Box art is cosmetic; nothing here ever touches a
-// game, save, or state file. A bug in this package can, at worst, cancel a cover fetch
-// too eagerly or too late — never lose data.
+// Package covercancel is the tiny cross-process cancel signal the launcher's B-press
+// raises during a progress overlay. It governs exactly two things: the box-art cover
+// fetch loop (its original job, hence the name/path), and — since the real-cancel work
+// (lodor#7 follow-up) — the INTERACTIVE ROM/disc download chunk loops
+// (--download/--fetch-next-disc/--fetch-discs via Client.CancelCheck), which stop
+// between chunks, KEEP their partial .tmp for resume, and report "cancelled=1"
+// honestly. Nothing here ever deletes a game, save, or state file. A bug in this
+// package can, at worst, cancel a fetch too eagerly or too late — never lose data.
 //
 // Mechanism: a sentinel FILE. The launcher (C) touches it when the user presses B to
 // cancel a "Refresh box art / Refresh Library" run; the engine's cover loop stats it

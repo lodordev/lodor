@@ -120,11 +120,23 @@ func EvictToStub(cfg *config.Config, romPath string) (evicted bool, reason strin
 // Shared by evict/uninstall (delete the referenced discs) and the disc-1-first
 // completeness checks (--check-rom / --prefetch-discs, lodor#7).
 func M3UDiscRefs(m3uPath string) []string {
+	dir := filepath.Dir(m3uPath)
+	var out []string
+	for _, line := range M3UDiscLines(m3uPath) {
+		out = append(out, filepath.Join(dir, line))
+	}
+	return out
+}
+
+// M3UDiscLines returns a real .m3u's disc lines RAW (m3u-relative, CRLF-trimmed),
+// under the same defensive rules as M3UDiscRefs (blank/comment/absolute/".." lines
+// skipped). This relative shape is what the manifest's canonical disc list stores —
+// the legacy-migration seed reads the old full-list playlist through this.
+func M3UDiscLines(m3uPath string) []string {
 	data, err := os.ReadFile(m3uPath)
 	if err != nil {
 		return nil
 	}
-	dir := filepath.Dir(m3uPath)
 	var out []string
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
@@ -134,19 +146,37 @@ func M3UDiscRefs(m3uPath string) []string {
 		if filepath.IsAbs(line) || strings.Contains(line, "..") {
 			continue
 		}
-		out = append(out, filepath.Join(dir, line))
+		out = append(out, line)
 	}
 	return out
 }
 
-// evictDiscFiles deletes the disc files a real .m3u references (present bytes AND
-// 0-byte disc-1-first stubs alike — os.Remove treats them the same). The per-game
-// disc folder is removed only when the deletions left it empty (os.Remove on a
-// non-empty dir fails, silently). Best-effort throughout.
+// evictDiscFiles deletes a multi-disc game's LOCAL disc bytes. The .m3u is
+// local-only now (lodor#7 — it lists just the discs with real bytes), so the
+// playlist refs alone no longer cover the whole on-card set: beyond-budget 0-byte
+// stubs and interrupted .tmp partials live in the per-game folder unlisted. Three
+// legs, most-authoritative last:
+//
+//  1. the .m3u's own refs (works even on a manifest-less card);
+//  2. the manifest's canonical disc list (covers discs delisted from a local-only
+//     playlist but still holding bytes — e.g. after a hand-edit);
+//  3. the manifest-OWNED per-game folder, removed WHOLE (sweepStrandedDiscDir's
+//     gate: downloadMultiDiscCore records the folder before any disc lands —
+//     record-intent-then-act), which is what actually catches stubs and partials.
+//
+// An unowned same-named folder (the user's own files in merge mode, or any
+// manifest-less card) is never swept — legs 1-2 remove only referenced/recorded
+// files and the folder falls only if empty. Best-effort throughout.
 func evictDiscFiles(m3uPath string) {
 	dir := filepath.Dir(m3uPath)
 	discDirs := map[string]bool{}
-	for _, p := range M3UDiscRefs(m3uPath) {
+	man := platform.LoadManifest()
+	seen := map[string]bool{}
+	for _, p := range append(M3UDiscRefs(m3uPath), CanonicalDiscRefs(man, m3uPath)...) {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
 		_ = os.Remove(p)
 		if d := filepath.Dir(p); d != dir {
 			discDirs[d] = true
@@ -155,6 +185,7 @@ func evictDiscFiles(m3uPath string) {
 	for d := range discDirs {
 		_ = os.Remove(d)
 	}
+	sweepStrandedDiscDir(m3uPath) // owned-folder sweep: stubs + .tmp partials
 }
 
 // sweepStrandedDiscDir reclaims fetched disc bytes stranded behind a 0-byte stub

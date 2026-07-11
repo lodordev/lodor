@@ -25,12 +25,26 @@ import (
 	"lodor/catalog"
 	"lodor/config"
 	"lodor/cover"
+	"lodor/covercancel"
 	"lodor/fsutil"
 	"lodor/platform"
 	"lodor/ranet"
 	"lodor/romm"
 	"lodor/sync"
 )
+
+// armDownloadCancel makes an INTERACTIVE download's transfer loops honor the
+// launcher's B-press sentinel (/tmp/lodor-cover-cancel) — a REAL cancel, not the
+// old wait-out-the-transfer soft-cancel: clear any leftover sentinel first (belt —
+// the launcher rm -fs it at op start too), then point the client's between-chunks
+// CancelCheck at it. Armed for --download / --fetch-next-disc / --fetch-discs
+// ONLY; the daemons' --prefetch-discs and --download-queue never arm it, so a
+// user cancelling a foreground op can't kill a background transfer mid-disc
+// (sentinel absent = never polled = no behavior change anywhere else).
+func armDownloadCancel(client *romm.Client) {
+	covercancel.Clear()
+	client.CancelCheck = covercancel.Requested
+}
 
 // extractTimeout bounds a single archive (7z/zip) extraction. Generous enough for a
 // multi-GB CHD/ISO on slow handheld storage, finite so a wedged decoder can never hang
@@ -49,19 +63,29 @@ const extractTimeout = 20 * time.Minute
 // SECURITY: every failure prints a generic, host-free DLFAIL token to stderr — the
 // URL and the underlying client error (which can embed the host) are NEVER echoed.
 func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
+	// Legacy full-list .m3u → local-only before any network work (lodor#7): a
+	// launcher-routed --download on a partially-downloaded legacy card must leave
+	// the game launchable on its present discs even when the fetch fails offline.
+	migrateLegacyM3U(romPath)
 	ok, st := downloadRomCoreStats(client, cfg, romPath)
+	// "cancelled=1" is ADDITIVE (parsers key on the downloaded= token): the user's
+	// B-press stopped the transfer loop — partial kept, nothing failed dishonestly.
+	cancelSuffix := ""
+	if st.cancelled {
+		cancelSuffix = " cancelled=1"
+	}
 	if st.multi {
 		// Multi-disc (disc-1-first, lodor#7): the trailing disc fields are ADDITIVE —
 		// every existing parser keys on the exact "downloaded=<0|1>" token and ignores
 		// the rest of the line. downloaded=1 means the game is LAUNCHABLE (its first
 		// missing disc landed, or every disc was already present) — NOT that every
 		// disc is on the card; discs_present vs discs_total carries that truth.
-		fmt.Printf("RESULT downloaded=%d discs_total=%d discs_present=%d discs_fetched=%d\n",
-			b2i(ok), st.total, st.present, st.fetched)
+		fmt.Printf("RESULT downloaded=%d discs_total=%d discs_present=%d discs_fetched=%d%s\n",
+			b2i(ok), st.total, st.present, st.fetched, cancelSuffix)
 	} else if ok {
 		fmt.Println("RESULT downloaded=1")
 	} else {
-		fmt.Println("RESULT downloaded=0")
+		fmt.Println("RESULT downloaded=0" + cancelSuffix)
 	}
 	exitMode(0)
 }
@@ -75,6 +99,11 @@ type discStats struct {
 	total   int
 	present int
 	fetched int
+	// cancelled = the user's B-press sentinel stopped this run's transfer loop
+	// (REAL cancel — partial .tmp kept for resume, verified discs kept + listed).
+	// Reported additively as "cancelled=1" on the RESULT line; also set for a
+	// cancelled single-file transfer (multi=false).
+	cancelled bool
 }
 
 // complete reports whether every listed disc is on the card.
@@ -243,7 +272,16 @@ func downloadRomCoreInner(client *romm.Client, cfg *config.Config, romPath strin
 		// download-queue retry) resumes from here instead of restarting at zero. A
 		// corrupt/stale partial is caught later by the hash verify (which deletes the
 		// bad file), so retaining it is safe.
-		fmt.Fprintf(os.Stderr, "DLFAIL download rom=%d\n", rom.ID)
+		if errors.Is(derr, romm.ErrCancelled) {
+			// REAL user cancel (B-press sentinel): same keep-the-partial contract,
+			// reported as a cancel — never dressed up as a network failure.
+			if st != nil {
+				st.cancelled = true
+			}
+			fmt.Fprintf(os.Stderr, "DLCANCEL rom=%d (partial .tmp kept for resume)\n", rom.ID)
+		} else {
+			fmt.Fprintf(os.Stderr, "DLFAIL download rom=%d\n", rom.ID)
+		}
 		writeProgress(0)
 		return false
 	}
@@ -531,13 +569,22 @@ func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string, man *p
 // downloadMultiDiscCore downloads a folder-per-game multi-file ROM's discs and writes
 // the .m3u that ties them together — DISC-1-FIRST (lodor#7 hybrid). budget caps how
 // many discs this run may TRANSFER: 1 = the launch path / --fetch-next-disc (first
-// missing disc in m3u order — the disc the player is about to need); < 0 = unlimited
-// (--fetch-discs / the daemon prefetch completes the set). Missing discs beyond the
-// budget are left as honest 0-byte stubs and the FULL .m3u is always written on
-// success, so the emulator knows the whole disc list while the card only pays for
-// discs actually fetched. A populated .m3u with 0-byte disc stubs is therefore a
-// VALID on-card state now — the lane hooks detect it (incomplete-m3u scan /
-// --check-rom) and re-trigger the fetch, and mirror/evict/uninstall tolerate it.
+// missing disc in canonical order — the disc the player is about to need); < 0 =
+// unlimited (--fetch-discs / the daemon prefetch completes the set).
+//
+// LOCAL-ONLY .m3u (hardware-verified regression fix, 2026-07-11): the playlist on
+// card lists ONLY discs with real bytes. The shipped LodorOS launcher (minui.c,
+// unrebuildable) parses the .m3u pre-launch and refuses to launch while ANY listed
+// disc is missing/0-byte — a full-list .m3u with stubs meant one disc downloaded
+// per launch and the game NEVER launched. So:
+//   - the FULL canonical disc list (server/natural order) is persisted on the
+//     .m3u's mirror-manifest record (SetDiscs) before any byte moves — that record,
+//     not the playlist, is what --check-rom / --prefetch-discs / evict key off;
+//   - the .m3u is atomically REWRITTEN after each disc verifies (canonical order,
+//     present discs only), so every landed disc is playable immediately;
+//   - missing discs beyond the budget still leave honest 0-byte stubs in the
+//     per-game folder (additive; the evict sweep owns their cleanup), but they are
+//     NEVER listed in the playlist.
 //
 // Each disc is fetched INDIVIDUALLY via a single file_ids selector (verified live:
 // one file_ids → that file's raw bytes; two or more → a mod_zip). This is chosen over
@@ -547,9 +594,10 @@ func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string, man *p
 //     non-CHD discs are checked against files[].sha1/md5; .chd discs are accepted on a
 //     valid streamed transfer because RomM records a CHD's INTERNAL disc SHA1, not the
 //     container's — see isCHD; a mod_zip would expose no per-member hash to check at all);
-//   - a failed TRANSFER fails this run honestly (ok=false, no .m3u write if it was
-//     still a stub) but KEEPS every previously-verified disc — per-disc resume: the
-//     next run re-lists the verified discs and fetches only what's still missing.
+//   - a failed TRANSFER fails this run honestly (ok=false) but KEEPS every
+//     previously-verified disc — per-disc resume — and every verified disc is
+//     ALREADY in the playlist (rewritten as each disc landed), so the game plays
+//     on the discs it has; the next run fetches only what's still missing.
 //
 // Discs land in <Roms>/<system>/<FsNameNoExt>/<disc>.chd; the .m3u (at <FsNameNoExt>.m3u
 // beside that folder) lists "<FsNameNoExt>/<disc>" lines, resolved relative to the m3u
@@ -690,7 +738,50 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		toFetch = budget
 	}
 
-	var m3uLines []string
+	// CANONICAL DISC LIST → manifest, before any byte moves (local-only .m3u): the
+	// playlist stops carrying the full set, so the full set is recorded fact on the
+	// .m3u's manifest entry (it survives stub↔download kind flips and evict). The
+	// entry normally exists already (mirror stub / prior download); if not, record
+	// the stub intent first — downloadDestAllowed vetted this path above.
+	canonLines := make([]string, 0, total)
+	for _, p := range plans {
+		canonLines = append(canonLines, folderName+"/"+p.file.FileName)
+	}
+	if _, owned := man.Entry(m3uPath); !owned {
+		man.Record(m3uPath, platform.ManifestStub, rom.ID)
+	}
+	man.SetDiscs(m3uPath, canonLines)
+	if err := man.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "MANIFEST save failed before multidisc discs: %v\n", err)
+	}
+
+	// writeLocalM3U atomically (re)writes the playlist with the discs that hold real
+	// verified bytes RIGHT NOW, canonical order. Zero present discs = empty (0-byte)
+	// playlist — exactly the stub shape the launch path already owns. Unchanged
+	// content writes nothing (no FAT32 churn on an idempotent relaunch). This is
+	// also the legacy-card migration: a full-list .m3u still referencing stubs is
+	// normalized to local-only the first time any fetch path touches the game.
+	writeLocalM3U := func() bool {
+		var lines []string
+		for _, p := range plans {
+			if p.present {
+				lines = append(lines, folderName+"/"+p.file.FileName)
+			}
+		}
+		content := ""
+		if len(lines) > 0 {
+			content = strings.Join(lines, "\n") + "\n"
+		}
+		if cur, rerr := os.ReadFile(m3uPath); rerr == nil && string(cur) == content {
+			return true
+		}
+		if wErr := fsutil.WriteFileAtomicString(m3uPath, content, 0o644); wErr != nil {
+			fmt.Fprintf(os.Stderr, "DLFAIL multidisc m3u-write rom=%d\n", rom.ID)
+			return false
+		}
+		return true
+	}
+
 	fetched := 0
 	writeProgress(0)
 	for i, p := range plans {
@@ -698,17 +789,27 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 			if st != nil {
 				st.present++
 			}
-			m3uLines = append(m3uLines, folderName+"/"+p.file.FileName)
 			continue
 		}
 		if budget >= 0 && fetched >= budget {
-			// Beyond this run's budget (disc-1-first): leave an honest 0-byte stub so
-			// the on-card disc set matches the .m3u we write below. ADDITIVE only —
-			// anything already at the path (even a stale partial) is left alone; the
-			// per-game folder is manifest-owned, so the stub is ours to place.
+			// Beyond this run's budget (disc-1-first): leave an honest 0-byte stub in
+			// the per-game folder (NOT in the playlist). ADDITIVE only — anything
+			// already at the path (even a stale partial) is left alone; the per-game
+			// folder is manifest-owned, so the stub is ours to place.
 			ensureDiscStub(p.dest)
-			m3uLines = append(m3uLines, folderName+"/"+p.file.FileName)
 			continue
+		}
+		// REAL CANCEL (B-press sentinel), checked between discs before committing to
+		// the next transfer: everything fetched so far is verified, already listed in
+		// the local-only .m3u, and stays. Only reached when a transfer WOULD start —
+		// a cancel after the budget is spent never fails a completed run.
+		if client.CancelCheck != nil && client.CancelCheck() {
+			if st != nil {
+				st.cancelled = true
+			}
+			fmt.Fprintf(os.Stderr, "DLCANCEL multidisc rom=%d before disc=%d\n", rom.ID, i+1)
+			writeProgress(0)
+			return false
 		}
 		writePhase(fmt.Sprintf("Downloading %s — disc %d/%d…", romName, i+1, total))
 
@@ -755,13 +856,21 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		cerr2 := out.Close()
 		if dErr != nil || syncErr != nil || cerr2 != nil || n == 0 {
 			noteAuthErr(dErr)
-			fmt.Fprintf(os.Stderr, "DLFAIL multidisc download rom=%d disc=%d: %s\n", rom.ID, i+1, safeErr(dErr))
+			if errors.Is(dErr, romm.ErrCancelled) {
+				// REAL user cancel mid-disc: keep the partial, report the cancel.
+				if st != nil {
+					st.cancelled = true
+				}
+				fmt.Fprintf(os.Stderr, "DLCANCEL multidisc rom=%d disc=%d (partial .tmp kept for resume)\n", rom.ID, i+1)
+			} else {
+				fmt.Fprintf(os.Stderr, "DLFAIL multidisc download rom=%d disc=%d: %s\n", rom.ID, i+1, safeErr(dErr))
+			}
 			// KEEP the partial .tmp so the next run resumes this disc from here
 			// instead of restarting at zero — same contract as the single-file path.
 			// A stale/corrupt partial self-heals via the resume transport's 416
 			// handling and the per-disc hash verify (which deletes a bad disc).
 			// Previously-verified discs STAY (a partial multi-disc is a valid on-card
-			// state under disc-1-first); a still-stub .m3u is left for the hook to re-tap.
+			// state under disc-1-first) and are already listed in the local-only .m3u.
 			writeProgress(0)
 			return false
 		}
@@ -784,20 +893,27 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 		}
 
 		fetched++
+		plans[i].present = true
 		if st != nil {
 			st.present++
 			st.fetched++
 		}
-		m3uLines = append(m3uLines, folderName+"/"+p.file.FileName)
+		// Append the verified disc to the playlist NOW (atomic rewrite, canonical
+		// order): if a later disc's transfer fails, everything landed so far is
+		// already listed and playable — the launcher's gate sees only real bytes.
+		if !writeLocalM3U() {
+			writeProgress(0)
+			return false
+		}
 		writeProgress(fetched * 100 / toFetch)
 	}
 
-	// Write the FULL .m3u FAT32-atomically (temp + fsync + rename + dir fsync); the
-	// rename overwrites any 0-byte stub at that path. The playlist always lists EVERY
-	// disc — present or stub — so the emulator's disc-control menu shows the whole set.
+	// Final playlist write (idempotent when the loop already wrote it): local-only,
+	// FAT32-atomic (temp + fsync + rename + dir fsync); the rename overwrites any
+	// 0-byte stub at that path. This is also the pure-migration path — a legacy
+	// full-list .m3u with nothing left to fetch normalizes here.
 	writePhase("Writing playlist…")
-	if wErr := fsutil.WriteFileAtomicString(m3uPath, strings.Join(m3uLines, "\n")+"\n", 0o644); wErr != nil {
-		fmt.Fprintf(os.Stderr, "DLFAIL multidisc m3u-write rom=%d\n", rom.ID)
+	if !writeLocalM3U() {
 		return false
 	}
 	writeProgress(100)

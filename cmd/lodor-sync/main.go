@@ -364,13 +364,16 @@ func main() {
 		// --download uses the LONG download timeout, not the api timeout: a large
 		// ROM over a 30s api timeout was a real past failure. Rebuild the client.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		armDownloadCancel(dlClient)
 		runDownloadRom(dlClient, cfg, downloadRom)
 	case fetchNextDisc != "":
 		// Disc transfers are (possibly huge) file transfers — the long download timeout.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		armDownloadCancel(dlClient)
 		runFetchDiscs(dlClient, cfg, fetchNextDisc, 1)
 	case fetchDiscs != "":
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		armDownloadCancel(dlClient)
 		runFetchDiscs(dlClient, cfg, fetchDiscs, -1)
 	case prefetchDiscs:
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
