@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "Sega Game Gear",
+    "uniqueId": "gamegear",
+    "shortname": "gamegear",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - Sega Game Gear",
+      "uniqueId": "gamegear.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch genesis_plus_gx. Extensions: 68k, 7z, bin, bms, chd, col, cue, gen, gg, iso, m3u, md, mdx, rom, sg, sgd, smd, sms, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:68k|7z|bin|bms|chd|col|cue|gen|gg|iso|m3u|md|mdx|rom|sg|sgd|smd|sms|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM gamegear\n  -e LODOR_CORE genesis_plus_gx\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "Bandai WonderSwan Color",
+    "uniqueId": "wonderswancolor",
+    "shortname": "wonderswancolor",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - Bandai WonderSwan Color",
+      "uniqueId": "wonderswancolor.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch mednafen_wswan. Extensions: 7z, pc2, ws, wsc, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:7z|pc2|ws|wsc|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM wonderswancolor\n  -e LODOR_CORE mednafen_wswan\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}
