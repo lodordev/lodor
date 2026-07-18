@@ -1,0 +1,299 @@
+{
+  "baseUri": "https://lodordev.github.io/lodor/daijisho/",
+  "platformList": [
+    {
+      "filename": "arcade.lodor.platform.json",
+      "platformName": "Arcade",
+      "platformShortname": "arcade",
+      "platformUniqueId": "arcade",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "atari2600.lodor.platform.json",
+      "platformName": "Atari 2600",
+      "platformShortname": "atari2600",
+      "platformUniqueId": "atari2600",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "atari5200.lodor.platform.json",
+      "platformName": "Atari 5200",
+      "platformShortname": "atari5200",
+      "platformUniqueId": "atari5200",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "atari7800.lodor.platform.json",
+      "platformName": "Atari 7800 ProSystem",
+      "platformShortname": "atari7800",
+      "platformUniqueId": "atari7800",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "atarijaguar.lodor.platform.json",
+      "platformName": "Atari Jaguar",
+      "platformShortname": "atarijaguar",
+      "platformUniqueId": "atarijaguar",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "atarilynx.lodor.platform.json",
+      "platformName": "Atari Lynx",
+      "platformShortname": "atarilynx",
+      "platformUniqueId": "atarilynx",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "c64.lodor.platform.json",
+      "platformName": "Commodore 64",
+      "platformShortname": "c64",
+      "platformUniqueId": "c64",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "colecovision.lodor.platform.json",
+      "platformName": "Coleco ColecoVision",
+      "platformShortname": "colecovision",
+      "platformUniqueId": "colecovision",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "dos.lodor.platform.json",
+      "platformName": "DOS (PC)",
+      "platformShortname": "dos",
+      "platformUniqueId": "dos",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "dreamcast.lodor.platform.json",
+      "platformName": "Sega Dreamcast",
+      "platformShortname": "dreamcast",
+      "platformUniqueId": "dreamcast",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "fbneo.lodor.platform.json",
+      "platformName": "FinalBurn Neo",
+      "platformShortname": "fbneo",
+      "platformUniqueId": "fbneo",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "fds.lodor.platform.json",
+      "platformName": "Nintendo Famicom Disk System",
+      "platformShortname": "fds",
+      "platformUniqueId": "fds",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "gamegear.lodor.platform.json",
+      "platformName": "Sega Game Gear",
+      "platformShortname": "gamegear",
+      "platformUniqueId": "gamegear",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "gb.lodor.platform.json",
+      "platformName": "Nintendo Game Boy",
+      "platformShortname": "gb",
+      "platformUniqueId": "gb",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "gba.lodor.platform.json",
+      "platformName": "Nintendo Game Boy Advance",
+      "platformShortname": "gba",
+      "platformUniqueId": "gba",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "gbc.lodor.platform.json",
+      "platformName": "Nintendo Game Boy Color",
+      "platformShortname": "gbc",
+      "platformUniqueId": "gbc",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "mastersystem.lodor.platform.json",
+      "platformName": "Sega Master System",
+      "platformShortname": "mastersystem",
+      "platformUniqueId": "mastersystem",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "megadrive.lodor.platform.json",
+      "platformName": "Sega Mega Drive",
+      "platformShortname": "megadrive",
+      "platformUniqueId": "megadrive",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "n64.lodor.platform.json",
+      "platformName": "Nintendo 64",
+      "platformShortname": "n64",
+      "platformUniqueId": "n64",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "nds.lodor.platform.json",
+      "platformName": "Nintendo DS",
+      "platformShortname": "nds",
+      "platformUniqueId": "nds",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "neogeo.lodor.platform.json",
+      "platformName": "SNK Neo Geo",
+      "platformShortname": "neogeo",
+      "platformUniqueId": "neogeo",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "neogeocd.lodor.platform.json",
+      "platformName": "SNK Neo Geo CD",
+      "platformShortname": "neogeocd",
+      "platformUniqueId": "neogeocd",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "nes.lodor.platform.json",
+      "platformName": "Nintendo Entertainment System",
+      "platformShortname": "nes",
+      "platformUniqueId": "nes",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "ngp.lodor.platform.json",
+      "platformName": "SNK Neo Geo Pocket",
+      "platformShortname": "ngp",
+      "platformUniqueId": "ngp",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "ngpc.lodor.platform.json",
+      "platformName": "SNK Neo Geo Pocket Color",
+      "platformShortname": "ngpc",
+      "platformUniqueId": "ngpc",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "pcengine.lodor.platform.json",
+      "platformName": "NEC PC Engine",
+      "platformShortname": "pcengine",
+      "platformUniqueId": "pcengine",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "pcenginecd.lodor.platform.json",
+      "platformName": "NEC PC Engine CD",
+      "platformShortname": "pcenginecd",
+      "platformUniqueId": "pcenginecd",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "pico8.lodor.platform.json",
+      "platformName": "PICO-8 Fantasy Console",
+      "platformShortname": "pico8",
+      "platformUniqueId": "pico8",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "pokemini.lodor.platform.json",
+      "platformName": "Nintendo Pok\u00e9mon Mini",
+      "platformShortname": "pokemini",
+      "platformUniqueId": "pokemini",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "ports.lodor.platform.json",
+      "platformName": "Ports",
+      "platformShortname": "ports",
+      "platformUniqueId": "ports",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "psp.lodor.platform.json",
+      "platformName": "Sony PlayStation Portable",
+      "platformShortname": "psp",
+      "platformUniqueId": "psp",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "psx.lodor.platform.json",
+      "platformName": "Sony PlayStation",
+      "platformShortname": "psx",
+      "platformUniqueId": "psx",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "saturn.lodor.platform.json",
+      "platformName": "Sega Saturn",
+      "platformShortname": "saturn",
+      "platformUniqueId": "saturn",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "scummvm.lodor.platform.json",
+      "platformName": "ScummVM Game Engine",
+      "platformShortname": "scummvm",
+      "platformUniqueId": "scummvm",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "sega32x.lodor.platform.json",
+      "platformName": "Sega Mega Drive 32X",
+      "platformShortname": "sega32x",
+      "platformUniqueId": "sega32x",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "segacd.lodor.platform.json",
+      "platformName": "Sega CD",
+      "platformShortname": "segacd",
+      "platformUniqueId": "segacd",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "sg-1000.lodor.platform.json",
+      "platformName": "Sega SG-1000",
+      "platformShortname": "sg-1000",
+      "platformUniqueId": "sg-1000",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "snes.lodor.platform.json",
+      "platformName": "Nintendo SNES (Super Nintendo)",
+      "platformShortname": "snes",
+      "platformUniqueId": "snes",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "supergrafx.lodor.platform.json",
+      "platformName": "NEC SuperGrafx",
+      "platformShortname": "supergrafx",
+      "platformUniqueId": "supergrafx",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "virtualboy.lodor.platform.json",
+      "platformName": "Nintendo Virtual Boy",
+      "platformShortname": "virtualboy",
+      "platformUniqueId": "virtualboy",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "wonderswan.lodor.platform.json",
+      "platformName": "Bandai WonderSwan",
+      "platformShortname": "wonderswan",
+      "platformUniqueId": "wonderswan",
+      "revisionNumber": 1
+    },
+    {
+      "filename": "wonderswancolor.lodor.platform.json",
+      "platformName": "Bandai WonderSwan Color",
+      "platformShortname": "wonderswancolor",
+      "platformUniqueId": "wonderswancolor",
+      "revisionNumber": 1
+    }
+  ]
+}

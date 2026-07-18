@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "Sega Saturn",
+    "uniqueId": "saturn",
+    "shortname": "saturn",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - Sega Saturn",
+      "uniqueId": "saturn.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch mednafen_saturn. Extensions: 7z, bin, ccd, chd, cue, iso, m3u, mds, toc, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:7z|bin|ccd|chd|cue|iso|m3u|mds|toc|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM saturn\n  -e LODOR_CORE mednafen_saturn\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}

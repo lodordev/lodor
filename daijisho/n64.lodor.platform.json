@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "Nintendo 64",
+    "uniqueId": "n64",
+    "shortname": "n64",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - Nintendo 64",
+      "uniqueId": "n64.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch mupen64plus_next_gles3. Extensions: 7z, app, bin, d64, n64, ndd, u1, v64, z64, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:7z|app|bin|d64|n64|ndd|u1|v64|z64|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM n64\n  -e LODOR_CORE mupen64plus_next_gles3\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}

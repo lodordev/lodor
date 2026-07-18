@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "Atari 2600",
+    "uniqueId": "atari2600",
+    "shortname": "atari2600",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - Atari 2600",
+      "uniqueId": "atari2600.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch stella. Extensions: 7z, a26, bin, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:7z|a26|bin|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM atari2600\n  -e LODOR_CORE stella\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}

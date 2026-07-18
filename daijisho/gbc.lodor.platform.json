@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "Nintendo Game Boy Color",
+    "uniqueId": "gbc",
+    "shortname": "gbc",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - Nintendo Game Boy Color",
+      "uniqueId": "gbc.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch gambatte. Extensions: 7z, bs, cgb, dmg, gb, gbc, gbx, sfc, sgb, smc, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:7z|bs|cgb|dmg|gb|gbc|gbx|sfc|sgb|smc|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM gbc\n  -e LODOR_CORE gambatte\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}

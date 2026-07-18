@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "DOS (PC)",
+    "uniqueId": "dos",
+    "shortname": "dos",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - DOS (PC)",
+      "uniqueId": "dos.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch dosbox_pure. Extensions: 7z, bat, com, conf, cue, dosz, exe, img, iso, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:7z|bat|com|conf|cue|dosz|exe|img|iso|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM dos\n  -e LODOR_CORE dosbox_pure\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}

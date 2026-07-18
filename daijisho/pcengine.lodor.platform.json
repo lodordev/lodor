@@ -1,0 +1,32 @@
+{
+  "databaseVersion": 14,
+  "revisionNumber": 1,
+  "platform": {
+    "name": "NEC PC Engine",
+    "uniqueId": "pcengine",
+    "shortname": "pcengine",
+    "description": null,
+    "acceptedFilenameRegex": "^(?!(?:\\._|\\.).*).*$",
+    "scraperSourceList": [],
+    "boxArtAspectRatioId": 0,
+    "useCustomBoxArtAspectRatio": false,
+    "customBoxArtAspectRatio": null,
+    "screenAspectRatioId": 1,
+    "useCustomScreenAspectRatio": false,
+    "customScreenAspectRatio": null,
+    "retroAchievementsConsoleIdList": [],
+    "extra": ""
+  },
+  "playerList": [
+    {
+      "name": "Lodor (RomM sync) - NEC PC Engine",
+      "uniqueId": "pcengine.lodor",
+      "description": "RomM download-on-launch + save/state sync, forwards to RetroArch mednafen_pce. Extensions: 7z, ccd, chd, cue, img, iso, m3u, pce, rom, sgx, toc, zip.",
+      "acceptedFilenameRegex": "(?i)^(.*)\\.(?:7z|ccd|chd|cue|img|iso|m3u|pce|rom|sgx|toc|zip)$",
+      "amStartArguments": "-n dev.lodor.android/dev.lodor.android.launch.ProxyLaunchActivity\n  -e LODOR_ROM {file.path}\n  -e LODOR_SYSTEM pcengine\n  -e LODOR_CORE mednafen_pce\n  --activity-clear-task\n  --activity-clear-top",
+      "killPackageProcesses": false,
+      "killPackageProcessesWarning": false,
+      "extra": ""
+    }
+  ]
+}
