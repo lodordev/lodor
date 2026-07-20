@@ -1,16 +1,28 @@
 # Lodor
 
-A small, CGO-free Go engine that syncs a [RomM](https://github.com/rommapp/romm) library to a Linux
-retro handheld — the headless core behind [LodorOS](https://github.com/lodordev/lodoros) and the
-per-CFW ports.
+A small, CGO-free Go engine that syncs a [RomM](https://github.com/rommapp/romm) library to a
+retro handheld — the headless core behind [LodorOS](https://github.com/lodordev/lodoros), the
+per-CFW ports, and the Lodor Android app.
 
 Lodor's wedge is **transparent mirroring**: instead of browsing and downloading, your whole library
 appears on the device as zero-byte stub files. Tap a game and the real ROM is fetched on demand;
 saves sync back to the server automatically around each session. The library "isn't there until you
 touch it," so a 128 MB handheld can front a 500 GB server.
 
-This repository is the **engine only** — a single static binary plus shell-callable subcommands. It
-has no UI; the front-end (menus, onboarding, progress) lives in the OS and port repos that embed it.
+This repository's **source is the engine only** — a single binary plus shell-callable subcommands,
+no UI; the front-ends (menus, onboarding, progress) live in the OS and port repos that embed it.
+This repo's **[releases](https://github.com/lodordev/lodor/releases) are the umbrella for the whole
+project**: each release carries every lane's artifacts — the LodorOS update overlays, the muOS
+`.muxapp`, the Knulli zip, the **Android APK**, and the signed `versions.json` self-update manifest.
+
+## The Android app
+
+The same engine also drives **Lodor for Android** (`Lodor-Android-<version>.apk` on the releases
+page): an app that brings stub mirroring, download-on-launch, and save/state sync to Android
+handhelds under an existing frontend. It registers as a proxy emulator — the frontend launches
+Lodor, Lodor materializes the ROM and saves, forwards to RetroArch, and syncs back at session end.
+One-tap setup configures **ES-DE**, **Cocoon**, and **Daijishō**. The engine ships inside the APK
+(built `GOOS=android GOARCH=arm64`); nothing about the server setup differs from the CFW lanes.
 
 ## What it does
 
@@ -20,6 +32,10 @@ has no UI; the front-end (menus, onboarding, progress) lives in the OS and port 
 - **Save sync** — push local saves to RomM (additive, versioned) and pull/restore newer ones, with a
   pending queue for offline writes. A restore preserves the current save first — pushing it, or staging
   it for deferred upload when offline — so it can never trade away unsynced progress.
+- **Save-state sync** — the same discipline for emulator save states: push, pull, queue offline,
+  restore any past point (this is what powers LodorOS Flashback and cross-device Handoff).
+- **Self-update** — check and fetch per-lane update assets from the signed `versions.json` manifest,
+  sha256-verified and resumable; a lane with no published asset honestly reports "no update".
 - **Catalog & collections** — mirror platforms and RomM collections to the device.
 - **Box art & BIOS** — fetch covers (lazily) and per-platform firmware.
 - **Onboarding** — pair to a server with a one-time code (no admin credentials on the device).
@@ -27,7 +43,8 @@ has no UI; the front-end (menus, onboarding, progress) lives in the OS and port 
 ## Design
 
 - **CGO-free, standard-library only.** No database driver, no SDL, no third-party modules — `go.mod`
-  has zero `require`s. Builds to a single static binary that cross-compiles cleanly for ARMv7/ARM64.
+  has zero `require`s. Builds to a single static binary that cross-compiles cleanly for ARMv7/ARM64
+  on the CFW lanes (the Android build of the same code ships inside the APK instead).
 - **Honest results.** Every subcommand prints a machine-parseable `RESULT …` line and exits with a
   code the caller switches on. A partial or failed transfer reports `downloaded=0` and leaves the stub
   in place — it never fabricates success or writes a fake placeholder in a real ROM's spot.
@@ -68,6 +85,23 @@ Configuration lives in `config.json` next to the binary (see `config.json.exampl
 | `--sync-feed` | List recent server saves, newest first. |
 
 Each prints a `RESULT …` summary line.
+
+That table is the everyday core; the full surface is larger. Run `lodor-sync -h` for the
+authoritative per-flag reference. The other mode groups:
+
+| Group | Modes |
+|---|---|
+| Save states (Flashback / Handoff) | `--list-states` `--pull-state` `--push-states` `--push-all-states` `--push-pending-states` `--queue-state` (with `--state-id` / `--state-slot`) |
+| Self-update | `--check-update` `--fetch-update` (sha256-verified, Range-resumable; per-lane assets from the signed `versions.json`) |
+| Downloads & discs | `--download-queue` `--fetch-discs` `--fetch-next-disc` `--prefetch-discs` `--check-rom` `--check-bios` `--remove-downloads` `--evict` |
+| Continue / recency | `--recent` `--sync-continue` `--sync-feed` |
+| Multi-user profiles | `--list-users` `--login-user` `--login-profile` `--pair-profile` `--list-profiles` `--login-device` |
+| Playtime & metadata | `--sync-playtime` `--report-session` `--session-start` / `--session-end` · `--set-favorite` / `--unset-favorite` `--set-rating` `--set-status` `--set-props` |
+| RetroAchievements | `--ra-login` `--ra-status` `--ra-cmd` |
+| Housekeeping | `--reconcile` `--pull-saves` `--push-save` `--track-save` / `--untrack-save` `--write-gamelists` `--uninstall-mirror` `--version` |
+
+Common modifiers: `--dry`, `--full`, `--include-deleted`, `--cancellable` (honest B-press
+cancellation on device UIs), `--insecure`, `--port`.
 
 **Exit codes:** `0` ok · `2` config/flag error · `3` unreachable / could not resolve · `4` ran but
 one or more items errored · `6` **pairing expired** — the server rejected this device's client token
