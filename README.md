@@ -13,7 +13,8 @@ This repository's **source is the engine only** — a single binary plus shell-c
 no UI; the front-ends (menus, onboarding, progress) live in the OS and port repos that embed it.
 This repo's **[releases](https://github.com/lodordev/lodor/releases) are the umbrella for the whole
 project**: each release carries every lane's artifacts — the LodorOS update overlays, the muOS
-`.muxapp`, the Knulli zip, the **Android APK**, and the signed `versions.json` self-update manifest.
+`.muxapp`, the Knulli zip, the OnionOS zip, the **Android APK**, and the signed `versions.json`
+self-update manifest.
 
 ## The Android app
 
