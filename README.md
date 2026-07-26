@@ -26,7 +26,7 @@ The umbrella release for this alpha carries the **LodorOS update overlays** and 
 - [Release notes and downloads](https://github.com/lodordev/lodor/releases/tag/v1.0.0-alpha1)
 - Devices self-update from `https://lodordev.github.io/lodor/versions.json` (ed25519-signed)
 
-These 1.0 releases are marked **pre-release** on GitHub, so this repo's *Latest release* badge still points at the last stable (`0.9.8.1`). That is deliberate.
+This is the current release: it is what *Latest release* points at, and what the download links above resolve to.
 
 ## The Android app
 
