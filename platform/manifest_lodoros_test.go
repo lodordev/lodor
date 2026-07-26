@@ -1,4 +1,4 @@
-//go:build !onion && !muos && !knulli && !android && !lodorandroid
+//go:build !onion && !muos && !knulli && !android && !lodorandroid && !spruce
 
 // The LodorOS (native-state host) leg of the ReclaimableStub triple gate. Lives in its
 // own !onion && !muos file: HostShowsStateNatively is hard-false on the onion/muos

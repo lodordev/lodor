@@ -1,4 +1,4 @@
-//go:build !onion
+//go:build !onion && !spruce
 
 package catalog
 

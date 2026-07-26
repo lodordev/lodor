@@ -415,3 +415,49 @@ func prefetchStillWanted(m3uPath string) bool {
 	fi, err := os.Stat(m3uPath)
 	return err == nil && !fi.IsDir() && fi.Size() > 0
 }
+
+// runPrefetchLarge is a daemon background leg (beta1 T2.1): pre-warm large disc-image
+// STUBS (segacd/psx/saturn/dreamcast, or any .chd container) so a first launch of a
+// big game does not stall on a cold multi-hundred-MB download over the Miyoo Mini's
+// Wi-Fi. The census (catalog.LargeStubDownloads) is OFFLINE — manifest + filesystem
+// only; each real fetch rides the SAME downloadRomCore machinery the launch path uses
+// (retained-.tmp HTTP-Range resume, the armed download-cancel signal, per-file hash
+// verify), so a SIGTERM at 94% leaves a .tmp the next cycle finishes. Charging is the
+// DAEMON's gate (romm-syncd only calls this on a charging pass), not the engine's.
+// Contract:
+//
+//	RESULT prefetch_roms=<N> fetched=<F> failed=<K>
+//
+// --dry prints the census (prefetch_roms) and exits without any network or card write,
+// so the daemon can decide if a cycle is worth the radio. Per-game PREFETCHLARGE lines
+// go to stderr (the daemon log), never stdout. Exit: 0, or 4 when any fetch failed (the
+// documented ran-but-errored code); a failed stub stays a stub and is re-found next cycle.
+func runPrefetchLarge(client *romm.Client, cfg *config.Config, dry bool) {
+	stubs := catalog.LargeStubDownloads()
+	if dry || len(stubs) == 0 {
+		fmt.Printf("RESULT prefetch_roms=%d fetched=0 failed=0\n", len(stubs))
+		os.Exit(0)
+	}
+	fetched, failed := 0, 0
+	for _, romPath := range stubs {
+		// Re-stat before spending radio: a stub filled by a launch since the census,
+		// or evicted, needs no work now (and refilling an evicted stub would silently
+		// undo the user — parity with runPrefetchDiscs / prefetchStillWanted).
+		if fi, err := os.Stat(romPath); err != nil || fi.IsDir() || fi.Size() != 0 {
+			fmt.Fprintf(os.Stderr, "PREFETCHLARGE skip (not a 0-byte stub now): %s\n", filepath.Base(romPath))
+			continue
+		}
+		if downloadRomCore(client, cfg, romPath) {
+			fetched++
+			fmt.Fprintf(os.Stderr, "PREFETCHLARGE complete: %s\n", filepath.Base(romPath))
+		} else {
+			failed++
+			fmt.Fprintf(os.Stderr, "PREFETCHLARGE incomplete (.tmp kept for resume; retry next cycle): %s\n", filepath.Base(romPath))
+		}
+	}
+	fmt.Printf("RESULT prefetch_roms=%d fetched=%d failed=%d\n", len(stubs), fetched, failed)
+	if failed > 0 {
+		exitMode(4)
+	}
+	exitMode(0)
+}

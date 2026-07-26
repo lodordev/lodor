@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -118,6 +119,42 @@ func runSetServer(rawURL string, port int, insecure bool) {
 	}
 
 	fmt.Println("RESULT server_set=1")
+	os.Exit(0)
+}
+
+// runSetFrontendMedia persists the frontend-media cover placement (--set-frontend-media),
+// offline like --set-server. value is "esde:<abs media dir>" (routes box art into the
+// frontend's tree and enables fetch_covers) or "off" (clears both). Contract:
+//
+//	RESULT frontend_media_set=<0|1>
+//
+// Exit: 2 malformed value (unknown style, relative/empty dir) · 4 write failed ·
+// 0 written. Diagnostics never echo the dir (matching this file's host-free style).
+func runSetFrontendMedia(value string) {
+	value = strings.TrimSpace(value)
+	if strings.EqualFold(value, "off") {
+		if werr := config.WriteFrontendMedia("", ""); werr != nil {
+			fmt.Fprintf(os.Stderr, "SETFRONTENDMEDIAFAIL write: %s\n", safeErr(werr))
+			fmt.Println("RESULT frontend_media_set=0")
+			os.Exit(4)
+		}
+		fmt.Println("RESULT frontend_media_set=1")
+		os.Exit(0)
+	}
+	style, dir, found := strings.Cut(value, ":")
+	style = strings.ToLower(strings.TrimSpace(style))
+	dir = strings.TrimSpace(dir)
+	if !found || style != "esde" || dir == "" || !filepath.IsAbs(dir) {
+		fmt.Fprintln(os.Stderr, "SETFRONTENDMEDIAFAIL invalid value (want esde:<abs dir> or off)")
+		fmt.Println("RESULT frontend_media_set=0")
+		os.Exit(2)
+	}
+	if werr := config.WriteFrontendMedia(style, dir); werr != nil {
+		fmt.Fprintf(os.Stderr, "SETFRONTENDMEDIAFAIL write: %s\n", safeErr(werr))
+		fmt.Println("RESULT frontend_media_set=0")
+		os.Exit(4)
+	}
+	fmt.Println("RESULT frontend_media_set=1")
 	os.Exit(0)
 }
 

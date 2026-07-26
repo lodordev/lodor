@@ -187,7 +187,7 @@ func PullSaveDirectOpts(client *romm.Client, cfg *config.Config, romPath string,
 			return PullResult{Outcome: PullTombstoned, Reason: "tombstone", Ghosts: ghosts}
 		}
 		// No local save yet (first play of this game on this device): pull newest.
-		if res := writeSave(client, cfg, newest.ID, localPath); res.Outcome != PullWritten {
+		if res := writeSave(client, cfg, newest, localPath); res.Outcome != PullWritten {
 			res.Ghosts = ghosts
 			return res
 		}
@@ -217,7 +217,7 @@ func PullSaveDirectOpts(client *romm.Client, cfg *config.Config, romPath string,
 		if s.ID != newest.ID && matches(s) {
 			// The local bytes verifiably live on the server as an OLDER revision —
 			// pulling newest cannot lose progress (.bak kept regardless).
-			if res := writeSave(client, cfg, newest.ID, localPath); res.Outcome != PullWritten {
+			if res := writeSave(client, cfg, newest, localPath); res.Outcome != PullWritten {
 				res.Ghosts = ghosts
 				return res
 			}
@@ -266,7 +266,7 @@ func RestoreSave(client *romm.Client, cfg *config.Config, romPath string, save r
 	// work OFFLINE: when the current save can't be pushed to the timeline right now, the
 	// caller stages its bytes and queues them for a later upload rather than blocking the
 	// flashback. writeSave still renames the existing local save to .bak as a local net.
-	if res := writeSave(client, cfg, save.ID, localPath); res.Outcome != PullWritten {
+	if res := writeSave(client, cfg, save, localPath); res.Outcome != PullWritten {
 		return res
 	}
 	// SYNCED MOMENT: the explicitly chosen revision is now the on-card save and the
@@ -470,16 +470,32 @@ func romBasename(cfg *config.Config, rom romm.Rom) string {
 	return rom.FsName
 }
 
-// writeSave downloads the save content (optimistic=false, sent literally) and writes
-// it non-destructively: back up an existing local file to .bak, write .tmp, atomic
-// rename. Returns a PullWritten result on success or a PullError with a host-free
-// reason.
-func writeSave(client *romm.Client, cfg *config.Config, saveID int, localPath string) PullResult {
-	data, err := client.DownloadSaveContent(saveID, deviceID(cfg), false)
+// writeSave downloads the save record's content (optimistic=false, sent literally)
+// and writes it non-destructively: back up an existing local file to .bak, write
+// .tmp, atomic rename. Returns a PullWritten result on success or a PullError with a
+// host-free reason.
+//
+// INTEGRITY GATE: the downloaded bytes are fingerprinted against the record's
+// content_hash BEFORE any filesystem mutation. Previously only a zero-length body was
+// rejected, so a truncated-but-non-empty transfer overwrote a good local save and then
+// recordSyncedSave anchored the ledger to bytes the server never held — the .bak was
+// the only thing between that and losing the save. A mismatch now aborts with the live
+// file untouched and nothing recorded. Honest by omission (the AlreadyOnServer /
+// --list-saves rule): a record with no content_hash can't be checked, so it is allowed
+// through on the length guard alone rather than blocking the pull.
+func writeSave(client *romm.Client, cfg *config.Config, save romm.Save, localPath string) PullResult {
+	data, err := client.DownloadSaveContent(save.ID, deviceID(cfg), false)
 	if err != nil || len(data) == 0 {
 		// len(data)==0 is the last-line ghost net: even if a byte-less record slipped
 		// past the list filter, an empty body never overwrites a real local save.
 		return PullResult{Outcome: PullError, Reason: "download failed", AuthExpired: romm.IsAuthError(err)}
+	}
+	if save.ContentHash != nil && *save.ContentHash != "" &&
+		!strings.EqualFold(bytesMD5(data), *save.ContentHash) {
+		// Corrupt/truncated transfer. Nothing has been renamed or written yet, so the
+		// local save is exactly as it was; the caller reports the failure and the next
+		// sync retries from a clean slate.
+		return PullResult{Outcome: PullError, Reason: "corrupt download (hash mismatch)"}
 	}
 	saveDir := filepath.Dir(localPath)
 	if err := os.MkdirAll(saveDir, 0o755); err != nil {
@@ -499,7 +515,7 @@ func writeSave(client *romm.Client, cfg *config.Config, saveID int, localPath st
 	// optimistic=false precisely so the server does NOT advance the sync row until this
 	// point. Best-effort and non-blocking — a failed confirm never turns a written save
 	// into a pull error (the save is already durable); gated on RomM >= 4.9.0.
-	confirmDownloaded(client, cfg, saveID)
+	confirmDownloaded(client, cfg, save.ID)
 	return PullResult{Outcome: PullWritten, LocalPath: localPath}
 }
 

@@ -20,6 +20,7 @@ import (
 
 const (
 	fbiogetVSCREENINFO = 0x4600
+	fbioputVSCREENINFO = 0x4601 // re-activate the panel mode (FB_ACTIVATE_NOW) — show.elf's SSD202D recipe
 	fbiogetFSCREENINFO = 0x4602
 	// fbiopanDISPLAY moves the visible window (xoffset/yoffset in fb_var_screeninfo) over the
 	// mmap'd buffer WITHOUT re-blitting — the H700/muOS page-flip mechanism. We issue it after
@@ -48,6 +49,10 @@ type Framebuffer struct {
 	vinfo   [160]byte
 	isFile  bool // LODOR_FB_DEV test seam: a regular file, so no real ioctls (pan is recorded, not issued)
 	lastPan int  // yoffset showDrawnPage last requested — production intent + test observability
+	// forceOpaque: on the SSD202D (miyoomini) we re-activate the panel via FBIOPUT, and its 32bpp
+	// scanout treats a zero alpha byte as transparent — so Flush must write an opaque alpha (show.elf
+	// does the same). Set ONLY when LODOR_FB_FORCEMODE_* activated the mode; other panels untouched.
+	forceOpaque bool
 }
 
 func ioctl(fd uintptr, req uintptr, arg unsafe.Pointer) error {
@@ -100,6 +105,28 @@ func OpenFramebuffer(dev string) (*Framebuffer, error) {
 		synthScreenInfo(vinfo[:], finfo[:])
 	}
 	le := binary.LittleEndian
+	// SSD202D re-activation (miyoomini): at launch-card time minui has already SDL_Quit'd, which can
+	// leave the panel scanout DEACTIVATED so writes to /dev/fb0 show nothing (the "dead fb" symptom).
+	// show.elf's proven recipe re-activates it: FBIOPUT_VSCREENINFO forcing the panel mode with
+	// FB_ACTIVATE_NOW + yres_virtual=3x (triple buffer). Gated on LODOR_FB_FORCEMODE_W/_H, which
+	// romm-session-sync sets for miyoomini ONLY, so no other panel's mode is ever touched.
+	forceOpaque := false
+	if testDev == "" && ioErr == nil {
+		if fw, _ := strconv.Atoi(os.Getenv("LODOR_FB_FORCEMODE_W")); fw > 0 {
+			if fh, _ := strconv.Atoi(os.Getenv("LODOR_FB_FORCEMODE_H")); fh > 0 {
+				le.PutUint32(vinfo[0:], uint32(fw))    // xres
+				le.PutUint32(vinfo[8:], uint32(fw))    // xres_virtual
+				le.PutUint32(vinfo[4:], uint32(fh))    // yres
+				le.PutUint32(vinfo[12:], uint32(fh*3)) // yres_virtual (triple buffer, per show.elf)
+				le.PutUint32(vinfo[16:], 0)            // xoffset
+				le.PutUint32(vinfo[20:], 0)            // yoffset
+				le.PutUint32(vinfo[84:], 0)            // activate = FB_ACTIVATE_NOW
+				_ = ioctl(f.Fd(), fbioputVSCREENINFO, unsafe.Pointer(&vinfo[0]))
+				_ = ioctl(f.Fd(), fbiogetVSCREENINFO, unsafe.Pointer(&vinfo[0])) // re-read the applied mode
+				forceOpaque = true
+			}
+		}
+	}
 	fb := &Framebuffer{
 		f:      f,
 		isFile: testDev != "",
@@ -118,6 +145,7 @@ func OpenFramebuffer(dev string) (*Framebuffer, error) {
 		lineLength: int(le.Uint32(finfo[48:])), // fb_fix_screeninfo.line_length @ 48 (64-bit)
 	}
 	copy(fb.vinfo[:], vinfo[:]) // keep the driver's struct verbatim for FBIOPAN_DISPLAY re-issue
+	fb.forceOpaque = forceOpaque
 	if fb.yresVirtual < fb.yres {
 		fb.yresVirtual = fb.yres // single-buffer (or a driver that omits it): one page
 	}
@@ -220,6 +248,9 @@ func (fb *Framebuffer) Flush(c *Canvas) {
 		for x := 0; x < maxX; x++ {
 			r, g, b := c.Pix[srcRow+x].rgb()
 			px := fb.pack(r, g, b)
+			if fb.forceOpaque && bytesPP == 4 {
+				px |= 0xFF000000 // opaque alpha (top byte) — the SSD202D 32bpp scanout hides a 0-alpha pixel
+			}
 			off := rowOff + x*bytesPP
 			if off+bytesPP > len(fb.mem) {
 				continue

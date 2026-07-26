@@ -9,8 +9,8 @@ import "strings"
 
 // Theme holds the palette + text scales tuned for the 720×480 H700 panel.
 type Theme struct {
-	Bg, Panel, Accent, Text, Dim, Good, Bad Color
-	TitleScale, BodyScale, SmallScale       int
+	Bg, Panel, Accent, Text, Dim, Good, Bad, Warn Color
+	TitleScale, BodyScale, SmallScale             int
 }
 
 // DefaultTheme - dark with a RomM-ish violet accent.
@@ -23,6 +23,9 @@ func DefaultTheme() Theme {
 		Dim:    0x8888a0,
 		Good:   0x4ade80,
 		Bad:    0xf87171,
+		// Amber — the sync-status "queued / offline / needs-attention" tone (never the alarming
+		// red Bad; offline is a normal state). Used by the exit save-sync splash.
+		Warn: 0xfbbf24,
 
 		TitleScale: 4,
 		BodyScale:  2,

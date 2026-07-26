@@ -181,6 +181,31 @@ func TestOnionLocalRomPathBareTagFolder(t *testing.T) {
 	}
 }
 
+// TestOnionLocalRomPathResolvesBareTagRegardlessOfMapping is the lodor#68 residual guard.
+// OnionOS scans ONLY the fixed bare-tag folder, so a slug must resolve to its tag whether
+// its directory_mappings entry is (a) ABSENT — a system in the library but missing from a
+// carried/partial mapping set, the case the live verify caught (n64/atari landed under the
+// RomM display name "Nintendo 64"/"Atari Lynx", invisible to OnionOS) — or (b) a stale
+// MinUI-form path the heal has not yet rewritten. Both must place under the bare tag.
+func TestOnionLocalRomPathResolvesBareTagRegardlessOfMapping(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("BASE_PATH", "/c")
+	// (a) NO mapping for n64 at all — must still land under Roms/N64, not "Nintendo 64".
+	cfgNoMap := &config.Config{DirectoryMappings: map[string]config.DirMapping{}}
+	rn64 := romm.Rom{PlatformFsSlug: "n64", PlatformDisplayName: "Nintendo 64", Files: []romm.RomFile{{FileName: "Mario 64 (USA).z64"}}}
+	if got := LocalRomPath(cfgNoMap, rn64); got != "/c/Roms/N64/Mario 64 (USA).z64" {
+		t.Errorf("unmapped n64 LocalRomPath=%q want /c/Roms/N64/... (bare tag, not display name)", got)
+	}
+	// (b) STALE MinUI-form mapping for gba — placement must ignore it and use the bare tag.
+	cfgStale := &config.Config{DirectoryMappings: map[string]config.DirMapping{
+		"gba": {Slug: "gba", RelativePath: "Game Boy Advance (GBA)"},
+	}}
+	rgba := romm.Rom{PlatformFsSlug: "gba", PlatformDisplayName: "Game Boy Advance", Files: []romm.RomFile{{FileName: "Zelda (USA).gba"}}}
+	if got := LocalRomPath(cfgStale, rgba); got != "/c/Roms/GBA/Zelda (USA).gba" {
+		t.Errorf("stale-mapped gba LocalRomPath=%q want /c/Roms/GBA/... (bare tag)", got)
+	}
+}
+
 // TestOnionFsSlugForTag locks the deterministic reverse of onionRomTags that catalog.go
 // (shared with !onion) depends on. The key property: every slug returned must round-trip
 // back to the SAME tag via PrimaryTag, and the result must be stable for aliased tags.

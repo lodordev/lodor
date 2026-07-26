@@ -43,7 +43,7 @@ func TestSetServerPropagatesToSameServerProfileHosts(t *testing.T) {
 		},
 	}
 	data, _ := json.Marshal(seed)
-	if err := os.WriteFile(configFileName, data, 0o600); err != nil {
+	if err := os.WriteFile(configFileName(), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 

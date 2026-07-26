@@ -86,13 +86,13 @@ func UninstallMirror(cfg *config.Config, removeDownloads bool) UninstallResult {
 				evictDiscFiles(abs)
 			}
 			removeAndForget(man, abs, &res)
-		case platform.ManifestCover:
+		case platform.ManifestCover, platform.ManifestCoverDim:
 			if _, err := os.Stat(abs); err != nil {
 				man.Forget(abs)
 				continue
 			}
 			removeAndForget(man, abs, &res)
-			_ = os.Remove(filepath.Dir(abs)) // .media — falls unless empty
+			_ = os.Remove(filepath.Dir(abs)) // .media (or ES-DE covers/) — falls unless empty
 		case platform.ManifestCollection, platform.ManifestContinue:
 			if strings.EqualFold(filepath.Base(abs), "map.txt") {
 				man.Forget(abs) // NextUI's file, full stop — a lying manifest can't claim it

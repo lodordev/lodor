@@ -241,6 +241,17 @@ type Config struct {
 	// (decided 2026-07-07: retention depth is the user's knob).
 	StateRetain int `json:"state_retain,omitempty"`
 
+	// FrontendMedia points the cover pass at a HOST FRONTEND's media tree instead of
+	// the NextUI .media convention. Today the only recognized style is "esde":
+	// covers land at <dir>/<system-folder>/covers/<rom-stem>.png — ES-DE's
+	// filename-match convention (its Android build keys media on the game file's
+	// basename; gamelist <image> entries are ignored there). Dir is the absolute
+	// media root (ES-DE's downloaded_media). Written by the Android app when its
+	// ES-DE integration is installed; absent on every CFW lane, so NextUI/LodorOS
+	// cover behavior is untouched. Cocoon is the intended second style — add a new
+	// style token rather than overloading "esde".
+	FrontendMedia *FrontendMediaConfig `json:"frontend_media,omitempty"`
+
 	// RAUsername / RAToken are the RetroAchievements credential spine (task #46):
 	// the RA account handle and its long-lived login token, stored TOP-LEVEL (not
 	// under a host) because RA is account-global, independent of any RomM host. The
@@ -263,6 +274,29 @@ func (c *Config) ResolvedStateRetain() int {
 		return 50
 	}
 	return c.StateRetain
+}
+
+// FrontendMediaConfig configures frontend-media cover placement (see the
+// FrontendMedia field). Style selects the layout convention; Dir is the absolute
+// media root the layout is rooted at.
+type FrontendMediaConfig struct {
+	Style string `json:"style"`
+	Dir   string `json:"dir"`
+}
+
+// FrontendMediaESDEDir returns the ES-DE media root (downloaded_media) when
+// frontend-media placement is configured with style "esde" and a non-empty dir,
+// else "" — the single gate every cover-placement decision reads. Unrecognized
+// styles read as "" (fail toward the harmless NextUI convention, never toward
+// writing into an unknown tree). Nil-safe.
+func (c *Config) FrontendMediaESDEDir() string {
+	if c == nil || c.FrontendMedia == nil {
+		return ""
+	}
+	if strings.TrimSpace(strings.ToLower(c.FrontendMedia.Style)) != "esde" {
+		return ""
+	}
+	return strings.TrimSpace(c.FrontendMedia.Dir)
 }
 
 // CoversEnabled reports whether the BULK cover fetch on --mirror-catalog is on.
@@ -395,7 +429,7 @@ func (s Seconds) Int() int { return int(s) }
 // and applies defaults: ApiTimeout 30s (clamped to 300s max), DownloadTimeout
 // 3600s.
 func Load() (*Config, error) {
-	data, err := os.ReadFile(configFileName)
+	data, err := os.ReadFile(configFileName())
 	if err != nil {
 		return nil, fmt.Errorf("reading config.json: %w", err)
 	}

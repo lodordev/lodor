@@ -68,7 +68,7 @@ func TestWriteSaveDownloadedConfirmIsBestEffort(t *testing.T) {
 	c := romm.NewClient(cfg.ActiveHost(), 10*time.Second)
 
 	local := filepath.Join(t.TempDir(), "game.sav")
-	res := writeSave(c, cfg, 100, local)
+	res := writeSave(c, cfg, romm.Save{ID: 100}, local)
 	if res.Outcome != PullWritten {
 		t.Fatalf("a 500 on /downloaded must not fail the write; got outcome %v reason=%q", res.Outcome, res.Reason)
 	}
@@ -90,7 +90,7 @@ func TestWriteSaveConfirmGatedOffBelow490(t *testing.T) {
 	c := romm.NewClient(cfg.ActiveHost(), 10*time.Second)
 
 	local := filepath.Join(t.TempDir(), "game.sav")
-	res := writeSave(c, cfg, 100, local)
+	res := writeSave(c, cfg, romm.Save{ID: 100}, local)
 	if res.Outcome != PullWritten {
 		t.Fatalf("write should succeed regardless of version; got %v", res.Outcome)
 	}

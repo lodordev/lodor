@@ -43,9 +43,16 @@ import (
 // mirror created (removable at uninstall only when empty); "collection"/"continue"
 // are Collections/*.txt files the mirror wrote.
 const (
-	ManifestStub       = "stub"
-	ManifestDownload   = "download"
-	ManifestCover      = "cover"
+	ManifestStub     = "stub"
+	ManifestDownload = "download"
+	ManifestCover    = "cover"
+	// ManifestCoverDim marks a frontend-media cover placed in its DIMMED (stub)
+	// styling. Same removal semantics as "cover"; the distinct kind is the
+	// dim-state ledger: --download force-refetches a dim cover bright, evict dims a
+	// bright one in place, and neither ever double-applies (the kind flips with
+	// each transition). Only frontend-media placements use it — the NextUI .media
+	// convention never dims.
+	ManifestCoverDim   = "cover-dim"
 	ManifestFolder     = "folder"
 	ManifestCollection = "collection"
 	ManifestContinue   = "continue"
@@ -63,6 +70,14 @@ const (
 	// history — deleting it would erase that. Ownership is used only to decide
 	// which pointers the injector may rewrite/re-key.
 	ManifestHistory = "history"
+	// ManifestFrontendMedia marks a box-art cover the engine placed into a host
+	// frontend's downloaded_media/<system>/covers/ tree (ES-DE AND Cocoon both match
+	// media to the ROM FILENAME, ignoring gamelist <image> — verified on ES-DE 3.4.1;
+	// Cocoon is ES-DE-media-compatible by design). Ownership is tracked so the
+	// idempotent placer (--place-frontend-media) may prune ONLY covers it wrote when a
+	// ROM's on-disk basename changes (✘->✓ on download) or the ROM leaves the library —
+	// a user's own scraped media is never in this set and is never touched.
+	ManifestFrontendMedia = "frontend-media"
 )
 
 // manifestFileName is the on-disk name, beside catalog-index.json in PakDir().

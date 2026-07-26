@@ -24,8 +24,17 @@ import (
 )
 
 // configFileName is the canonical config the engine loads CWD-relative. Kept in one
-// place so Load and the writer never drift.
-const configFileName = "config.json"
+// place so Load and the writer never drift. It honors LODOR_CONFIG_NAME so a host whose
+// frontend already OWNS an App-level "config.json" (spruceOS: App/Lodor/config.json is
+// the spruce Apps-menu manifest) can point the engine's RomM config at a distinct file
+// in the SAME dir, avoiding a name collision. Default "config.json" -- zero change for
+// every existing lane.
+func configFileName() string {
+	if n := os.Getenv("LODOR_CONFIG_NAME"); n != "" {
+		return n
+	}
+	return "config.json"
+}
 
 // WriteProfileHost adds or updates a MULTI-USER profile in config.json's hosts array:
 // it finds the host whose profile_label matches (case-insensitive) and updates its
@@ -39,7 +48,7 @@ const configFileName = "config.json"
 // (map-based, like WriteHostUpdate). Password is never stored (token-only at rest).
 // label/token are required by the caller.
 func WriteProfileHost(label, username, token, deviceID string, scopes []string) error {
-	path := configFileName
+	path := configFileName()
 	var root map[string]any
 	data, err := os.ReadFile(path)
 	switch {
@@ -174,7 +183,7 @@ func (u *HostUpdate) SetToken(token, name, expiresAt string, scopes []string) *H
 //
 // NEVER logs or returns the token/host/device_id; errors name the failing step only.
 func WriteHostUpdate(u HostUpdate) error {
-	path := configFileName
+	path := configFileName()
 
 	var root map[string]any
 	data, err := os.ReadFile(path)
@@ -290,7 +299,7 @@ func WriteHostUpdate(u HostUpdate) error {
 // CLEARS both keys (logout). Atomic 0600 write. NEVER logs the token; errors name only
 // the failing step.
 func WriteRACredentials(username, token string) error {
-	path := configFileName
+	path := configFileName()
 
 	var root map[string]any
 	data, err := os.ReadFile(path)
@@ -314,6 +323,42 @@ func WriteRACredentials(username, token string) error {
 	} else {
 		root["ra_username"] = username
 		root["ra_token"] = token
+	}
+
+	return writeJSONAtomic(path, root)
+}
+
+// WriteFrontendMedia persists the frontend-media cover placement: frontend_media =
+// {style, dir} AND fetch_covers=true in one write — a host frontend's media tree
+// exists to show the whole library's art, so enabling placement without the bulk
+// fetch is never what its caller wants. style=="" clears BOTH keys back to their
+// defaults (frontend media off, bulk covers off). Same contract as every writer
+// here: generic-tree round-trip (unknown keys survive), atomic write, nothing echoed.
+func WriteFrontendMedia(style, dir string) error {
+	path := configFileName()
+
+	var root map[string]any
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if uerr := json.Unmarshal(data, &root); uerr != nil {
+			return fmt.Errorf("parse config: %w", uerr)
+		}
+		if root == nil {
+			root = map[string]any{}
+		}
+	case os.IsNotExist(err):
+		root = map[string]any{}
+	default:
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	if style == "" {
+		delete(root, "frontend_media")
+		delete(root, "fetch_covers")
+	} else {
+		root["frontend_media"] = map[string]any{"style": style, "dir": dir}
+		root["fetch_covers"] = true
 	}
 
 	return writeJSONAtomic(path, root)

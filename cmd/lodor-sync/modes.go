@@ -306,7 +306,7 @@ func downloadRomCoreInner(client *romm.Client, cfg *config.Config, romPath strin
 	}
 	writeProgress(100)
 
-	fetchRomCover(client, rom, dest, man)
+	fetchRomCover(client, cfg, rom, dest, man)
 	recordDownload(man, dest, rom.ID)
 
 	return true
@@ -442,7 +442,7 @@ func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm
 		fmt.Fprintf(os.Stderr, "EXTRACT 7z rom=%d raw=%dB %dms\n", rom.ID, st.Size(), ms)
 	}
 	writeProgress(100)
-	fetchRomCover(client, rom, dest, man)
+	fetchRomCover(client, cfg, rom, dest, man)
 	recordDownload(man, dest, rom.ID)
 	return true
 }
@@ -546,22 +546,26 @@ func isBareM3U(rom romm.Rom) bool {
 	return false
 }
 
-// fetchRomCover fetches this one ROM's box-art into .media/ (BLUEPRINT §11),
+// fetchRomCover fetches this one ROM's box-art (BLUEPRINT §11) into the host's
+// cover placement — the frontend-media tree (ES-DE) when configured, else .media/ —
 // UNCONDITIONALLY of the bulk "fetch_covers" toggle (a per-game download is an
 // explicit action, so its Details view should show art even when bulk is off).
-// Best-effort, never gating the RESULT; honors pkg cover's skip-existing / no-cover /
-// graceful-error contract. coverAnchor is the path cover.MediaPath() keys off — the
-// .m3u for a multi-disc game, the rom file for a single-file game.
-// man records a SAVED cover as mirror-owned (kind=cover) so uninstall can remove
-// it; the caller persists the manifest (recordDownload's save covers it).
-func fetchRomCover(client *romm.Client, rom romm.Rom, coverAnchor string, man *platform.Manifest) {
+// A freshly-landed game is BRIGHT: when the manifest says the existing cover is the
+// dimmed stub styling, the fetch is FORCED so the art transitions with the bytes;
+// otherwise the plain skip-existing contract holds. Best-effort, never gating the
+// RESULT. coverAnchor is the path the placement keys off — the .m3u for a
+// multi-disc game, the rom file for a single-file game. man records a SAVED cover
+// as mirror-owned; the caller persists the manifest (recordDownload's save covers it).
+func fetchRomCover(client *romm.Client, cfg *config.Config, rom romm.Rom, coverAnchor string, man *platform.Manifest) {
 	if cp := rom.CoverPath(); cp != "" {
-		out, cerr := cover.FetchAndSave(client, cp, coverAnchor, false)
+		pl := catalog.CoverPlacement(cfg, coverAnchor, false)
+		force := man.OwnsKind(pl.Dest, platform.ManifestCoverDim)
+		out, cerr := cover.FetchAndPlace(client, cp, pl, force)
 		if out == cover.OutcomeError && cerr != nil {
 			fmt.Fprintf(os.Stderr, "COVERWARN rom=%d: %s\n", rom.ID, safeErr(cerr))
 		}
 		if out == cover.OutcomeSaved {
-			man.Record(cover.MediaPath(coverAnchor), platform.ManifestCover, rom.ID)
+			man.Record(pl.Dest, catalog.CoverKind(pl), rom.ID)
 		}
 	}
 }
@@ -922,7 +926,7 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 	}
 	writeProgress(100)
 
-	fetchRomCover(client, rom, m3uPath, man)
+	fetchRomCover(client, cfg, rom, m3uPath, man)
 	recordDownload(man, m3uPath, rom.ID) // the .m3u is the evictable download anchor
 
 	return true

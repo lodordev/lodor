@@ -22,7 +22,7 @@ import (
 // SECURITY: like WriteHostUpdate, this never reads, logs, or returns the token/host/
 // device_id; errors name the failing step only, and the host block is left untouched.
 func WriteDirectoryMappings(mappings map[string]DirMapping) error {
-	path := configFileName
+	path := configFileName()
 
 	var root map[string]any
 	data, err := os.ReadFile(path)

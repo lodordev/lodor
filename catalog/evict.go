@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"lodor/config"
+	"lodor/cover"
 	"lodor/platform"
 	"lodor/romm"
 )
@@ -105,6 +106,25 @@ func EvictToStub(cfg *config.Config, romPath string) (evicted bool, reason strin
 		man.Record(final, platform.ManifestStub, 0)
 	} else {
 		man.Record(romPath, platform.ManifestStub, 0)
+	}
+	// Frontend-media cover: the game is a stub again, so its BRIGHT cover dims in
+	// place (offline — no refetch needed; evict has no client). Kind-gated on the
+	// manifest so an already-dim cover never double-dims; best-effort, never
+	// failing the evict. Markerless hosts only ever reach here with a stable
+	// canonical name, so the placement key is unchanged by the reconcile above.
+	if cfg.FrontendMediaESDEDir() != "" {
+		anchor := final
+		if anchor == "" {
+			anchor = romPath
+		}
+		pl := CoverPlacement(cfg, anchor, true)
+		if man.OwnsKind(pl.Dest, platform.ManifestCover) {
+			if derr := cover.DimFileInPlace(pl.Dest); derr == nil {
+				man.Record(pl.Dest, platform.ManifestCoverDim, 0)
+			} else {
+				fmt.Fprintf(os.Stderr, "COVERWARN dim-on-evict: %v\n", derr)
+			}
+		}
 	}
 	if merr := man.Save(); merr != nil {
 		fmt.Fprintf(os.Stderr, "MANIFEST save failed after evict: %v\n", merr)

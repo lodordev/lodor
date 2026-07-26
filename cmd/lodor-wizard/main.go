@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,6 +79,17 @@ const (
 	stepTsSignin // interactive Tailscale sign-in: show the login URL, poll to connected
 )
 
+// wizardConfigName is the engine RomM config filename the wizard reads/writes in the
+// pak dir. Honors LODOR_CONFIG_NAME (spruceOS points the engine config at a non-colliding
+// name because App/Lodor/config.json is spruce's own Apps-menu manifest). Default
+// "config.json" — identical to every existing lane.
+func wizardConfigName() string {
+	if n := os.Getenv("LODOR_CONFIG_NAME"); n != "" {
+		return n
+	}
+	return "config.json"
+}
+
 type wizard struct {
 	t       ui.Theme
 	server  string
@@ -93,6 +105,7 @@ type wizard struct {
 	retry   step // where an error screen's "B: try again" returns to
 
 	in           ui.InputSource // live evdev source (nil off-hardware / in the sim tests)
+	wd           *watchdog      // active launch-card idle watchdog; nil outside the card (lodor#63)
 	tsAvail      bool           // Tailscale bundled + device capable (shim `available` == 0)
 	useTailscale bool           // user chose the Tailscale path at the Connect step
 	tsURL        string         // current Tailscale login URL (shown for the browser sign-in)
@@ -140,15 +153,34 @@ func main() {
 		w.reseedOverrides()
 		return
 	}
-	// --splash <title> <body> [good|bad]: draw ONE full-screen message to /dev/fb0 and exit.
+	// --splash <title> <body> [good|bad|queued]: draw ONE full-screen message to /dev/fb0 and exit.
 	// The launch override calls this for honest on-screen feedback during download-on-launch
 	// (user feedback #6: "no feedback when clicking/loading a game"). No input loop, no engine
 	// calls; best-effort — a non-openable fb returns non-zero for the caller to log.
-	// --launch-card <rom>: the Handoff launch gate (launchcard.go). Probes first
-	// with no fb/input; the interactive card appears ONLY when the server has
-	// something newer. Always exits 0 — a launch is never blocked.
-	if len(args) >= 2 && args[0] == "--launch-card" {
-		os.Exit(w.launchCard(args[1]))
+	// --launch-card [--summoned] <rom>: the Handoff launch gate (launchcard.go,
+	// expanded per-game card in launchcardv2.go). SMART (default): probes first
+	// with no fb/input; the card appears ONLY when the server has something
+	// newer. SUMMONED (--summoned flag, or LODOR_LAUNCH_SUMMONED=1 for hook
+	// lanes that can't alter argv): the full card shows regardless of news.
+	// Always exits 0 — a launch is never blocked, even on a bad invocation.
+	if len(args) >= 1 && args[0] == "--launch-card" {
+		rest := args[1:]
+		summoned := os.Getenv("LODOR_LAUNCH_SUMMONED") == "1"
+		if len(rest) >= 1 && rest[0] == "--summoned" {
+			summoned = true
+			rest = rest[1:]
+		}
+		if len(rest) < 1 {
+			fmt.Println("LAUNCHCARD shown=0 reason=no-rom")
+			os.Exit(0)
+		}
+		os.Exit(w.launchCard(rest[0], summoned))
+	}
+	// --sdl-spike: Phase A hardware spike (launch-card-v2). Drives lodor-fbhelper (SDL)
+	// and proves DISPLAY+INPUT on the tg5040/tg5050 panel where raw /dev/fb0 is black.
+	// Not the real card; a trivial button->color loop. See sdlspike.go.
+	if len(args) >= 1 && args[0] == "--sdl-spike" {
+		os.Exit(sdlSpike())
 	}
 	if len(args) >= 1 && args[0] == "--splash" {
 		title, body, tone := "", "", ""
@@ -189,11 +221,14 @@ func (w *wizard) splash(title, body, tone string) int {
 		col = t.Good
 	case "bad":
 		col, hint = t.Bad, "returning to menu"
+	case "queued":
+		// Offline / queued — a normal, non-alarming state (amber, not red).
+		col, hint = t.Warn, "will sync when online"
 	}
 	x, y, ww, _ := t.Frame(c, "Lodor", hint)
 	c.DrawTextCentered(x, y+10, ww, title, t.Accent, t.TitleScale-1)
 	t.DrawTextWrappedAt(c, x, y+10+wizGlyphH*(t.TitleScale-1)+30, ww, body, col, t.BodyScale)
-	fb.Flush(c)
+	presentCanvas(fb, c) // canvas is panel-native here, so this is identity — kept on the one seam
 	return 0
 }
 
@@ -298,6 +333,20 @@ func (w *wizard) runEngine(args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, w.bin, args...)
 	cmd.Dir = w.dataDir
 	return runCaptured(ctx, cmd, engineTimeout)
+}
+
+// runEngineMutating is runEngine wrapped in a watchdog pause/resume so the launch-card idle
+// auto-exit (os.Exit(0), which runs no deferreds and orphans the engine child) cannot fire
+// mid-write on a state-mutating op and corrupt the save the game is about to open (lodor#63).
+// Outside the card (w.wd == nil — Game Manager, first-run wizard) it is exactly runEngine, so
+// callers shared with those paths keep their behavior. Use ONLY for mutating ops
+// (--restore-save / --pull-state / --download / --evict); read-only listings don't need it.
+func (w *wizard) runEngineMutating(args ...string) (string, error) {
+	if w.wd != nil {
+		w.wd.pause()
+		defer w.wd.resume()
+	}
+	return w.runEngine(args...)
 }
 
 // runCaptured runs cmd under ctx (deadline d), capturing combined stdout+stderr to a
@@ -659,7 +708,7 @@ func (w *wizard) runInteractive() {
 	// default — production never dumps. Best-effort; a failed dump never disturbs the UI.
 	dumpPath := os.Getenv("LODOR_FB_DUMP")
 	draw := func(c *ui.Canvas) {
-		fb.Flush(c)
+		presentCanvas(fb, c) // panel-scaled — NEVER raw Flush (TrimUI corner-render bug)
 		if dumpPath != "" {
 			_ = fb.SavePNG(dumpPath)
 		}
@@ -693,12 +742,43 @@ func (w *wizard) openInput() (ui.InputSource, error) {
 		w.phaseInput(len(seq))
 		return ui.NewScriptedSource(seq), nil
 	}
-	ev, err := ui.NewEvdevSource()
+	// EVDEV RAW-LOG BACKSTOP (launch-card-v2): on the raw-fb lanes (muos/knulli H700, LodorOS
+	// miyoomini/my355) the wizard tees every raw evdev code it sees to <pakDir>/wizard-input.log
+	// so the FIRST on-device test of each lane captures the device's TRUE button map. This is
+	// how the unresolved my355 (Flip) codes get confirmed and how H700/Mini are sanity-checked
+	// without a separate spike — the SDL lane already logs via the spike/helper #surface tee.
+	// Best-effort: if the log can't be opened (or there's no pak dir yet), input still works.
+	rawLog := w.openInputRawLog()
+	ev, err := ui.NewEvdevSourceLoggedFor(rawLog, inputKeyMap())
 	if err != nil {
+		if rawLog != nil {
+			if c, ok := rawLog.(io.Closer); ok {
+				_ = c.Close()
+			}
+		}
 		return nil, err
 	}
 	w.phaseInput(ev.Count())
 	return ev, nil
+}
+
+// openInputRawLog opens <pakDir>/wizard-input.log (append) for the evdev raw-code backstop,
+// or returns nil (logging simply off) when there is no pak dir or the file can't be created —
+// a log problem must NEVER stop the card from taking input. The EvdevSource owns the writer
+// for the process lifetime (closed with the source); we do not hold a handle here.
+func (w *wizard) openInputRawLog() io.Writer {
+	dir := w.dataDir
+	if dir == "" {
+		return nil
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "wizard-input.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil
+	}
+	fmt.Fprintf(f, "=== wizard-input %s host=%s ===\n",
+		time.Now().Format("2006-01-02 15:04:05"), hostOS())
+	return f
 }
 
 // parseButtonScript turns a comma/space/newline-separated token list into logical Buttons
@@ -727,6 +807,10 @@ func parseButtonScript(s string) ([]ui.Button, error) {
 			out = append(out, ui.BtnStart)
 		case "select":
 			out = append(out, ui.BtnSelect)
+		case "l1":
+			out = append(out, ui.BtnL1)
+		case "r1":
+			out = append(out, ui.BtnR1)
 		default:
 			return nil, fmt.Errorf("bad button token %q in LODOR_INPUT_SCRIPT", f)
 		}
@@ -736,7 +820,7 @@ func parseButtonScript(s string) ([]ui.Button, error) {
 
 // configured reports whether config.json already holds a server + credential.
 func (w *wizard) configured() bool {
-	b, err := os.ReadFile(filepath.Join(w.dataDir, "config.json"))
+	b, err := os.ReadFile(filepath.Join(w.dataDir, wizardConfigName()))
 	if err != nil {
 		return false
 	}
@@ -787,6 +871,7 @@ type menuRow struct {
 type menuState struct {
 	pairingExpired bool
 	pendingN       int
+	pendingStatesN int
 	queueN         int
 	userLabel      string
 	coversOn       bool
@@ -816,6 +901,11 @@ func buildMenuRows(st menuState) []menuRow {
 	if st.pendingN > 0 {
 		// lodor#60: "upload now" is the cross-lane canon label (NextUI shipped it first).
 		add(fmt.Sprintf("Pending saves (%d) - upload now", st.pendingN), actPushPending)
+	}
+	if st.pendingStatesN > 0 {
+		// Handoff: save-STATES queued offline. Sync Now drains them (--push-pending-states);
+		// surfacing the count keeps "queued" honest instead of a silent backlog.
+		add(fmt.Sprintf("Queued states (%d) - sync to upload", st.pendingStatesN), actSyncNow)
 	}
 	add("Refresh library (update)", actRefreshUpdate)
 	add("Refresh library (full)", actRefreshFull)
@@ -974,6 +1064,7 @@ func (w *wizard) menuState() menuState {
 	return menuState{
 		pairingExpired: w.pairingExpired(),
 		pendingN:       countLines(filepath.Join(w.dataDir, "pending-saves.txt")),
+		pendingStatesN: countLines(filepath.Join(w.dataDir, "pending-states.txt")),
 		queueN:         countLines(filepath.Join(w.dataDir, "download-queue.txt")),
 		userLabel:      w.activeProfileLabel(),
 		coversOn:       w.fetchCoversOn(),
@@ -1046,7 +1137,7 @@ func (w *wizard) activeProfileLabel() string {
 			return s
 		}
 	}
-	cfg, _ := os.ReadFile(filepath.Join(w.dataDir, "config.json"))
+	cfg, _ := os.ReadFile(filepath.Join(w.dataDir, wizardConfigName()))
 	if v := jsonString(string(cfg), "profile_label"); v != "" {
 		return v
 	}
@@ -1255,7 +1346,23 @@ func (w *wizard) doSyncNow(draw func(*ui.Canvas), btn func() ui.Button) {
 	}
 	if rc == 0 {
 		w.maybeCheckUpdates(draw)
-		w.showMsg("Done", "Sync complete.", w.t.Good, draw, btn)
+		// HONEST STATUS (Handoff): --push-pending-states is best-effort (ignoreRC) and the
+		// engine exits 0 even when states stay stuck offline, so rc=0 can hide a non-empty
+		// queue. Read the residual queue files the drain rewrites and say so.
+		stuckSaves := countLines(filepath.Join(w.dataDir, "pending-saves.txt"))
+		stuckStates := countLines(filepath.Join(w.dataDir, "pending-states.txt"))
+		if stuckSaves > 0 || stuckStates > 0 {
+			var q []string
+			if stuckSaves > 0 {
+				q = append(q, fmt.Sprintf("%d save(s)", stuckSaves))
+			}
+			if stuckStates > 0 {
+				q = append(q, fmt.Sprintf("%d state(s)", stuckStates))
+			}
+			w.showMsg("Done", fmt.Sprintf("Synced - %s still queued (offline).", strings.Join(q, ", ")), w.t.Text, draw, btn)
+		} else {
+			w.showMsg("Done", "Sync complete.", w.t.Good, draw, btn)
+		}
 	} else {
 		w.showMsg("Problem", w.diagnose(rc, ""), w.t.Bad, draw, btn)
 	}
@@ -1920,15 +2027,29 @@ func (w *wizard) tsSignIn(draw func(*ui.Canvas), btn func() ui.Button) bool {
 	w.tsURL, w.tsPhase = "", "Starting Tailscale sign-in..."
 	draw(w.render(stepTsSignin, nil))
 
-	out, _ := w.runShim("up-interactive")
-	url := strings.TrimSpace(firstLine(out))
-	if url == "" {
-		// Empty URL = already signed in (persisted state) OR bring-up failed. Disambiguate.
+	var url string
+	for {
+		out, _ := w.runShim("up-interactive")
+		url = strings.TrimSpace(firstLine(out))
+		if url != "" {
+			break
+		}
+		// Empty URL = already signed in (persisted state) OR the control plane hasn't
+		// answered yet: on RG34XX-H hardware the FIRST handshake on a fresh node took 29s
+		// (noise dial forced to :443) — the daemon keeps waiting and the AuthURL lands in
+		// status JSON after the scrape window. Disambiguate, then offer an honest retry:
+		// a re-run of up-interactive reads the late URL straight from status JSON, so
+		// A-to-retry succeeds instantly once the control plane has answered.
 		if w.tsConnected() {
 			return true
 		}
-		w.tsPhase = "Couldn't start Tailscale sign-in. Check Wi-Fi.\n\nPress B to go back and choose Home / public URL."
-		return w.screenMessage(stepTsSignin, draw, btn) == actAdvance && w.tsConnected()
+		w.tsPhase = "No sign-in link yet - Tailscale can take a minute to answer\nthe first time on a new device.\n\nA: try again   B: go back and choose Home / public URL."
+		if w.screenMessage(stepTsSignin, draw, btn) != actAdvance {
+			return false
+		}
+		if w.tsConnected() { // approved out-of-band while we sat on the message
+			return true
+		}
 	}
 	w.tsURL = url
 	w.tsPhase = "Open this link in a browser and approve this device. Waiting for sign-in... (B to cancel)"
@@ -2376,11 +2497,13 @@ func (w *wizard) gmDownload(path string, draw func(*ui.Canvas), btn func() ui.Bu
 		return false
 	}
 	w.working(draw, "Downloading "+filepath.Base(path)+"...")
-	out, err := w.runEngine("--download", path)
+	// --download / --reconcile mutate the card; on the launch-card path they pause the idle
+	// watchdog so its os.Exit(0) can't orphan the writing child (lodor#63). No-op elsewhere.
+	out, err := w.runEngineMutating("--download", path)
 	rc := exitCode(err)
 	w.markPairFlag(rc)
 	if rc == 0 && strings.Contains(out, "downloaded=1") && isDownloaded(path) {
-		_, _ = w.runEngine("--reconcile", path) // offline ✘->✓, carries save+cover
+		_, _ = w.runEngineMutating("--reconcile", path) // offline ✘->✓, carries save+cover
 		w.showMsg("Downloaded", "It's on the card now.", w.t.Good, draw, btn)
 		return true
 	}
@@ -2426,7 +2549,9 @@ func (w *wizard) gmDelete(path string, draw func(*ui.Canvas), btn func() ui.Butt
 		return false
 	}
 	w.working(draw, "Deleting "+filepath.Base(path)+"...")
-	out, _ := w.runEngine("--evict", path)
+	// --evict mutates the card (rom -> 0-byte stub, save preserved); guard the launch-card
+	// path against a mid-write watchdog auto-exit (lodor#63). No-op in the Game Manager.
+	out, _ := w.runEngineMutating("--evict", path)
 	if ui.ResultToken(out, "evicted") == "1" {
 		w.showMsg("Deleted", "Deleted from card - still in your library to re-download.", w.t.Good, draw, btn)
 		return true
@@ -2486,25 +2611,7 @@ func (w *wizard) gmServerSaves(path string, draw func(*ui.Canvas), btn func() ui
 		w.showMsg("Server saves", w.diagnose(rc, out), w.t.Bad, draw, btn)
 		return
 	}
-	type sv struct{ id, label string }
-	var saves []sv
-	for _, ln := range strings.Split(out, "\n") {
-		f := strings.Split(ln, "\t")
-		if len(f) < 2 {
-			continue
-		}
-		label := f[1]
-		if len(f) >= 3 && strings.TrimSpace(f[2]) != "" {
-			label += "  -  " + f[2]
-		}
-		if len(f) >= 4 && strings.TrimSpace(f[3]) != "" {
-			label += "  -  " + f[3]
-		}
-		if len(f) >= 5 && f[4] == "CURRENT" {
-			label += "  (on this device)"
-		}
-		saves = append(saves, sv{id: f[0], label: label})
-	}
+	saves := parseSaveRows(out) // shared with the launch card (launchcardv2.go)
 	if len(saves) == 0 {
 		w.showMsg("Server saves", "No server saves for "+filepath.Base(path)+".", w.t.Text, draw, btn)
 		return
@@ -2816,8 +2923,8 @@ func (w *wizard) fetchCoversOn() bool {
 			return strings.TrimPrefix(ln, "fetch_covers=") == "on"
 		}
 	}
-	return strings.Contains(readFileString(filepath.Join(w.dataDir, "config.json")), "\"fetch_covers\": true") ||
-		strings.Contains(readFileString(filepath.Join(w.dataDir, "config.json")), "\"fetch_covers\":true")
+	return strings.Contains(readFileString(filepath.Join(w.dataDir, wizardConfigName())), "\"fetch_covers\": true") ||
+		strings.Contains(readFileString(filepath.Join(w.dataDir, wizardConfigName())), "\"fetch_covers\":true")
 }
 
 // setSetting writes key=value into settings.conf (other keys preserved). FAT32-durable

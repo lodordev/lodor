@@ -47,75 +47,82 @@ const tierProbeTimeout = 2 * time.Second
 
 func main() {
 	var (
-		mirrorCatalog     bool
-		mirrorFull        bool
-		mirrorCollections bool
-		pushPending       bool
-		pullSaves         bool
-		includeDeleted    bool
-		syncContinue      bool
-		downloadBios      bool
-		downloadQueue     bool
-		syncFeed          bool
-		recent            bool
-		syncSave          string
-		pushSave          string
-		pushStates        string
-		queueState        string
-		pushPendingStates bool
-		pushAllStates     bool
-		listStates        string
-		pullStateRom      string
-		pullStateID       int
-		pullStateSlot     string
-		listSaves         string
-		restoreSave       string
-		downloadRom       string
-		fetchNextDisc     string
-		fetchDiscs        string
-		prefetchDiscs     bool
-		prefetchDry       bool
-		cancellable       bool
-		checkRom          string
-		reconcile         string
-		evict             string
-		uninstallMirror   bool
-		removeDownloads   bool
-		writeGamelists    bool
-		pair              string
-		pairProfile       string
-		registerDevice    string
-		renameDevice      string
-		validate          bool
-		setServer         string
-		setServerPort     int
-		setServerInsecure bool
-		raLogin           string
-		raStatus          bool
-		raCmd             string
-		raRecv            bool
-		sessionStart      string
-		sessionEnd        string
-		syncPlaytime      bool
-		listProfiles      bool
-		listUsers         bool
-		loginProfile      string
-		loginUser         string
-		loginDevice       string
-		trackSave         string
-		untrackSave       string
-		setFavorite       string
-		unsetFavorite     string
-		setRating         string
-		setStatus         string
-		setProps          string
-		checkBios         string
-		showVersion       bool
-		checkUpdate       bool
-		fetchUpdate       bool
-		reportSession     string
-		sessionStarted    int64
-		sessionEnded      int64
+		mirrorCatalog      bool
+		mirrorFull         bool
+		mirrorCollections  bool
+		pushPending        bool
+		pullSaves          bool
+		includeDeleted     bool
+		reconcileLibrary   bool
+		reconcileDryRun    bool
+		syncContinue       bool
+		downloadBios       bool
+		downloadQueue      bool
+		syncFeed           bool
+		recent             bool
+		syncSave           string
+		pushSave           string
+		pushStates         string
+		queueState         string
+		pushPendingStates  bool
+		pushAllStates      bool
+		listStates         string
+		pullStateRom       string
+		pullStateID        int
+		pullStateSlot      string
+		listSaves          string
+		restoreSave        string
+		downloadRom        string
+		fetchNextDisc      string
+		fetchDiscs         string
+		prefetchDiscs      bool
+		prefetchLarge      bool
+		prefetchDry        bool
+		cancellable        bool
+		checkRom           string
+		reconcile          string
+		evict              string
+		storageReport      bool
+		storageReportJSON  bool
+		uninstallMirror    bool
+		removeDownloads    bool
+		writeGamelists     bool
+		placeFrontendMedia bool
+		pair               string
+		pairProfile        string
+		registerDevice     string
+		renameDevice       string
+		validate           bool
+		setServer          string
+		setServerPort      int
+		setServerInsecure  bool
+		setFrontendMedia   string
+		raLogin            string
+		raStatus           bool
+		raCmd              string
+		raRecv             bool
+		sessionStart       string
+		sessionEnd         string
+		syncPlaytime       bool
+		listProfiles       bool
+		listUsers          bool
+		loginProfile       string
+		loginUser          string
+		loginDevice        string
+		trackSave          string
+		untrackSave        string
+		setFavorite        string
+		unsetFavorite      string
+		setRating          string
+		setStatus          string
+		setProps           string
+		checkBios          string
+		showVersion        bool
+		checkUpdate        bool
+		fetchUpdate        bool
+		reportSession      string
+		sessionStarted     int64
+		sessionEnded       int64
 	)
 	flag.BoolVar(&mirrorCatalog, "mirror-catalog", false, "stub every not-downloaded RomM game into Roms/ and write catalog-index.json; prints MIRROR created=.. existing=.. skipped=.. multifile=.. covers=..  (UPDATE: only new games + missing covers)")
 	flag.BoolVar(&mirrorFull, "full", false, "with --mirror-catalog: FULL refresh — re-fetch every cover even if already present (default is the fast incremental update)")
@@ -128,6 +135,8 @@ func main() {
 	flag.BoolVar(&pushPending, "push-pending", false, "upload every save in pending-saves.txt; prints RESULT pushed=<N> total=<M> stuck=<K>")
 	flag.BoolVar(&pullSaves, "pull-saves", false, "TARGETED bulk pull (fast 'Sync now' leg): for every on-card game with a real server save, decide by CONTENT-HASH LINEAGE (local==newest: no-op; local==older revision: pull newest, .bak kept; local unknown to server: push it instead — never overwrite; ghosts filtered) — no catalog mirror; a save DELETED on this device after a sync is SKIPPED unless the server has a newer revision (deleted-save tombstone; see --include-deleted); prints RESULT pulled=<N> checked=<M> ghosts=<G> pushed=<K> tombstones=<T>")
 	flag.BoolVar(&includeDeleted, "include-deleted", false, "with --pull-saves: bypass deleted-save tombstones — pull a game's newest server save even when this device's save ledger says its local copy was deliberately deleted after a sync (the explicit resurrection escape hatch; per-save explicit restore via --restore-save never needs this)")
+	flag.BoolVar(&reconcileLibrary, "reconcile-library", false, "MANAGED SYNC (RomM >= 5.0.0): whole-library background save reconcile via the sync-session endpoints — build the local save inventory, POST /api/sync/negotiate, execute the returned upload/download plan through the verified push/pull primitives (conflicts DEFERRED to the launch card, never auto-resolved), then close the session; prints RESULT reconciled=<N> planned=<P> failed=<F> conflicts=<C> skipped=<S> session=<id> (exit 2 if the server is older than 5.0.0)")
+	flag.BoolVar(&reconcileDryRun, "dry-run", false, "with --reconcile-library: negotiate + print the PLAN and exit WITHOUT moving any save bytes (opens then closes the session 0/0); prints RESULT dryrun=1 inventory=<N> planned=<P> upload=<U> download=<D> conflict=<C> noop=<O> session=<id> closed=<0|1>")
 	flag.BoolVar(&syncContinue, "sync-continue", false, "LIGHT Continue refresh (fast 'Sync now' leg): rebuild the cross-device '0) Continue' collection and merge it into the host's native Recently Played from the local index + server saves — no catalog mirror; prints CONTINUE entries=<N> then RECENTS merged=<M> total=<T>")
 	flag.BoolVar(&downloadBios, "download-bios", false, "download BIOS/firmware for every mapped platform; prints RESULT bios=<count>")
 	flag.StringVar(&checkBios, "check-bios", "", "OFFLINE pre-launch BIOS gate: does this ROM's system REQUIRE a BIOS the user must supply, and is it present where the emulator reads it? prints RESULT bios_ok=1, or RESULT bios_ok=0 missing=<f1,f2> system=<name>. System TAG from LODOR_ROM_TAG or the ROM folder; extra search dirs via LODOR_BIOS_DIRS (colon-sep)")
@@ -150,14 +159,19 @@ func main() {
 	flag.StringVar(&fetchNextDisc, "fetch-next-disc", "", "MULTI-DISC (lodor#7): fetch this game's NEXT missing disc (m3u order) — the hooks' pre-launch re-trigger for a populated-but-incomplete .m3u; prints RESULT fetched=<N> complete=<0|1> discs_total=<T> discs_present=<P> [reason=<tok>]")
 	flag.StringVar(&fetchDiscs, "fetch-discs", "", "MULTI-DISC (lodor#7): fetch EVERY missing disc of this game (same per-disc verify/resume as --download); prints RESULT fetched=<N> complete=<0|1> discs_total=<T> discs_present=<P> [reason=<tok>]")
 	flag.BoolVar(&prefetchDiscs, "prefetch-discs", false, "MULTI-DISC (lodor#7) daemon leg: complete the disc set of EVERY downloaded (non-stub) .m3u game with missing discs (mirror-manifest walk); prints RESULT prefetch_roms=<N> discs_missing=<M> fetched=<F> failed=<K>; exit 4 = some game(s) failed")
-	flag.BoolVar(&prefetchDry, "dry", false, "with --prefetch-discs: OFFLINE census only — report the pending disc work without touching network or card (runs pre-config, any pairing state)")
+	flag.BoolVar(&prefetchLarge, "prefetch-large", false, "LARGE-DISC (beta1) daemon leg: pre-warm every not-yet-downloaded STUB that is a large disc image (.chd, or any file under segacd/psx/saturn/dreamcast) so a first launch does not stall on a cold multi-hundred-MB download; rides downloadRomCore (resume/cancel/hash); prints RESULT prefetch_roms=<N> fetched=<F> failed=<K>; exit 4 = some game(s) failed")
+	flag.BoolVar(&prefetchDry, "dry", false, "with --prefetch-discs / --prefetch-large: OFFLINE census only — report the pending work without touching network or card (runs pre-config, any pairing state)")
 	flag.BoolVar(&cancellable, "cancellable", false, "INTERACTIVE runs only (lodor#42): arm the launcher's B-press cancel sentinel (/tmp/lodor-cover-cancel) for this run — batch sweeps stop between items and streaming transfers between chunks (partials kept for resume); RESULT lines gain an ADDITIVE cancelled=1 when a run stopped early. Daemons must never pass this: the sentinel is shared, so an armed background run could be killed by a foreground B-press.")
 	flag.StringVar(&checkRom, "check-rom", "", "OFFLINE pre-launch completeness gate: is this ROM fully present on the card? (multi-disc: real .m3u + every referenced disc non-empty). Filesystem-only, no config/host/device; prints RESULT complete=<0|1> [discs_total=<N> discs_present=<M>] [reason=<tok>]")
 	flag.StringVar(&reconcile, "reconcile", "", "post-launch: flip ONE downloaded ROM's on-disk state marker (✘→✓) to match the bytes now present, carrying its save+cover with the rename; offline, no device; prints RESULT reconciled=<0|1>")
 	flag.StringVar(&evict, "evict", "", "delete ONE downloaded ROM's bytes from the card and re-create its 0-byte cloud stub (✓→✘), carrying its save+cover with the rename — saves are NEVER deleted; multi-disc .m3u deletes its disc files too; offline, no device; prints RESULT evicted=<0|1> [reason=…]")
+	flag.BoolVar(&storageReport, "storage-report", false, "OFFLINE READ-ONLY per-volume storage view: for every mapped platform (and a TOTAL) report the download-cache footprint on the card — downloaded ROM count + bytes (real >0-byte files) and cloud-stub count (0-byte). Scopes to Lodor-owned files when the mirror manifest exists, else all ROMs (header says which). Mutates nothing (reclaim space with --evict); prints an aligned table (or JSON with --json); exit 0")
+	flag.BoolVar(&storageReportJSON, "json", false, "with --storage-report: emit the machine-readable JSON form instead of the human table")
 	flag.BoolVar(&uninstallMirror, "uninstall-mirror", false, "remove every MIRROR-OWNED artifact from the card (manifest walk: stubs, our covers/collections/folders; downloads KEPT unless --remove-downloads; saves NEVER touched; user files byte-identical); offline; prints RESULT uninstalled=<0|1> removed=<N> kept_downloads=<K> skipped=<S>")
 	flag.BoolVar(&removeDownloads, "remove-downloads", false, "with --uninstall-mirror: also delete Lodor-downloaded games (the explicit second confirmation)")
 	flag.BoolVar(&writeGamelists, "write-gamelists", false, "KNULLI BUILD ONLY (#186): merge-write every owned roms/<system>/gamelist.xml from the mirror manifest — clean marker-stripped <name>, cover <image> when present, foreign entries preserved verbatim; offline; prints RESULT gamelists=<N> entries=<M> (other builds refuse, exit 2)")
+	flag.BoolVar(&placeFrontendMedia, "place-frontend-media", false, "HOST FRONTENDS (#box-art): into every detected frontend (ES-DE via LODOR_ESDE_DIR, Cocoon via LODOR_COCOON_DIR) place each owned ROM's box art in downloaded_media/<system>/covers/ (filename-matched; dimmed for ✘ cloud stubs, normal for ✓ on-device) AND merge-write a clean-title gamelists/<system>/gamelist.xml (marker stripped from <name>); idempotent + self-healing across the ✘→✓ flip; offline; prints RESULT frontend_media targets=<N> placed=<M> gamelists=<K> pruned=<P>")
+	flag.BoolVar(&placeFrontendMedia, "place-esde-media", false, "deprecated alias for --place-frontend-media")
 	flag.StringVar(&pair, "pair", "", "exchange a RomM pairing code for a client-token, validate it, write config.json (clearing any password); prints RESULT paired=<0|1> scopes_ok=<0|1>")
 	flag.StringVar(&pairProfile, "pair-profile", "", "MULTI-USER: sign a profile in with a RomM PAIRING CODE (client-token exchange, not a password); stores the token owner as a profile; prints RESULT paired=<0|1> username=<name>")
 	flag.StringVar(&registerDevice, "register-device", "", "register this device by name, store device_id+device_name in config.json; prints RESULT registered=<0|1>")
@@ -166,6 +180,7 @@ func main() {
 	flag.StringVar(&setServer, "set-server", "", "persist the server URL (scheme+host) to config.json BEFORE pairing, creating config.json if absent; with --port/--insecure; prints RESULT server_set=<0|1>")
 	flag.IntVar(&setServerPort, "port", 0, "optional numeric port: for --set-server the server port (0 = none); for --ra-cmd the RetroArch network_cmd_port (0 = default 55355)")
 	flag.BoolVar(&setServerInsecure, "insecure", false, "for --set-server: skip TLS verification (HTTPS only)")
+	flag.StringVar(&setFrontendMedia, "set-frontend-media", "", "persist frontend-media cover placement to config.json: \"esde:<abs media dir>\" routes box art into that tree (ES-DE downloaded_media layout, stubs dimmed) and enables fetch_covers; \"off\" clears both; offline; prints RESULT frontend_media_set=<0|1>")
 	flag.StringVar(&raLogin, "ra-login", "", "log in to RetroAchievements as <user>; reads the password from STDIN (never argv), exchanges it for the long-lived RA token, stores {ra_username, ra_token} in config.json (never the password); prints RESULT ra_login=<0|1>")
 	flag.BoolVar(&raStatus, "ra-status", false, "report RetroAchievements login state; prints RESULT ra_logged_in=<0|1> ra_user=<username>")
 	flag.StringVar(&raCmd, "ra-cmd", "", "send one RetroArch Network Control Interface command (QUIT, SCREENSHOT, GET_STATUS, ...) over loopback UDP; fire-and-forget by default (exit 0 once the datagram is sent); with --recv, wait for the reply (250ms x3), print it, exit 0 — a silent peer exits 3 (the wrapper's ra-net UNSUPPORTED probe signal). Local-only: no config, no RomM host.")
@@ -239,6 +254,12 @@ func main() {
 		runPrefetchDiscs(nil, nil, true)
 		return // always exits; defensive
 	}
+	// --prefetch-large --dry is the same OFFLINE census (stub disc-image walk) so a
+	// daemon can pre-decide the cycle; the REAL prefetch runs through the gates below.
+	if prefetchLarge && prefetchDry {
+		runPrefetchLarge(nil, nil, true)
+		return // always exits; defensive
+	}
 
 	// --session-start / --session-end are OFFLINE and must work in ANY pairing
 	// state (an unpaired card still tracks playtime locally under the fallback
@@ -265,6 +286,10 @@ func main() {
 		runSetServer(setServer, setServerPort, setServerInsecure)
 		return // runSetServer always exits; defensive
 	}
+	if setFrontendMedia != "" {
+		runSetFrontendMedia(setFrontendMedia)
+		return // always exits; defensive
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -287,6 +312,14 @@ func main() {
 		runEvict(cfg, evict)
 		return // runEvict always exits; defensive
 	}
+	// --storage-report is READ-ONLY and OFFLINE (Argosy steal): it only stats the mapped
+	// ROM folders to report the download-cache footprint — no host, network, or device,
+	// and it mutates nothing. Runs before the hosts gate so "how much is on the card?"
+	// answers with Wi-Fi off / server unreachable, like --evict.
+	if storageReport {
+		runStorageReport(cfg, storageReportJSON)
+		return // runStorageReport always exits; defensive
+	}
 	// --uninstall-mirror is manifest-walk-only and OFFLINE (like --evict): remove
 	// everything the mirror created, keep the user's tree byte-identical. Runs
 	// before the hosts gate so "Remove Lodor" works with Wi-Fi off.
@@ -300,6 +333,13 @@ func main() {
 	// the hosts gate so a display refresh works with Wi-Fi off.
 	if writeGamelists {
 		runWriteGamelists(cfg)
+		return // always exits; defensive
+	}
+	// --place-frontend-media is manifest+filesystem only (no host, no network): reconcile
+	// each detected frontend's covers + gamelists from the on-disk roms. Runs before the
+	// hosts gate so a display refresh works offline.
+	if placeFrontendMedia {
+		runPlaceFrontendMedia()
 		return // always exits; defensive
 	}
 	// RetroAchievements credential-spine modes (task #46): account-global, they need
@@ -390,6 +430,13 @@ func main() {
 	case prefetchDiscs:
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
 		runPrefetchDiscs(dlClient, cfg, false)
+	case prefetchLarge:
+		// Large disc images are the biggest file transfers Lodor does — give them the
+		// download timeout AND the armed cancel so a charging-pass SIGTERM stops cleanly
+		// (retained .tmp resumes next cycle), exactly like the launch download path.
+		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		armDownloadCancel(dlClient)
+		runPrefetchLarge(dlClient, cfg, false)
 	case downloadBios:
 		// BIOS fetches are file transfers too — give them the download timeout.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
@@ -445,6 +492,12 @@ func main() {
 		// Save downloads are file transfers too — the long timeout, like --push-pending.
 		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
 		runPullSaves(dlClient, cfg, includeDeleted)
+	case reconcileLibrary:
+		requireDevice(host)
+		// Reconcile moves save bytes both ways — use the long download timeout like the
+		// other transfer modes, not the short api timeout.
+		dlClient := romm.NewClient(host, time.Duration(cfg.DownloadTimeout.Int())*time.Second)
+		runReconcileLibrary(dlClient, cfg, reconcileDryRun)
 	case syncContinue:
 		runSyncContinue(client, cfg)
 	case syncPlaytime:
@@ -471,7 +524,7 @@ func main() {
 		requireDevice(host)
 		runReportSession(client, host, cfg, reportSession, sessionStarted, sessionEnded)
 	default:
-		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --fetch-next-disc --fetch-discs --prefetch-discs --check-rom --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --push-all-states --list-states --pull-state --list-saves --restore-save --evict --write-gamelists --sync-feed --report-session --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
+		fmt.Fprintln(os.Stderr, "FATAL flag: no mode selected (need one of --pair --register-device --rename-device --validate --mirror-catalog --mirror-collections --download --fetch-next-disc --fetch-discs --prefetch-discs --prefetch-large --check-rom --download-queue --download-bios --check-bios --push-pending --pull-saves --sync-continue --sync-save --push-save --push-states --queue-state --push-pending-states --push-all-states --list-states --pull-state --list-saves --restore-save --evict --storage-report --write-gamelists --sync-feed --report-session --ra-login --ra-status --ra-cmd --session-start --session-end --sync-playtime --track-save --untrack-save --set-favorite --unset-favorite --set-rating --set-status --set-props)")
 		os.Exit(2)
 	}
 }

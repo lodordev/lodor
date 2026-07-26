@@ -1,4 +1,4 @@
-//go:build !onion && !muos && !knulli && !android && !lodorandroid
+//go:build !onion && !muos && !knulli && !android && !lodorandroid && !spruce
 
 package catalog
 

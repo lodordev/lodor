@@ -1,3 +1,5 @@
+//go:build !onion && !muos && !knulli && !android && !lodorandroid
+
 // align_salvage_test.go — re-land coverage for the b1342a5 salvage (play-sessions +
 // resumable downloads) adapted to today's engine: the resolved-ActiveHost device_id,
 // the keep-partial-.tmp-on-error contract, and the Range resume through the hardened

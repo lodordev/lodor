@@ -11,7 +11,7 @@ import (
 func writeConfigInCWD(t *testing.T, body string) {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, configFileName), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, configFileName()), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	old, err := os.Getwd()

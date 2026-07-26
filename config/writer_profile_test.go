@@ -10,7 +10,7 @@ import (
 // edits, failing the test on any read/parse error.
 func readConfigTree(t *testing.T) map[string]any {
 	t.Helper()
-	data, err := os.ReadFile(configFileName)
+	data, err := os.ReadFile(configFileName())
 	if err != nil {
 		t.Fatalf("read config: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestWriteProfileHostSeedsTransportFields(t *testing.T) {
 		}},
 	}
 	data, _ := json.Marshal(seed)
-	if err := os.WriteFile(configFileName, data, 0o600); err != nil {
+	if err := os.WriteFile(configFileName(), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -125,7 +125,7 @@ func TestWriteProfileHostBareEndpointSeedsNoTransport(t *testing.T) {
 		}},
 	}
 	data, _ := json.Marshal(seed)
-	if err := os.WriteFile(configFileName, data, 0o600); err != nil {
+	if err := os.WriteFile(configFileName(), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := WriteProfileHost("kid", "kid", "kid-token", "", nil); err != nil {

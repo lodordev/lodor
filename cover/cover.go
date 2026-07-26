@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -66,8 +67,36 @@ func MediaPath(romPath string) string {
 // Exists reports whether a cover already exists (non-empty) at the media path for
 // romPath — the skip-existing gate so a re-run never refetches.
 func Exists(romPath string) bool {
-	fi, err := os.Stat(MediaPath(romPath))
+	return ExistsAt(MediaPath(romPath))
+}
+
+// ExistsAt is Exists for an explicit destination path (frontend-media placements,
+// where the cover does not live beside the ROM).
+func ExistsAt(dest string) bool {
+	fi, err := os.Stat(dest)
 	return err == nil && fi.Size() > 0
+}
+
+// EsdeCoverPath returns the ES-DE placement for a ROM's cover:
+// <mediaRoot>/<system-folder>/covers/<rom-stem>.png, where <system-folder> is the
+// ROM's parent directory name (Lodor's ES-DE es_systems.xml names each system after
+// its ROM folder, and ES-DE's media tree keys on the system name) and <rom-stem> is
+// the on-disk filename without extension — ES-DE (Android) matches media strictly by
+// game-file basename. A multi-disc game's romPath is its .m3u, so the cover lands
+// under the .m3u stem — the entry ES-DE actually lists.
+func EsdeCoverPath(mediaRoot, romPath string) string {
+	base := filepath.Base(romPath)
+	stem := base[:len(base)-len(filepath.Ext(base))]
+	return filepath.Join(mediaRoot, filepath.Base(filepath.Dir(romPath)), "covers", stem+".png")
+}
+
+// Placement says where a fetched cover goes and how it is styled. Dim is the
+// stub treatment for frontends with no native cloud-state cue (ES-DE): the cover is
+// darkened so a not-yet-downloaded game visibly reads as remote next to a bright,
+// on-device one. The NextUI convention never dims (markers/size carry that state).
+type Placement struct {
+	Dest string
+	Dim  bool
 }
 
 // Outcome is the result of one FetchAndSave call, for honest progress/diagnostics.
@@ -87,17 +116,23 @@ const (
 // fetch/decode/write failure returns OutcomeError with the error so the caller can count
 // it WITHOUT aborting a 6,000-item mirror. coverPath is rom.CoverPath().
 func FetchAndSave(dl coverDownloader, coverPath, romPath string, force bool) (Outcome, error) {
+	return FetchAndPlace(dl, coverPath, Placement{Dest: MediaPath(romPath)}, force)
+}
+
+// FetchAndPlace is FetchAndSave for an explicit Placement — same grace contract,
+// caller-chosen destination and dim styling.
+func FetchAndPlace(dl coverDownloader, coverPath string, p Placement, force bool) (Outcome, error) {
 	if coverPath == "" {
 		return OutcomeNoCover, nil
 	}
-	if !force && Exists(romPath) {
+	if !force && ExistsAt(p.Dest) {
 		return OutcomeSkipped, nil
 	}
 	raw, err := dl.DownloadCover(coverPath)
 	if err != nil {
 		return OutcomeError, fmt.Errorf("download: %w", err)
 	}
-	return saveCover(raw, romPath)
+	return savePlaced(raw, p)
 }
 
 // FetchAndSaveCtx is FetchAndSave with a context threaded into the network fetch, so an
@@ -108,23 +143,29 @@ func FetchAndSave(dl coverDownloader, coverPath, romPath string, force bool) (Ou
 // counts without aborting the mirror. Callers that want prompt cancel should ALSO check
 // their cancel signal between covers so the whole pass stops, not just the current fetch.
 func FetchAndSaveCtx(ctx context.Context, dl coverDownloaderCtx, coverPath, romPath string, force bool) (Outcome, error) {
+	return FetchAndPlaceCtx(ctx, dl, coverPath, Placement{Dest: MediaPath(romPath)}, force)
+}
+
+// FetchAndPlaceCtx is FetchAndSaveCtx for an explicit Placement — identical cancel
+// and grace contract, caller-chosen destination and dim styling.
+func FetchAndPlaceCtx(ctx context.Context, dl coverDownloaderCtx, coverPath string, p Placement, force bool) (Outcome, error) {
 	if coverPath == "" {
 		return OutcomeNoCover, nil
 	}
-	if !force && Exists(romPath) {
+	if !force && ExistsAt(p.Dest) {
 		return OutcomeSkipped, nil
 	}
 	raw, err := dl.DownloadCoverCtx(ctx, coverPath)
 	if err != nil {
 		return OutcomeError, fmt.Errorf("download: %w", err)
 	}
-	return saveCover(raw, romPath)
+	return savePlaced(raw, p)
 }
 
-// saveCover validates, scales, and atomically writes fetched cover bytes to romPath's
-// .media path. Shared tail of FetchAndSave and FetchAndSaveCtx so both apply the
-// identical scale + atomic-write path.
-func saveCover(raw []byte, romPath string) (Outcome, error) {
+// savePlaced validates, scales, styles, and atomically writes fetched cover bytes to
+// the placement. Shared tail of every fetch variant so all apply the identical
+// scale + dim + atomic-write path.
+func savePlaced(raw []byte, p Placement) (Outcome, error) {
 	if len(raw) == 0 {
 		return OutcomeError, fmt.Errorf("empty cover body")
 	}
@@ -132,10 +173,68 @@ func saveCover(raw []byte, romPath string) (Outcome, error) {
 	if err != nil {
 		return OutcomeError, fmt.Errorf("scale: %w", err)
 	}
-	if err := writeAtomic(MediaPath(romPath), scaled); err != nil {
+	if p.Dim {
+		if scaled, err = dimPNG(scaled); err != nil {
+			return OutcomeError, fmt.Errorf("dim: %w", err)
+		}
+	}
+	if err := writeAtomic(p.Dest, scaled); err != nil {
 		return OutcomeError, fmt.Errorf("write: %w", err)
 	}
 	return OutcomeSaved, nil
+}
+
+// dimFactorPct is how much of each color channel a dimmed stub cover keeps.
+// 45% reads unmistakably "inactive" on ES-DE's dark theme while leaving the art
+// recognizable at thumbnail size.
+const dimFactorPct = 45
+
+// dimPNG darkens a PNG by scaling every color channel to dimFactorPct, preserving
+// alpha. Stdlib-only (image, image/png), straight-alpha NRGBA math.
+func dimPNG(raw []byte) ([]byte, error) {
+	src, err := png.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	b := src.Bounds()
+	dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			r, g, bb, a := src.At(x, y).RGBA() // 16-bit premultiplied
+			i := dst.PixOffset(x-b.Min.X, y-b.Min.Y)
+			a8 := uint8(a >> 8)
+			if a == 0 {
+				dst.Pix[i+0], dst.Pix[i+1], dst.Pix[i+2], dst.Pix[i+3] = 0, 0, 0, 0
+				continue
+			}
+			// Un-premultiply to straight alpha, then dim the color channels only.
+			dst.Pix[i+0] = uint8((((r * 0xffff) / a) >> 8) * dimFactorPct / 100)
+			dst.Pix[i+1] = uint8((((g * 0xffff) / a) >> 8) * dimFactorPct / 100)
+			dst.Pix[i+2] = uint8((((bb * 0xffff) / a) >> 8) * dimFactorPct / 100)
+			dst.Pix[i+3] = a8
+		}
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestCompression}
+	if err := enc.Encode(&buf, dst); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// DimFileInPlace dims an already-placed cover file (evict: a downloaded game
+// returning to stub state, offline — no refetch available or needed). Atomic
+// rewrite; callers gate on manifest state so a dim cover is never double-dimmed.
+func DimFileInPlace(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	dimmed, err := dimPNG(raw)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(path, dimmed)
 }
 
 // scalePNG decodes a PNG, box-reduces it so its long edge is <= maxEdge (never
@@ -202,6 +301,48 @@ func scalePNG(raw []byte, maxEdge int) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// Dim returns a darkened, desaturated copy of a PNG cover — the "not downloaded yet"
+// treatment for a cloud stub in a host-frontend grid. It is the download-state cue that
+// replaces the ✘ marker once the marker is stripped from the visible title: a greyed,
+// dimmed cover reads as "unavailable / not here", a normal cover as "on device". Pure
+// stdlib (image/png), CGO-free. Best-effort: any decode/encode failure returns the input
+// bytes unchanged (a normal cover beats no cover).
+func Dim(raw []byte) []byte {
+	src, err := png.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return raw
+	}
+	sb := src.Bounds()
+	dst := image.NewNRGBA(sb)
+	for y := sb.Min.Y; y < sb.Max.Y; y++ {
+		for x := sb.Min.X; x < sb.Max.X; x++ {
+			r, g, b, a := src.At(x, y).RGBA() // 16-bit, alpha-premultiplied
+			var r8, g8, b8, a8 uint8
+			a8 = uint8(a >> 8)
+			if a == 0 {
+				r8, g8, b8 = 0, 0, 0
+			} else {
+				r8 = uint8(((r * 0xffff) / a) >> 8)
+				g8 = uint8(((g * 0xffff) / a) >> 8)
+				b8 = uint8(((b * 0xffff) / a) >> 8)
+			}
+			// Rec.601 luma; mix toward grey (retain ~40% chroma), then darken to ~45%.
+			lum := (uint32(r8)*77 + uint32(g8)*150 + uint32(b8)*29) >> 8
+			mix := func(c uint8) uint8 {
+				v := (uint32(c)*40 + lum*60) / 100 // desaturate toward luma
+				return uint8(v * 45 / 100)         // darken
+			}
+			dst.SetNRGBA(x, y, color.NRGBA{R: mix(r8), G: mix(g8), B: mix(b8), A: a8})
+		}
+	}
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestCompression}
+	if err := enc.Encode(&buf, dst); err != nil {
+		return raw
+	}
+	return buf.Bytes()
 }
 
 // boxReduce downscales src to dw x dh by averaging the source pixels that map to each

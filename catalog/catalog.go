@@ -38,12 +38,43 @@ const coverRequestTimeout = 15 * time.Second
 // short by the user's cancel sentinel (covercancel), so an in-flight download on a slow
 // radio aborts on B-press instead of waiting out the network. It is a thin wrapper over
 // cover.FetchAndSaveCtx used by both cover-fetch spots in MirrorCatalog.
-func fetchCoverCancellable(dl coverDownloaderCtx, coverPath, anchorPath string, force bool) (cover.Outcome, error) {
+func fetchCoverCancellable(dl coverDownloaderCtx, coverPath string, p cover.Placement, force bool) (cover.Outcome, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), coverRequestTimeout)
 	defer cancel()
 	ctx, cancel2 := covercancel.WithSignal(ctx)
 	defer cancel2()
-	return cover.FetchAndSaveCtx(ctx, dl, coverPath, anchorPath, force)
+	return cover.FetchAndPlaceCtx(ctx, dl, coverPath, p, force)
+}
+
+// CoverPlacement decides where a ROM's cover belongs on THIS host: the configured
+// frontend-media tree (ES-DE — dimmed when the on-card presence is a 0-byte stub, so
+// a cloud game visibly reads as remote) or, absent that config, the NextUI .media
+// convention beside the ROM (never dimmed — markers/size carry cloud state there).
+// The manifest kind for the placement comes from CoverKind. Exported for the
+// download/evict paths in cmd/lodor-sync, which flip a cover's dim state.
+func CoverPlacement(cfg *config.Config, romPath string, stub bool) cover.Placement {
+	if dir := cfg.FrontendMediaESDEDir(); dir != "" {
+		return cover.Placement{Dest: cover.EsdeCoverPath(dir, romPath), Dim: stub}
+	}
+	return cover.Placement{Dest: cover.MediaPath(romPath)}
+}
+
+// CoverKind returns the manifest kind a placement is recorded under — the dim-state
+// ledger the bright/dim transitions key on.
+func CoverKind(p cover.Placement) string {
+	if p.Dim {
+		return platform.ManifestCoverDim
+	}
+	return platform.ManifestCover
+}
+
+// otherCoverKind is the manifest kind the placement would NOT be recorded under —
+// i.e. the stale dim-state a mirror pass heals by force-re-placing.
+func otherCoverKind(p cover.Placement) string {
+	if p.Dim {
+		return platform.ManifestCover
+	}
+	return platform.ManifestCoverDim
 }
 
 // saveExts are extensions that mark a file as a SAVE rather than a game. Such files
@@ -392,9 +423,11 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 							coversCancelled = true
 						} else if cp := rom.CoverPath(); cp != "" {
 							coverDone++
-							if out, _ := fetchCoverCancellable(client, cp, uf.abs, false); out == cover.OutcomeSaved {
+							// Adopted = the user's real file: always a bright placement.
+							pl := CoverPlacement(cfg, uf.abs, false)
+							if out, _ := fetchCoverCancellable(client, cp, pl, false); out == cover.OutcomeSaved {
 								covers++
-								man.Record(cover.MediaPath(uf.abs), platform.ManifestCover, rom.ID)
+								man.Record(pl.Dest, CoverKind(pl), rom.ID)
 							}
 						}
 					}
@@ -434,10 +467,13 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 			// name is a download/library file either way; in merge mode only files
 			// at MARKED names ever reach here, and a ✓-named real file that
 			// resolves is a Lodor download — user files never carry markers).
+			isStub := false
 			if fi, serr := os.Stat(finalPath); serr == nil {
 				kind := platform.ManifestStub
 				if fi.Size() > 0 {
 					kind = platform.ManifestDownload
+				} else {
+					isStub = true
 				}
 				man.Record(finalPath, kind, rom.ID)
 			}
@@ -468,10 +504,16 @@ func MirrorCatalog(client romClient, cfg *config.Config, rep *Reporter, coverFor
 					if coverTotal > 0 {
 						rep.phase(fmt.Sprintf("Fetching cover %d/%d…", coverDone, coverTotal))
 					}
-					if out, _ := fetchCoverCancellable(client, cp, finalPath, coverForce); out == cover.OutcomeSaved {
+					// Frontend-media styling follows on-card presence: a stub's cover
+					// places dimmed. A cover recorded under the OTHER dim-state kind is
+					// stale (the presence flipped outside --download/evict, e.g. a
+					// sideloaded file) — force the re-place so styling heals on mirror.
+					pl := CoverPlacement(cfg, finalPath, isStub)
+					force := coverForce || man.OwnsKind(pl.Dest, otherCoverKind(pl))
+					if out, _ := fetchCoverCancellable(client, cp, pl, force); out == cover.OutcomeSaved {
 						covers++
 						// Manifest: our box art is removable at uninstall (kind=cover).
-						man.Record(cover.MediaPath(finalPath), platform.ManifestCover, rom.ID)
+						man.Record(pl.Dest, CoverKind(pl), rom.ID)
 					}
 				}
 			}

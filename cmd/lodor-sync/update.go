@@ -62,6 +62,15 @@ func runCheckUpdate() {
 		os.Exit(2)
 	}
 	ch := fetchChannel(channel)
+	// Freeze-aware check (pivot 2026-07-15): when the caller names its per-lane
+	// asset (LODOR_UPDATE_ASSET, the same key --fetch-update requires), an update
+	// exists only if this channel still ships that asset. A frozen lane -- its
+	// asset removed from versions.json -- must report update=0 forever, never an
+	// offer whose fetch cannot succeed.
+	if !assetPresent(ch, os.Getenv("LODOR_UPDATE_ASSET")) {
+		fmt.Printf("RESULT update=0 current=%s latest=%s channel=%s frozen=1\n", buildinfo.Version, ch.Version, channel)
+		os.Exit(0)
+	}
 	latest, err := update.ParseVersion(ch.Version)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "check-update: manifest version %q unparseable: %v\n", ch.Version, err)
@@ -175,4 +184,15 @@ func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\t", " ")
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// assetPresent reports whether the channel still ships the named per-lane
+// asset. An empty key is a legacy caller that never learned asset names --
+// treated as present so store-lane and pre-freeze callers keep old behavior.
+func assetPresent(ch *update.Channel, key string) bool {
+	if key == "" {
+		return true
+	}
+	_, ok := ch.Assets[key]
+	return ok
 }

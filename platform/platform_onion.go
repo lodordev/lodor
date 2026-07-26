@@ -336,26 +336,30 @@ func MirrorFolderName(display, tag, mode string) string {
 // fs_slug lives: directory_mappings[fs_slug].relative_path when set, else the fs_slug
 // folder, else the platform display name, else the fs_slug.
 func platformRomDirectory(cfg *config.Config, fsSlug, displayName string) string {
-	folder := fsSlug
+	// OnionOS binds a Roms/ subfolder to its emulator by a FIXED bare tag and scans nothing
+	// else, so when this slug has a known OnionOS tag THAT TAG IS THE FOLDER, unconditionally.
+	// A directory_mappings entry cannot override it: a non-tag folder — a carried MinUI-form
+	// "<Display> (<TAG>)", OR the RomM display name for a system missing from a partial/stale
+	// mapping set (n64, atari7800, atarilynx were absent from the carried Mini config) — is
+	// invisible to OnionOS MainUI, which is exactly how lodor#68 hid the library. The heal pass
+	// keeps the persisted mapping equal to this tag for consistency; placement never needs it.
+	if tag, ok := onionRomTags[fsSlug]; ok {
+		return filepath.Join(RomsDir(), tag)
+	}
+	// No OnionOS tag for this slug (a system the Mini can't launch anyway — HasEmuPak gates the
+	// mirror out): honour a SAFE custom mapping, else the display name, else the slug.
 	if cfg != nil {
-		if m, ok := cfg.DirectoryMappings[fsSlug]; ok {
-			// SECURITY: relative_path comes from config.json, which a co-installed hostile
-			// app can write ("../../../../data/local/tmp"). Only honour it when it is a safe
-			// relative folder under Roms/; a poisoned value is DROPPED and we fall through to
-			// the canonical resolution below, never joining an escape.
-			if m.RelativePath != "" && isSafeRelFolder(m.RelativePath) {
-				return filepath.Join(RomsDir(), m.RelativePath)
-			}
-			if m.RelativePath == "" {
-				return filepath.Join(RomsDir(), fsSlug)
-			}
-			// Unsafe relative_path: fall through to canonical resolution below.
+		// SECURITY: relative_path comes from config.json, which a co-installed hostile app can
+		// write ("../../../../data/local/tmp"). Only honour a safe relative folder under Roms/;
+		// a poisoned value is DROPPED and we fall through, never joining an escape.
+		if m, ok := cfg.DirectoryMappings[fsSlug]; ok && m.RelativePath != "" && isSafeRelFolder(m.RelativePath) {
+			return filepath.Join(RomsDir(), m.RelativePath)
 		}
 	}
 	if displayName != "" {
-		folder = displayName
+		return filepath.Join(RomsDir(), displayName)
 	}
-	return filepath.Join(RomsDir(), folder)
+	return filepath.Join(RomsDir(), fsSlug)
 }
 
 // archiveRawExt maps a RomM fs_slug to the raw ROM extension its standalone emulator
@@ -448,8 +452,19 @@ func MultiDiscDir(cfg *config.Config, rom romm.Rom) string {
 	return filepath.Join(romDir, DiscFolderName(rom.FsNameNoExt))
 }
 
-// CanonicalMirrorFolder returns "" on OnionOS: the bare-TAG folder OnionOS mirror
-// already writes IS canonical here, and any user mapping is legitimately custom, so the
-// mirror never heals it. Only muOS overrides this (its folder name is fixed by
-// info/assign), keeping catalog.healMirrorFolders a no-op on the onion build.
-func CanonicalMirrorFolder(fsSlug string) string { return "" }
+// CanonicalMirrorFolder returns the bare OnionOS Roms/ TAG for a slug (e.g. "GBA"),
+// or "" for a slug OnionOS has no folder code for. OnionOS binds a Roms/ subfolder to
+// an emulator PURELY by that fixed code, so the tag is the ONLY folder its MainUI will
+// scan - exactly like muOS's info/assign catalogue name. This makes catalog.healMirrorFolders
+// SNAP a foreign/stale relative_path back to the bare tag: a config.json carried from a
+// MinUI/LodorOS Mini install seeds "<Display> (<TAG>)" mappings (and even MinUI tags -
+// "...(SMS)" where OnionOS wants MS), so its stubs land in folders OnionOS never scans
+// and the whole library is invisible (lodor#68). Healing to the bare tag is always safe
+// here: a non-tag folder is unscannable by definition, so there is no legitimate custom
+// mapping to protect. Bare-tag mappings already equal the canonical and are left untouched.
+func CanonicalMirrorFolder(fsSlug string) string {
+	if tag, ok := onionRomTags[fsSlug]; ok {
+		return tag
+	}
+	return ""
+}
