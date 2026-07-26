@@ -16,18 +16,6 @@ project**: each release carries every lane's artifacts — the LodorOS update ov
 `.muxapp`, the Knulli zip, the OnionOS zip, the **Android APK**, and the signed `versions.json`
 self-update manifest.
 
-## Current release
-
-**1.0.0-alpha1** — the first public alpha of the 1.0 line. Early on purpose: expect rough edges and report them.
-
-The umbrella release for this alpha carries the **LodorOS update overlays** and the signed update manifest
-(`versions.json` + `.sig`). The Android APK is **not** part of this alpha.
-
-- [Release notes and downloads](https://github.com/lodordev/lodor/releases/tag/v1.0.0-alpha1)
-- Devices self-update from `https://lodordev.github.io/lodor/versions.json` (ed25519-signed)
-
-This is the current release: it is what *Latest release* points at, and what the download links above resolve to.
-
 ## The Android app
 
 The same engine also drives **Lodor for Android** (`Lodor-Android-<version>.apk` on the releases

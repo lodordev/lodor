@@ -9,7 +9,7 @@ import (
 
 // trustedPubKeyHex is the OFFLINE ed25519 public key whose matching private key
 // (out of repo, on the release host at /mnt/user/appdata/lodor/, backed up to
-// titan) signs versions.json. Embedding the public key here is the whole point
+// a separate offline host) signs versions.json. Embedding the public key here is the whole point
 // of the feature: a device trusts a manifest because it carries a signature
 // from THIS key, not because it arrived from github.io. Compromising gh-pages
 // or the publishing token no longer lets an attacker forge an accepted update

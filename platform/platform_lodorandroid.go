@@ -30,7 +30,7 @@
 //
 // SANDBOX RELOCATION: identical contract to the other lanes — ROMS_DIR/SAVES_DIR/
 // BIOS_DIR override individual roots; a set BASE_PATH relocates the WHOLE tree to
-// <BASE_PATH>/{Roms,Saves,Bios} so the off-hardware Panther suite exercises one
+// <BASE_PATH>/{Roms,Saves,Bios} so the off-hardware test suite exercises one
 // consistent tree. On device the app exports the real paths and BASE_PATH stays
 // unset. CGO-free, stdlib only.
 package platform
