@@ -23,8 +23,6 @@ Notes for this alpha:
 - **LodorOS ships as update overlays only** — there is no new full-card image. Flash the newest full card from
   an earlier release, then use **Update Lodor**.
 - **The Android APK is not part of 1.0.0-alpha1.**
-- The 1.0 releases are marked **pre-release** on GitHub, so each repo's *Latest release* badge still points at
-  `0.9.8.1`.
 <!-- LATEST:END -->
 
 Devices self-update via the manifest at `https://lodordev.github.io/lodor/versions.json` (ed25519-signed as of 0.9.7.6).
