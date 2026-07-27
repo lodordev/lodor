@@ -182,6 +182,27 @@ func main() {
 	if len(args) >= 1 && args[0] == "--sdl-spike" {
 		os.Exit(sdlSpike())
 	}
+	// --splash-follow <title> <body> [tone] [stop-file]: like --splash, but HOLDS the
+	// framebuffer and repaints ~1/s with live transfer state from the engine's
+	// side-channels until the stop file appears or stdin closes. Exists because a slow
+	// download was indistinguishable from a hang: the launch path painted one static
+	// frame and never updated it while 16 MB crawled in over 113 s (2026-07-26).
+	if len(args) >= 1 && args[0] == "--splash-follow" {
+		title, body, tone, stop := "", "", "", ""
+		if len(args) >= 2 {
+			title = args[1]
+		}
+		if len(args) >= 3 {
+			body = args[2]
+		}
+		if len(args) >= 4 {
+			tone = args[3]
+		}
+		if len(args) >= 5 {
+			stop = args[4]
+		}
+		os.Exit(w.splashFollow(title, body, tone, stop))
+	}
 	if len(args) >= 1 && args[0] == "--splash" {
 		title, body, tone := "", "", ""
 		if len(args) >= 2 {
@@ -209,6 +230,16 @@ func (w *wizard) splash(title, body, tone string) int {
 		return 1
 	}
 	defer fb.Close()
+	w.paintSplash(fb, title, body, tone, "")
+	return 0
+}
+
+// paintSplash draws one splash frame onto an ALREADY-OPEN framebuffer. Split out of
+// splash() so --splash-follow can repaint on a tick without reopening /dev/fb0 on every
+// frame (reopening flickers and fights the launcher for the device). status is an
+// optional extra line under the body — live transfer state for the follow mode; splash
+// passes "" and renders exactly as before.
+func (w *wizard) paintSplash(fb *ui.Framebuffer, title, body, tone, status string) {
 	cw, ch := fb.Xres(), fb.Yres()
 	if cw < 1 || ch < 1 {
 		cw, ch = W, H
@@ -227,9 +258,12 @@ func (w *wizard) splash(title, body, tone string) int {
 	}
 	x, y, ww, _ := t.Frame(c, "Lodor", hint)
 	c.DrawTextCentered(x, y+10, ww, title, t.Accent, t.TitleScale-1)
-	t.DrawTextWrappedAt(c, x, y+10+wizGlyphH*(t.TitleScale-1)+30, ww, body, col, t.BodyScale)
+	bodyY := y + 10 + wizGlyphH*(t.TitleScale-1) + 30
+	next := t.DrawTextWrappedAt(c, x, bodyY, ww, body, col, t.BodyScale)
+	if status != "" {
+		t.DrawTextWrappedAt(c, x, next+24, ww, status, t.Accent, t.BodyScale)
+	}
 	presentCanvas(fb, c) // canvas is panel-native here, so this is identity — kept on the one seam
-	return 0
 }
 
 // dataDir resolves the app working directory (config.json, catalog-index.json,

@@ -56,8 +56,8 @@ const extractTimeout = 20 * time.Minute
 // percent progress to /tmp/dl-progress (0 → 90 on transfer → 100 on a verified
 // write). Contract: RESULT downloaded=<0|1>. BLUEPRINT §3.
 //
-// The buffered raw GET can't give true byte-level progress, so the bar is coarse:
-// the verify step is the real gate. Multi-file or no-hash ROMs are accepted without
+// The transfer is STREAMED with a byte-level progress callback (see onProg below), so
+// the bar tracks real bytes; the verify step is still the gate on correctness. Multi-file or no-hash ROMs are accepted without
 // a hash check; a hash mismatch deletes the bad file and reports downloaded=0.
 //
 // SECURITY: every failure prints a generic, host-free DLFAIL token to stderr — the
@@ -80,12 +80,12 @@ func runDownloadRom(client *romm.Client, cfg *config.Config, romPath string) {
 		// the rest of the line. downloaded=1 means the game is LAUNCHABLE (its first
 		// missing disc landed, or every disc was already present) — NOT that every
 		// disc is on the card; discs_present vs discs_total carries that truth.
-		fmt.Printf("RESULT downloaded=%d discs_total=%d discs_present=%d discs_fetched=%d%s\n",
-			b2i(ok), st.total, st.present, st.fetched, cancelSuffix)
+		fmt.Printf("RESULT downloaded=%d discs_total=%d discs_present=%d discs_fetched=%d%s%s\n",
+			b2i(ok), st.total, st.present, st.fetched, cancelSuffix, dlMetrics(st))
 	} else if ok {
-		fmt.Println("RESULT downloaded=1")
+		fmt.Println("RESULT downloaded=1" + dlMetrics(st))
 	} else {
-		fmt.Println("RESULT downloaded=0" + cancelSuffix)
+		fmt.Println("RESULT downloaded=0" + cancelSuffix + dlMetrics(st))
 	}
 	exitMode(0)
 }
@@ -104,6 +104,30 @@ type discStats struct {
 	// Reported additively as "cancelled=1" on the RESULT line; also set for a
 	// cancelled single-file transfer (multi=false).
 	cancelled bool
+	// bytes/secs = transfer accounting for THIS run: bytes actually moved over the
+	// wire (a resumed download counts only the resumed remainder) and the wall-clock
+	// the transfer took. Reported additively so a slow download is diagnosable from
+	// romm.log alone — before this, "RESULT downloaded=1" recorded no size, no
+	// duration and no rate, and a 113 s launch could only be investigated by pulling
+	// the card and reading tailscaled's log (2026-07-26).
+	bytes int64
+	secs  float64
+}
+
+// dlMetrics renders the ADDITIVE transfer accounting appended to a --download RESULT
+// line. Additive by construction: every existing parser keys on the "downloaded=" token
+// and ignores the rest. A run that moved no bytes (already complete, resolve failure)
+// appends nothing rather than a misleading "bytes=0"; a zero-duration run reports
+// kbps=0 instead of dividing by zero.
+func dlMetrics(st discStats) string {
+	if st.bytes <= 0 {
+		return ""
+	}
+	kbps := 0.0
+	if st.secs > 0 {
+		kbps = float64(st.bytes) / st.secs / 1024.0
+	}
+	return fmt.Sprintf(" bytes=%d secs=%.1f kbps=%.0f", st.bytes, st.secs, kbps)
 }
 
 // complete reports whether every listed disc is on the card.
@@ -212,7 +236,7 @@ func downloadRomCoreInner(client *romm.Client, cfg *config.Config, romPath strin
 	// onDiskExt), so dest is e.g. ".../Advance Wars.nds"; download the .7z, verify it, and
 	// extract the inner ROM into dest. Paid once — the raw file persists.
 	if _, ok := platform.ArchiveExtractTargetForRom(rom); ok {
-		return downloadAndExtractArchive(client, cfg, rom, dest, romName, man)
+		return downloadAndExtractArchive(client, cfg, rom, dest, romName, man, st)
 	}
 
 	writePhase(fmt.Sprintf("Downloading %s…", romName))
@@ -255,13 +279,23 @@ func downloadRomCoreInner(client *romm.Client, cfg *config.Config, romPath strin
 		if total <= 0 {
 			return
 		}
+		// Publish raw counters alongside the percent so the launcher can show a real
+		// size and rate. Cheap: one small write per percent step, not per chunk.
 		pct := int(done * 90 / total)
 		if pct > lastPct {
 			lastPct = pct
 			writeProgress(pct)
+			writeBytes(done, total)
 		}
 	}
+	dlStart := time.Now()
 	n, derr := client.DownloadRomContentResumeTo(rom.ID, rom.FsName, out, startOffset, onProg)
+	// Record even on failure/cancel: a partial transfer's rate is exactly what we want
+	// when diagnosing "why was this slow", and a cancel keeps its partial for resume.
+	if st != nil && n > 0 {
+		st.bytes += n
+		st.secs += time.Since(dlStart).Seconds()
+	}
 	// FAT32-durable: fsync streamed ROM bytes before rename (streaming path — too
 	// large to buffer through fsutil). A Sync failure folds into the download gate.
 	syncErr := out.Sync()
@@ -375,7 +409,7 @@ func restoreStub(dest string) {
 // open (NDS/DraStic): download the .7z, hash-verify it (RomM's hash is of the stored .7z),
 // then extract the single inner ROM into dest (which is already named with the raw .nds
 // extension, via onDiskExt). Logs the real on-device extract time (EXTRACT line).
-func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm.Rom, dest, romName string, man *platform.Manifest) bool {
+func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm.Rom, dest, romName string, man *platform.Manifest, st *discStats) bool {
 	// SECURITY (containment suspenders): this path also writes real bytes to dest (via
 	// the .7z.dl temp + extract), so assert dest is inside Roms/ before any create.
 	if !platform.PathWithinRoms(dest) {
@@ -402,9 +436,15 @@ func downloadAndExtractArchive(client *romm.Client, cfg *config.Config, rom romm
 		if pct > lastPct {
 			lastPct = pct
 			writeProgress(pct)
+			writeBytes(done, total)
 		}
 	}
+	dlStart := time.Now()
 	n, derr := client.DownloadRomContentTo(rom.ID, rom.FsName, out, onProg)
+	if st != nil && n > 0 {
+		st.bytes += n
+		st.secs += time.Since(dlStart).Seconds()
+	}
 	cErr := out.Close()
 	if derr != nil || cErr != nil || n == 0 {
 		noteAuthErr(derr)
@@ -854,9 +894,15 @@ func downloadMultiDiscCore(client *romm.Client, cfg *config.Config, rom romm.Rom
 			if pct > lastPct {
 				lastPct = pct
 				writeProgress(pct)
+				writeBytes(done, tot)
 			}
 		}
+		discDlStart := time.Now()
 		n, dErr := client.DownloadRomFileResumeTo(rom.ID, rom.FsName, p.file.ID, out, discStart, onProg)
+		if st != nil && n > 0 {
+			st.bytes += n
+			st.secs += time.Since(discDlStart).Seconds()
+		}
 		// FAT32-durable: fsync the streamed disc bytes before rename so a power-yank
 		// can't zero a "renamed-in" .chd (streaming path — too large to buffer through
 		// fsutil, so we fsync in place). A Sync error folds into the download-failed gate.

@@ -18,6 +18,7 @@ import (
 var (
 	progressPath = sideChannelPath("dl-progress") // integer percent 0..100, newline-terminated
 	phasePath    = sideChannelPath("romm-phase")  // one-line human label, newline-terminated
+	bytesPath    = sideChannelPath("dl-bytes")    // "<done>/<total>" bytes, newline-terminated
 )
 
 func sideChannelPath(name string) string {
@@ -93,4 +94,19 @@ func b2i(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// writeBytes publishes the live byte counters of a transfer as "<done>/<total>" so a
+// launcher overlay can render a TRUE rate (MB/s) and a size, rather than inferring one
+// from percent deltas. Percent alone cannot distinguish a 4 MB game from a 400 MB one,
+// which is exactly the ambiguity that made a slow launch indistinguishable from a hang.
+// Best-effort like every side-channel: a write failure never changes a RESULT or exit code.
+func writeBytes(done, total int64) {
+	if done < 0 {
+		done = 0
+	}
+	if total < 0 {
+		total = 0
+	}
+	_ = os.WriteFile(bytesPath, []byte(strconv.FormatInt(done, 10)+"/"+strconv.FormatInt(total, 10)+"\n"), 0o644)
 }
