@@ -10,10 +10,10 @@ front-ends are deliberately **not** all on the same version right now.
 
 | Front-end | Version | Download |
 |---|---|---|
-| **muOS** (`.muxapp`) | **1.0.0-alpha1** | [lodor-muos · v1.0.0-alpha1](https://github.com/lodordev/lodor-muos/releases/tag/v1.0.0-alpha1) |
-| **LodorOS** — update overlays (Miyoo) | **1.0.0-alpha1** | [lodoros · v1.0.0-alpha1](https://github.com/lodordev/lodoros/releases/tag/v1.0.0-alpha1) |
-| **NextUI** (Pak Store) | **1.0.0-alpha1** | [lodor-nextui · 1.0.0-alpha1](https://github.com/lodordev/lodor-nextui/releases/tag/1.0.0-alpha1) |
-| **LodorOS update-overlays + signed manifest** | **1.0.0-alpha1** | [lodor · v1.0.0-alpha1](https://github.com/lodordev/lodor/releases/tag/v1.0.0-alpha1) |
+| **muOS** (`.muxapp`) | **1.0.0-alpha2** | [lodor-muos · v1.0.0-alpha2](https://github.com/lodordev/lodor-muos/releases/tag/v1.0.0-alpha2) |
+| **LodorOS** — update overlays (Miyoo) | **1.0.0-alpha2** | [lodoros · v1.0.0-alpha2](https://github.com/lodordev/lodoros/releases/tag/v1.0.0-alpha2) |
+| **NextUI** (Pak Store) | **1.0.0-alpha2** | [lodor-nextui · 1.0.0-alpha2](https://github.com/lodordev/lodor-nextui/releases/tag/1.0.0-alpha2) |
+| **LodorOS update-overlays + signed manifest** | **1.0.0-alpha2** | [lodor · v1.0.0-alpha2](https://github.com/lodordev/lodor/releases/tag/v1.0.0-alpha2) |
 | **Knulli** (zip onto `/userdata`) | 0.9.8.1 | [lodor-knulli · v0.9.8.1](https://github.com/lodordev/lodor-knulli/releases/tag/v0.9.8.1) |
 | **Android** (APK) | 0.9.8.1 | [lodor · v0.9.8.1](https://github.com/lodordev/lodor/releases/tag/v0.9.8.1) |
 | **OnionOS** (zip onto SD root) | *not yet released from its repo* | [umbrella releases](https://github.com/lodordev/lodor/releases) |
@@ -22,7 +22,7 @@ Notes for this alpha:
 
 - **LodorOS ships as update overlays only** — there is no new full-card image. Flash the newest full card from
   an earlier release, then use **Update Lodor**.
-- **The Android APK is not part of 1.0.0-alpha1.**
+- **The Android APK is not part of 1.0.0-alpha2.**
 <!-- LATEST:END -->
 
 Devices self-update via the manifest at `https://lodordev.github.io/lodor/versions.json` (ed25519-signed as of 0.9.7.6).
