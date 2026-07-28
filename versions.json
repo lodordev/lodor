@@ -1,24 +1,24 @@
 {
   "schema": 1,
   "stable": {
-    "version": "1.0.0-alpha2",
-    "notes": "LodorOS 1.0.0-alpha2",
+    "version": "1.0.0-alpha3",
+    "notes": "LodorOS 1.0.0-alpha3",
     "assets": {
       "lodoros-miyoomini": {
-        "url": "https://github.com/lodordev/lodor/releases/download/v1.0.0-alpha2/Lodor-LodorOS-update-miyoomini-1.0.0-alpha2.zip",
-        "size": 5530548,
-        "sha256": "a91de2adc58a8c224be03619c11c425440d3c16fdd1d62fb76ee9843f89fabdb"
+        "url": "https://github.com/lodordev/lodor/releases/download/v1.0.0-alpha3/Lodor-LodorOS-update-miyoomini-1.0.0-alpha3.zip",
+        "size": 5555372,
+        "sha256": "34021d70d2e26caafe2cd9688d0516b53fd00bd8e0ede7b002e2b90447115b0a"
       },
       "lodoros-my355": {
-        "url": "https://github.com/lodordev/lodor/releases/download/v1.0.0-alpha2/Lodor-LodorOS-update-my355-1.0.0-alpha2.zip",
-        "size": 5370884,
-        "sha256": "b1d27493697d5735e1ad45c861feba9e5395b4ab49fb79498870e0dfe5d6e6fd"
+        "url": "https://github.com/lodordev/lodor/releases/download/v1.0.0-alpha3/Lodor-LodorOS-update-my355-1.0.0-alpha3.zip",
+        "size": 5398466,
+        "sha256": "240d586f24f89dee66450549bd88c7951aa9749e35de3535b672ec776971084e"
       }
     }
   },
   "notify": {
     "nextui": "1.0.0-alpha1",
-    "muos": "1.0.0-alpha2",
-    "lodoros_card": "1.0.0-alpha2"
+    "muos": "1.0.0-alpha3",
+    "lodoros_card": "1.0.0-alpha3"
   }
 }
