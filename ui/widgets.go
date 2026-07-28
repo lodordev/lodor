@@ -41,13 +41,62 @@ func (t Theme) Frame(c *Canvas, title, hint string) (int, int, int, int) {
 	barH := glyphH*t.TitleScale + 24
 	c.FillRect(0, 0, c.W, barH, t.Panel)
 	c.FillRect(0, barH, c.W, 3, t.Accent)
-	c.DrawText(24, 12, title, t.Text, t.TitleScale)
-	// Footer hint bar.
-	footH := glyphH*t.SmallScale + 16
+	// Title: step the scale down before ellipsizing (a long game name reads better one size
+	// smaller than chopped), then measure — DrawText clips silently. barH stays pinned to
+	// TitleScale so a shrunk title never moves the content rect; center the smaller text in it.
+	inner := c.W - 48
+	tsc := FitScale(title, inner, t.TitleScale, t.BodyScale)
+	c.DrawText(24, (barH-glyphH*tsc)/2, FitText(title, inner, tsc), t.Text, tsc)
+	// Footer hint bar. The hint is a control legend — every token is something the user needs
+	// ("Start: OK"), so it WRAPS to a second line rather than being ellipsized away. The bar
+	// grows to match and the content rect shrinks with it, which is what keeps the same legend
+	// honest on a 640-wide panel as on the 720 one it was written for.
+	lines := wrapLegend(hint, inner, t.SmallScale)
+	if len(lines) > 2 { // pathological: keep the bar sane, ellipsize the tail
+		lines = append(lines[:1], FitText(strings.Join(lines[1:], legendSep), inner, t.SmallScale))
+	}
+	lineStep := glyphH*t.SmallScale + 8
+	footH := 16 + len(lines)*glyphH*t.SmallScale + (len(lines)-1)*8
 	fy := c.H - footH
 	c.FillRect(0, fy, c.W, footH, t.Panel)
-	c.DrawText(24, fy+8, hint, t.Dim, t.SmallScale)
-	return 24, barH + 20, c.W - 48, fy - (barH + 20) - 12
+	for i, ln := range lines {
+		c.DrawText(24, fy+8+i*lineStep, ln, t.Dim, t.SmallScale)
+	}
+	return 24, barH + 20, inner, fy - (barH + 20) - 12
+}
+
+// legendSep is the gap the footer legend puts between control tokens ("A: type" /
+// "B: delete"). Wrapping must not collapse it — plain word-wrap turns the legend into an
+// unreadable run-on ("D-pad: move A: type B: delete"), so wrapLegend breaks on WHOLE tokens.
+const legendSep = "   "
+
+// wrapLegend packs a footer legend into lines no wider than maxW, splitting only at the
+// token separator and preserving it. A single token wider than the bar is left for FitText.
+func wrapLegend(hint string, maxW, sc int) []string {
+	tokens := strings.Split(hint, legendSep)
+	var lines []string
+	line := ""
+	for _, tok := range tokens {
+		if tok == "" {
+			continue
+		}
+		try := tok
+		if line != "" {
+			try = line + legendSep + tok
+		}
+		if TextWidth(try, sc) <= maxW {
+			line = try
+			continue
+		}
+		if line != "" {
+			lines = append(lines, line)
+		}
+		line = tok
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // Menu is a vertical single-select list.
@@ -56,7 +105,7 @@ type Menu struct {
 	sel   int
 }
 
-func (m *Menu) Selected() int  { return m.sel }
+func (m *Menu) Selected() int { return m.sel }
 func (m *Menu) SelectedItem() string {
 	if m.sel >= 0 && m.sel < len(m.Items) {
 		return m.Items[m.sel]
@@ -97,7 +146,7 @@ func (m *Menu) Draw(c *Canvas, t Theme, x, y, w, h int) {
 		if i != m.sel {
 			col = t.Dim
 		}
-		c.DrawText(x+22, ry+9, it, col, t.BodyScale)
+		c.DrawText(x+22, ry+9, FitText(it, w-32, t.BodyScale), col, t.BodyScale)
 	}
 }
 
@@ -179,7 +228,7 @@ func (m *ScrollMenu) Draw(c *Canvas, t Theme, x, y, w, h int) {
 		if i == m.sel {
 			col = t.Text
 		}
-		c.DrawText(x+22, ry+9, m.Items[i], col, t.BodyScale)
+		c.DrawText(x+22, ry+9, FitText(m.Items[i], w-44, t.BodyScale), col, t.BodyScale)
 	}
 	if m.off > 0 {
 		c.DrawText(x+w-14, y+2, "^", t.Accent, t.BodyScale)
@@ -316,30 +365,84 @@ func (k *Keyboard) activate() (done bool) {
 	return false
 }
 
+// kbLayout is the keyboard's vertical layout, derived once so Draw and gridBottom can never
+// disagree. Hint and Prompt WRAP rather than ellipsize — both are instructions ("In RomM on
+// your computer: Settings > Devices > Pair"), and a truncated instruction is worse than a
+// two-line one — so the field and grid must track however many lines they actually took.
+type kbLayout struct {
+	hintY, promptY int // wrapped-text origins
+	fieldY, fieldH int
+	gridY          int
+	cellH, gridGap int
+	gridBottom     int
+}
+
+func (k *Keyboard) layout(t Theme, y, w, h int) kbLayout {
+	bottom := y + h
+	l := kbLayout{}
+	l.hintY = y
+	if k.Hint != "" {
+		y += WrappedHeight(k.Hint, w, t.SmallScale)
+	}
+	l.promptY = y
+	y += WrappedHeight(k.Prompt, w, t.SmallScale)
+	l.fieldY = y + 2
+	l.fieldH = glyphH*t.BodyScale + 16
+	// The grid takes whatever vertical room the wrapped text left it. A two-line hint plus a
+	// two-line prompt plus a two-line footer (all of which happen on a 640-wide panel) costs
+	// ~70px the 720×480 design never budgeted, so squeeze the paddings — in order of least
+	// harm: the gap above the grid, then between rows, then the cells' own padding — rather
+	// than let the last key row slide under the footer bar.
+	rows := len(kbGrid)
+	pad, gap, cellH := 18, 6, glyphH*t.BodyScale+14
+	minCellH := glyphH*t.BodyScale + 6
+	avail := bottom - (l.fieldY + l.fieldH)
+shrink:
+	for pad+rows*cellH+(rows-1)*gap > avail {
+		switch {
+		case pad > 8:
+			pad--
+		case gap > 2:
+			gap--
+		case cellH > minCellH:
+			cellH--
+		default:
+			// Genuinely out of room (a panel shorter than the design allows). Stop shrinking
+			// and let gridBottom report the overrun honestly rather than fake a fit.
+			break shrink
+		}
+	}
+	l.cellH, l.gridGap = cellH, gap
+	l.gridY = l.fieldY + l.fieldH + pad
+	l.gridBottom = l.gridY + rows*cellH + (rows-1)*gap
+	return l
+}
+
+// gridBottom is the y just past the last key row — the value the layout guard asserts stays
+// inside the content box (a wrapped hint pushes the grid down toward the footer bar).
+func (k *Keyboard) gridBottom(t Theme, y, w, h int) int { return k.layout(t, y, w, h).gridBottom }
+
 // Draw renders the prompt, the current text, and the key grid within (x,y,w,h).
 func (k *Keyboard) Draw(c *Canvas, t Theme, x, y, w, h int) {
+	l := k.layout(t, y, w, h)
 	if k.Hint != "" {
-		c.DrawText(x, y, k.Hint, t.Dim, t.SmallScale)
-		y += glyphH*t.SmallScale + 8
-		h -= glyphH*t.SmallScale + 8
+		c.DrawTextWrapped(x, l.hintY, w, k.Hint, t.Dim, t.SmallScale)
 	}
-	c.DrawText(x, y, k.Prompt, t.Dim, t.SmallScale)
-	// Text field.
-	fy := y + glyphH*t.SmallScale + 10
-	fieldH := glyphH*t.BodyScale + 16
+	c.DrawTextWrapped(x, l.promptY, w, k.Prompt, t.Dim, t.SmallScale)
+	// Text field. Long entries (a full server URL) scroll from the RIGHT so the caret and
+	// the characters just typed stay visible.
+	fy, fieldH := l.fieldY, l.fieldH
 	c.FillRect(x, fy, w, fieldH, t.Panel)
 	c.Rect(x, fy, w, fieldH, t.Accent)
 	shown := k.Text
 	if shown == "" {
 		c.DrawText(x+10, fy+8, "_", t.Dim, t.BodyScale)
 	} else {
-		c.DrawText(x+10, fy+8, shown+"_", t.Text, t.BodyScale)
+		c.DrawText(x+10, fy+8, FitTextTail(shown+"_", w-20, t.BodyScale), t.Text, t.BodyScale)
 	}
 	// Grid. Cells advance by their ACTUAL width so wide control keys (SHIFT/SPACE/DEL/OK)
 	// don't overlap their neighbours; single-char rows stay uniform.
-	gy := fy + fieldH + 18
-	cellH := glyphH*t.BodyScale + 14
-	const gap = 6
+	gy, cellH, gap := l.gridY, l.cellH, l.gridGap
 	for r, rowKeys := range kbGrid {
 		cx := x
 		cy := gy + r*(cellH+gap)
@@ -369,7 +472,7 @@ func (k *Keyboard) Draw(c *Canvas, t Theme, x, y, w, h int) {
 // status, error, and done screens. Honest: callers pass real state only.
 func (t Theme) Message(c *Canvas, title, body string, bodyColor Color) {
 	x, y, w, _ := t.Frame(c, "Lodor Setup", "A: continue   B: back")
-	c.DrawTextCentered(x, y+10, w, title, t.Accent, t.TitleScale-1)
+	c.DrawTextCentered(x, y+10, w, FitText(title, w, t.TitleScale-1), t.Accent, t.TitleScale-1)
 	t.DrawTextWrappedAt(c, x, y+10+glyphH*(t.TitleScale-1)+30, w, body, bodyColor, t.BodyScale)
 }
 
@@ -389,7 +492,7 @@ func (t Theme) Progress(c *Canvas, title, phase string, pct int) {
 // passive "please wait..."). Rendering is otherwise byte-identical to Progress.
 func (t Theme) ProgressHint(c *Canvas, title, phase string, pct int, hint string) {
 	x, y, w, _ := t.Frame(c, "Lodor Setup", hint)
-	c.DrawText(x, y+10, title, t.Text, t.BodyScale)
+	c.DrawText(x, y+10, FitText(title, w, t.BodyScale), t.Text, t.BodyScale)
 	by := y + 10 + glyphH*t.BodyScale + 24
 	barH := 28
 	c.Rect(x, by, w, barH, t.Dim)
@@ -402,6 +505,6 @@ func (t Theme) ProgressHint(c *Canvas, title, phase string, pct int, hint string
 		c.FillRect(x+2, by+2, (w-4)*pct/100, barH-4, t.Accent)
 	}
 	if phase != "" {
-		c.DrawText(x, by+barH+20, phase, t.Dim, t.SmallScale)
+		c.DrawText(x, by+barH+20, FitText(phase, w, t.SmallScale), t.Dim, t.SmallScale)
 	}
 }

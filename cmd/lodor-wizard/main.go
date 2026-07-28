@@ -30,6 +30,13 @@ import (
 	"lodor/ui"
 )
 
+// W, H is the DESIGN canvas — the RG34XX/H700 panel every screen's spacing was tuned on. It
+// stays the fallback and the launch card's fixed compose size, but the wizard's own screens
+// now compose at the PANEL's real geometry (wizard.canvas): presentCanvas aspect-fits a
+// mismatched canvas, and on a 640x480 device that meant a 0.889 nearest-neighbour downscale
+// — a softened 8x8 font and ~54 rows of letterbox — for no reason, since the chrome's layout
+// is resolution-relative. Composing native makes those panels crisp 1:1 and full-height, and
+// leaves presentCanvas as the identity path it already is when the sizes match.
 const W, H = 720, 480
 
 // Menu first-paint settle (RG34XX display-handoff fix, 2026-07-04). Unlike onboarding — which
@@ -111,6 +118,30 @@ type wizard struct {
 	tsURL        string         // current Tailscale login URL (shown for the browser sign-in)
 	tsPhase      string         // honest one-line status on the sign-in screen
 	registered   bool           // lodor#39: --register-device outcome, a validate-screen row
+
+	// Panel geometry the wizard's screens compose at, read from the framebuffer at startup.
+	// Zero means "not probed yet" — canvas() falls back to the W×H design size, which is what
+	// --capture and the off-hardware tests get.
+	panelW, panelH int
+}
+
+// canvas allocates a screen-sized canvas at the real panel geometry, falling back to the
+// design size before the framebuffer has been probed.
+func (w *wizard) canvas() *ui.Canvas {
+	cw, ch := w.panelW, w.panelH
+	if cw < 1 || ch < 1 {
+		cw, ch = W, H
+	}
+	return ui.NewCanvas(cw, ch)
+}
+
+// setPanel records the framebuffer geometry the wizard should compose at. Absurd values
+// (a driver reporting garbage) are ignored so we keep the known-good design size.
+func (w *wizard) setPanel(pw, ph int) {
+	if pw < 240 || ph < 180 || pw > 4096 || ph > 4096 {
+		return
+	}
+	w.panelW, w.panelH = pw, ph
 }
 
 // action is what a message screen reports back: advance (A/Start) or back (B). Every
@@ -134,6 +165,15 @@ func main() {
 		dir := "."
 		if len(args) >= 2 {
 			dir = args[1]
+		}
+		// Optional third arg "WxH" captures at a panel geometry other than the design size,
+		// so the fleet's other panels (640x480, 1280x720) can be eyeballed off-hardware
+		// instead of only after a reflash.
+		if len(args) >= 3 {
+			var pw, ph int
+			if _, err := fmt.Sscanf(args[2], "%dx%d", &pw, &ph); err == nil {
+				w.setPanel(pw, ph)
+			}
 		}
 		w.capture(dir)
 		return
@@ -240,11 +280,8 @@ func (w *wizard) splash(title, body, tone string) int {
 // optional extra line under the body — live transfer state for the follow mode; splash
 // passes "" and renders exactly as before.
 func (w *wizard) paintSplash(fb *ui.Framebuffer, title, body, tone, status string) {
-	cw, ch := fb.Xres(), fb.Yres()
-	if cw < 1 || ch < 1 {
-		cw, ch = W, H
-	}
-	c := ui.NewCanvas(cw, ch)
+	w.setPanel(fb.Xres(), fb.Yres())
+	c := w.canvas()
 	t := w.t
 	col, hint := t.Text, "please wait..."
 	switch tone {
@@ -430,7 +467,7 @@ func wifiUp() bool {
 // ---- rendering (pure: step+state -> canvas) -------------------------------------------
 
 func (w *wizard) render(s step, kb *ui.Keyboard) *ui.Canvas {
-	c := ui.NewCanvas(W, H)
+	c := w.canvas()
 	t := w.t
 	switch s {
 	case stepWelcome:
@@ -644,7 +681,7 @@ const (
 // renderCertTrust draws the certificate-failure choice screen (pure: state -> canvas,
 // shared by the interactive loop and --capture).
 func (w *wizard) renderCertTrust(m *ui.Menu) *ui.Canvas {
-	c := ui.NewCanvas(W, H)
+	c := w.canvas()
 	t := w.t
 	x, y, ww, hh := t.Frame(c, "Lodor Setup", "Up/Down: move   A: select   B: back")
 	c.DrawTextCentered(x, y+6, ww, certTrustTitle, t.Accent, t.TitleScale-1)
@@ -728,6 +765,7 @@ func (w *wizard) runInteractive() {
 	}
 	defer fb.Close()
 	w.phaseFB(fb.Xres(), fb.Yres(), fb.Bpp())
+	w.setPanel(fb.Xres(), fb.Yres()) // compose native; presentCanvas is then the identity path
 	in, err := w.openInput()
 	if err != nil {
 		w.logPhase("input open FAILED: %v", err)
@@ -1236,7 +1274,7 @@ func (w *wizard) runEngineStdin(pw string, args ...string) (string, error) {
 // synchronously beneath it; feedback_no_fake_ui_state). Used to bracket blocking engine
 // calls that have no progress side-channel.
 func (w *wizard) working(draw func(*ui.Canvas), body string) {
-	c := ui.NewCanvas(W, H)
+	c := w.canvas()
 	x, y, ww, _ := w.t.Frame(c, "Lodor", "please wait...")
 	c.DrawTextCentered(x, y+10, ww, "Working", w.t.Accent, w.t.TitleScale-1)
 	w.t.DrawTextWrappedAt(c, x, y+10+wizGlyphH*(w.t.TitleScale-1)+30, ww, body, w.t.Text, w.t.BodyScale)
@@ -1246,7 +1284,7 @@ func (w *wizard) working(draw func(*ui.Canvas), body string) {
 // showMsg draws a titled message and waits for a dismiss (A/Start/B all dismiss).
 func (w *wizard) showMsg(title, body string, col ui.Color, draw func(*ui.Canvas), btn func() ui.Button) {
 	for {
-		c := ui.NewCanvas(W, H)
+		c := w.canvas()
 		x, y, ww, _ := w.t.Frame(c, "Lodor", "A: OK")
 		c.DrawTextCentered(x, y+10, ww, title, w.t.Accent, w.t.TitleScale-1)
 		w.t.DrawTextWrappedAt(c, x, y+10+wizGlyphH*(w.t.TitleScale-1)+30, ww, body, col, w.t.BodyScale)
@@ -1310,7 +1348,7 @@ func (w *wizard) requireOnline(draw func(*ui.Canvas), btn func() ui.Button) bool
 // (returns -1, false). The one picker every list-based screen uses.
 func (w *wizard) pickScroll(title, hint string, m *ui.ScrollMenu, draw func(*ui.Canvas), btn func() ui.Button) (int, bool) {
 	for {
-		c := ui.NewCanvas(W, H)
+		c := w.canvas()
 		x, y, ww, hh := w.t.Frame(c, title, hint)
 		m.Draw(c, w.t, x, y, ww, hh)
 		draw(c)
@@ -1806,14 +1844,14 @@ func (w *wizard) screenMirrorArgs(draw func(*ui.Canvas), args ...string) int {
 				// 2026-07-05: 6939 stubs mirrored, overrides wired only on relaunch).
 				w.reseedOverrides()
 			}
-			c := ui.NewCanvas(W, H)
+			c := w.canvas()
 			w.t.Progress(c, "Building your library...", "Done", 100)
 			draw(c)
 			return rc
 		case <-time.After(400 * time.Millisecond):
 			pct := readPct()
 			phase := readPhase()
-			c := ui.NewCanvas(W, H)
+			c := w.canvas()
 			w.t.Progress(c, "Building your library...", phase, pct)
 			draw(c)
 		}
@@ -1881,7 +1919,7 @@ func (w *wizard) runEngineCancellable(title, phase0 string, draw func(*ui.Canvas
 		if phase == "" {
 			phase = phase0
 		}
-		c := ui.NewCanvas(W, H)
+		c := w.canvas()
 		if cancelled {
 			w.t.ProgressHint(c, title, "Stopping...", readPct(), "stopping - finishing current item")
 		} else {
@@ -2123,7 +2161,7 @@ func (w *wizard) tsSignIn(draw func(*ui.Canvas), btn func() ui.Button) bool {
 func (w *wizard) screenChoice(subtitle string, items []string, draw func(*ui.Canvas), btn func() ui.Button) (int, action) {
 	m := &ui.Menu{Items: items}
 	for {
-		c := ui.NewCanvas(W, H)
+		c := w.canvas()
 		x, y, ww, hh := w.t.Frame(c, "Lodor Setup", "Up/Down: move   A: select   B: back")
 		c.DrawText(x, y, subtitle, w.t.Text, w.t.BodyScale)
 		m.Draw(c, w.t, x, y+50, ww, hh-50)
@@ -2306,7 +2344,7 @@ func (w *wizard) doAddProfile(draw func(*ui.Canvas), btn func() ui.Button) {
 // screenKeyboardFree runs a text-entry screen (framed, no wizard step) until OK/BACK.
 func (w *wizard) screenKeyboardFree(kb *ui.Keyboard, draw func(*ui.Canvas), btn func() ui.Button) {
 	for {
-		c := ui.NewCanvas(W, H)
+		c := w.canvas()
 		x, y, ww, hh := w.t.Frame(c, "Lodor", "D-pad: move   A: type   B: delete   BACK: cancel   Start: OK")
 		kb.Draw(c, w.t, x, y, ww, hh)
 		draw(c)
@@ -3045,13 +3083,13 @@ func (w *wizard) capture(dir string) {
 	// Wi-Fi-up + progress variants.
 	w.wifiUp = true
 	_ = w.render(stepWifi, nil).SavePNG(filepath.Join(dir, "03-wifi-up.png"))
-	pc := ui.NewCanvas(W, H)
+	pc := w.canvas()
 	w.t.Progress(pc, "Building your library...", "Mirroring Sega Game Gear", 42)
 	_ = pc.SavePNG(filepath.Join(dir, "08-mirror.png"))
 	// Main management menu (the re-runnable parity surface once configured). Rendered from
 	// the SAME buildMenuRows spine the interactive loop uses, with representative state so
 	// the conditional rows (pending/queue counts, Tailscale) all appear.
-	mc := ui.NewCanvas(W, H)
+	mc := w.canvas()
 	mx, my, mw, mh := w.t.Frame(mc, menuTitle(), "Up/Down: move   A: select   B: exit")
 	rows := buildMenuRows(menuState{pendingN: 2, queueN: 3, userLabel: "Default", tsAvail: true})
 	labels := make([]string, len(rows))
@@ -3062,13 +3100,13 @@ func (w *wizard) capture(dir string) {
 	menu.Draw(mc, w.t, mx, my, mw, mh)
 	_ = mc.SavePNG(filepath.Join(dir, "10-menu.png"))
 	// Game Manager per-game action screen (scrolls; text details, no cover thumbnail v1).
-	gc := ui.NewCanvas(W, H)
+	gc := w.canvas()
 	gx, gy, gw, gh := w.t.Frame(gc, "Sonic The Hedgehog (USA).md", "Up/Down: move   A: select   B: back")
 	gm := &ui.ScrollMenu{Items: []string{"Delete from card", "Sync save now", "Server saves", "Details"}}
 	gm.Draw(gc, w.t, gx, gy, gw, gh)
 	_ = gc.SavePNG(filepath.Join(dir, "13-gamemanager.png"))
 	// Connect choice (Tailscale vs plain URL) + the Tailscale sign-in screen (login URL as text).
-	cc := ui.NewCanvas(W, H)
+	cc := w.canvas()
 	cx, cy, cw, chh := w.t.Frame(cc, "Lodor Setup", "Up/Down: move   A: select   B: back")
 	cc.DrawText(cx, cy, "Where is your RomM server?", w.t.Text, w.t.BodyScale)
 	cm := &ui.Menu{Items: []string{"Connect via Tailscale", "Home network / public URL"}}

@@ -37,6 +37,72 @@ func TextWidth(text string, sc int) int {
 	return len(text)*(glyphW*sc+sc) - sc
 }
 
+// FitText returns s shortened with a trailing "..." so it renders no wider than maxW at
+// scale sc; text that already fits comes back untouched. maxW <= 0 means "unbounded".
+//
+// Canvas.Set is bounds-checked, so DrawText clips an over-wide string SILENTLY — no error,
+// no marker, just missing characters. Every single-line string the chrome draws must
+// therefore be measured against the box it lives in. The field bug that forced this
+// (lodor-muos#2): a 51-character pairing-code hint drawn on the fixed 720px compose canvas
+// lost its last 12 characters, so the setup screen read "Settings > De" on EVERY device.
+// The launch card already carried a private copy of this helper (task #73, same bug class);
+// this is the shared one the chrome uses.
+func FitText(s string, maxW, sc int) string {
+	if maxW <= 0 || TextWidth(s, sc) <= maxW {
+		return s
+	}
+	const ell = "..."
+	for n := len(s) - 1; n >= 0; n-- {
+		if TextWidth(s[:n]+ell, sc) <= maxW {
+			return s[:n] + ell
+		}
+	}
+	// Not even "..." fits: the longest bare prefix that does.
+	for n := len(s); n >= 0; n-- {
+		if TextWidth(s[:n], sc) <= maxW {
+			return s[:n]
+		}
+	}
+	return ""
+}
+
+// FitTextTail is FitText anchored to the END of s ("...our-server.example" rather than
+// "https://my-really..."). Live text entry uses it: while typing a server URL the caret and
+// the characters just entered are the ones that must stay on screen.
+func FitTextTail(s string, maxW, sc int) string {
+	if maxW <= 0 || TextWidth(s, sc) <= maxW {
+		return s
+	}
+	const ell = "..."
+	for n := 1; n <= len(s); n++ {
+		if TextWidth(ell+s[n:], sc) <= maxW {
+			return ell + s[n:]
+		}
+	}
+	for n := 0; n <= len(s); n++ {
+		if TextWidth(s[n:], sc) <= maxW {
+			return s[n:]
+		}
+	}
+	return ""
+}
+
+// FitScale picks the largest scale in [min, max] at which s fits maxW, falling back to min
+// when nothing fits (the caller then ellipsizes at min). Used for the title bar, where a
+// long name is better rendered a size smaller than chopped in half — the bar height stays
+// pinned to the theme's TitleScale either way, so the layout below never moves.
+func FitScale(s string, maxW, max, min int) int {
+	if min < 1 {
+		min = 1
+	}
+	for sc := max; sc > min; sc-- {
+		if TextWidth(s, sc) <= maxW {
+			return sc
+		}
+	}
+	return min
+}
+
 // DrawText draws a string at (x,y) at scale sc with 1*sc px between glyphs. Returns the x
 // just past the last glyph.
 func (c *Canvas) DrawText(x, y int, text string, col Color, sc int) int {
@@ -57,15 +123,15 @@ func (c *Canvas) DrawTextCentered(x, y, w int, text string, col Color, sc int) {
 	c.DrawText(x+(w-tw)/2, y, text, col, sc)
 }
 
-// DrawTextWrapped draws text word-wrapped within maxW, returning the y past the last line.
-func (c *Canvas) DrawTextWrapped(x, y, maxW int, text string, col Color, sc int) int {
-	lineH := glyphH*sc + 4*sc
-	word := ""
-	line := ""
+// WrapText breaks text into lines that each render no wider than maxW at scale sc, splitting
+// on spaces and honoring '\n'. A single word longer than maxW still gets its own line — it is
+// ellipsized at draw time rather than silently overflowing.
+func WrapText(text string, maxW, sc int) []string {
+	var lines []string
+	word, line := "", ""
 	flush := func() {
 		if line != "" {
-			c.DrawText(x, y, line, col, sc)
-			y += lineH
+			lines = append(lines, line)
 			line = ""
 		}
 	}
@@ -85,21 +151,40 @@ func (c *Canvas) DrawTextWrapped(x, y, maxW int, text string, col Color, sc int)
 		}
 	}
 	for i := 0; i < len(text); i++ {
-		ch := text[i]
-		if ch == '\n' {
+		switch ch := text[i]; ch {
+		case '\n':
 			emit(word)
 			word = ""
 			flush()
-			continue
-		}
-		if ch == ' ' {
+		case ' ':
 			emit(word)
 			word = ""
-			continue
+		default:
+			word += string(ch)
 		}
-		word += string(ch)
 	}
 	emit(word)
 	flush()
+	return lines
+}
+
+// LineHeight is the baseline-to-baseline step DrawTextWrapped uses at scale sc.
+func LineHeight(sc int) int { return glyphH*sc + 4*sc }
+
+// WrappedHeight is the height DrawTextWrapped will consume — the measure-only twin of the
+// draw call, so a caller can lay out around wrapped text without rendering it first.
+func WrappedHeight(text string, maxW, sc int) int {
+	return len(WrapText(text, maxW, sc)) * LineHeight(sc)
+}
+
+// DrawTextWrapped draws text word-wrapped within maxW, returning the y past the last line.
+// Each line is additionally ellipsized to maxW so an unbreakable word (a long URL) is
+// visibly cut with "..." instead of silently running off the canvas.
+func (c *Canvas) DrawTextWrapped(x, y, maxW int, text string, col Color, sc int) int {
+	lineH := LineHeight(sc)
+	for _, line := range WrapText(text, maxW, sc) {
+		c.DrawText(x, y, FitText(line, maxW, sc), col, sc)
+		y += lineH
+	}
 	return y
 }
