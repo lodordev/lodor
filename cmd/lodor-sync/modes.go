@@ -7,15 +7,18 @@ package main
 // lives here too.
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1132,6 +1135,8 @@ func verifyFileHash(path, wantSha1, wantMd5 string) error {
 // (RomM records the CHD's INTERNAL disc SHA1, not the container's — see isCHD), and
 // games with no recorded hash are accepted (BLUEPRINT §3). The error it returns names
 // only the hash kind and digests — never the host.
+// ZIP ROMs follow RomM's composite archive semantics: hash eligible uncompressed
+// members in sorted internal-path order, not the raw container bytes.
 func verifyRomHash(rom romm.Rom, romPath string) error {
 	if rom.HasMultipleFiles {
 		return nil
@@ -1142,30 +1147,94 @@ func verifyRomHash(rom romm.Rom, romPath string) error {
 	if rom.Sha1Hash == "" && rom.Md5Hash == "" {
 		return nil
 	}
-	f, err := os.Open(romPath)
-	if err != nil {
-		return err
+	if strings.EqualFold(filepath.Ext(romPath), ".zip") {
+		return verifyZIPRomHash(romPath, rom.Sha1Hash, rom.Md5Hash)
 	}
-	defer f.Close()
+	return verifyFileHash(romPath, rom.Sha1Hash, rom.Md5Hash)
+}
 
-	if rom.Sha1Hash != "" {
-		h := sha1.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return err
-		}
-		if got := hex.EncodeToString(h.Sum(nil)); !strings.EqualFold(got, rom.Sha1Hash) {
-			return fmt.Errorf("sha1 mismatch got %s want %s", got, rom.Sha1Hash)
-		}
-		return nil
+// These are RomM's universal archive-member exclusions. Archive-specific user
+// exclusions do not apply: current RomM intentionally applies only this fixed junk
+// set to curated archives before building their composite ROM-level hash.
+var rommArchiveExcludedExtensions = [...]string{
+	".db", ".ini", ".tmp", ".bak", ".lock", ".log", ".cache", ".crdownload",
+}
+
+var rommArchiveExcludedNames = map[string]struct{}{
+	".DS_Store":            {},
+	".localized":           {},
+	".Trashes":             {},
+	".stfolder":            {},
+	"@SynoResource":        {},
+	"gamelist.xml":         {},
+	"metadata.pegasus.txt": {},
+}
+
+// verifyZIPRomHash streams eligible ZIP members through one accumulator in the same
+// internal-path order RomM uses. It never extracts members to disk or buffers their
+// contents, and any malformed header, unsupported compression method, or member
+// CRC/read failure rejects the archive honestly.
+func verifyZIPRomHash(zipPath, wantSha1, wantMd5 string) error {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("open zip: %w", err)
 	}
-	h := md5.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
+	defer zr.Close()
+
+	files := append([]*zip.File(nil), zr.File...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+
+	var h hash.Hash
+	kind, want := "md5", wantMd5
+	if wantSha1 != "" {
+		h = sha1.New()
+		kind, want = "sha1", wantSha1
+	} else {
+		h = md5.New()
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); !strings.EqualFold(got, rom.Md5Hash) {
-		return fmt.Errorf("md5 mismatch got %s want %s", got, rom.Md5Hash)
+
+	members := 0
+	for _, file := range files {
+		if file.FileInfo().IsDir() || rommArchiveMemberExcluded(file.Name) {
+			continue
+		}
+		r, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("open zip member: %w", err)
+		}
+		_, copyErr := io.Copy(h, r)
+		closeErr := r.Close()
+		if copyErr != nil {
+			return fmt.Errorf("read zip member: %w", copyErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close zip member: %w", closeErr)
+		}
+		members++
+	}
+	if members == 0 {
+		// RomM falls back to the raw container for a valid empty/all-excluded
+		// archive. Malformed ZIPs never reach here: zip.OpenReader rejects them.
+		return verifyFileHash(zipPath, wantSha1, wantMd5)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); !strings.EqualFold(got, want) {
+		return fmt.Errorf("%s mismatch got %s want %s", kind, got, want)
 	}
 	return nil
+}
+
+func rommArchiveMemberExcluded(name string) bool {
+	base := path.Base(name)
+	lower := strings.ToLower(base)
+	for _, ext := range rommArchiveExcludedExtensions {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	if _, excluded := rommArchiveExcludedNames[base]; excluded {
+		return true
+	}
+	return strings.HasSuffix(base, ":Zone.Identifier")
 }
 
 // runDownloadBios downloads BIOS/firmware for every MAPPED platform and writes each
