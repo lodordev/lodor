@@ -38,6 +38,7 @@ type Rom struct {
 	ID                  int       `json:"id"`
 	PlatformID          int       `json:"platform_id"`
 	PlatformFsSlug      string    `json:"platform_fs_slug"`
+	PlatformSlug        string    `json:"platform_slug"`
 	PlatformDisplayName string    `json:"platform_display_name"`
 	FsName              string    `json:"fs_name"`
 	FsNameNoExt         string    `json:"fs_name_no_ext"`
